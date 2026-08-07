@@ -1,0 +1,128 @@
+# =============================================================================
+# RoleBlank OS — DEVELOPMENT compose file
+# =============================================================================
+# THIS IS NOT PRODUCTION ORCHESTRATION. Do not copy it to a server.
+#
+# It exists to give a developer a working API + PostgreSQL pair on a laptop with
+# one command. It intentionally trades hardening for convenience in ways that are
+# unacceptable in production.
+#
+# What a production deployment additionally requires — none of which is here:
+#   * TLS termination in front of the API (this file speaks plain HTTP on
+#     loopback only) and TLS *to* PostgreSQL with certificate verification.
+#   * Secret injection from a real secret manager. Secrets must never come from a
+#     committed file, a compose `environment:` block, or a build argument.
+#   * Resource limits (CPU/memory) and restart policies. Argon2id is memory-hard
+#     by design; an unbounded container is a self-inflicted DoS.
+#   * A read-only root filesystem (`read_only: true`) plus explicit tmpfs mounts.
+#   * Dropped Linux capabilities (`cap_drop: [ALL]`) and
+#     `security_opt: [no-new-privileges:true]`.
+#   * Network segmentation — the database on an internal-only network that the
+#     ingress layer cannot reach.
+#   * The database NOT published on any host port at all. Here it is published on
+#     127.0.0.1 only, purely so a developer can attach psql/a GUI.
+#   * Log shipping, metrics scraping, backup scheduling and restore drills.
+#
+# Names (network, volume, container) deliberately match scripts/rb.ps1 so the two
+# workflows share one database instead of silently maintaining two.
+#
+# Usage:  docker compose -f docker-compose.dev.yml up --build
+# =============================================================================
+
+services:
+  postgres:
+    image: postgres:18.4-alpine
+    container_name: roleblank-postgres
+    environment:
+      # ---------------------------------------------------------------------
+      # FAKE, DEVELOPMENT-ONLY CREDENTIALS. Not a secret, never used anywhere
+      # but a laptop. The application does NOT connect as this superuser — it
+      # uses the unprivileged runtime role created by ops/sql/provision_ci.sql
+      # (or ops/sql/provision_dev.sql). Override via the root .env if you like.
+      # ---------------------------------------------------------------------
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dev_superuser_pw_local_only}
+      POSTGRES_DB: postgres
+      # Data checksums cannot be enabled after initdb. Turning them on in dev
+      # means silent page corruption surfaces here rather than in production.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      # PostgreSQL 18 images moved the data directory layout: the volume mounts
+      # at /var/lib/postgresql, NOT /var/lib/postgresql/data. Using the old path
+      # makes the container refuse to start. See docs/backend/00-reconnaissance.md R6.
+      - roleblank_pgdata:/var/lib/postgresql
+    ports:
+      # Bound to loopback explicitly. A bare "5440:5432" would listen on
+      # 0.0.0.0 and expose the development database to the whole LAN.
+      - "127.0.0.1:5440:5432"
+    healthcheck:
+      # `pg_isready` is shipped inside the postgres image, so this needs no extra
+      # package. -U/-d avoid a false "ready" from a half-initialised cluster.
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      # initdb on a cold volume can take a while; without a start_period the
+      # container is marked unhealthy before it ever had a chance.
+      start_period: 20s
+    networks:
+      - roleblank_net
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: roleblank-api
+    depends_on:
+      postgres:
+        # Wait for *healthy*, not merely *started*: the API fails closed on an
+        # unreachable database, so starting it early just produces noise.
+        condition: service_healthy
+    env_file:
+      # Real configuration lives in an untracked root .env (see .env.example).
+      # `required: false` so a fresh clone still comes up with the defaults below.
+      - path: .env
+        required: false
+    environment:
+      # ---------------------------------------------------------------------
+      # Development defaults, all overridable from .env. Every credential and
+      # key below is OBVIOUSLY FAKE and exists only so `up` works on a fresh
+      # clone. Production injects these from a secret manager — never from here.
+      # ---------------------------------------------------------------------
+      RB_ENV: ${RB_ENV:-development}
+      # Runtime role, not the migrator and not the superuser: the serving
+      # process must not be able to alter its own schema.
+      DATABASE_URL: ${DATABASE_URL:-postgres://roleblank_app:ci_only_fake_app_pw@postgres:5432/roleblank}
+      RB_BIND_ADDR: ${RB_BIND_ADDR:-0.0.0.0:8080}
+      # 0.0.0.0 *inside the container* is correct — the container's network
+      # namespace is the boundary, and the host mapping below is loopback-only.
+      RB_LOG_FORMAT: ${RB_LOG_FORMAT:-json}
+      RUST_LOG: ${RUST_LOG:-info,roleblank_backend=debug}
+    ports:
+      # Loopback only, port 8090 on the host (8080 is already taken by another
+      # project on this machine — see docs/backend/00-reconnaissance.md §2).
+      - "127.0.0.1:8090:8080"
+    # NOTE — no healthcheck on this service, on purpose.
+    # A compose healthcheck executes *inside* the container, and the runtime
+    # image deliberately ships no curl/wget (see backend/Dockerfile). Adding one
+    # just to satisfy this stanza would permanently enlarge the production attack
+    # surface for a development convenience.
+    # A real orchestrator probes from the outside over HTTP and needs nothing in
+    # the image, e.g. Kubernetes:
+    #     livenessProbe:  httpGet { path: /health/live,  port: 8080 }
+    #     readinessProbe: httpGet { path: /health/ready, port: 8080 }
+    # Locally, just curl http://127.0.0.1:8090/health/ready from the host.
+    networks:
+      - roleblank_net
+    restart: unless-stopped
+
+networks:
+  roleblank_net:
+    # `name:` pins the real Docker network name instead of letting compose prefix
+    # it with the project name, so containers started by scripts/rb.ps1 land on
+    # the same network and can resolve each other by name.
+    name: roleblank_net
+
+volumes:
+  roleblank_pgdata:
+    name: roleblank_pgdata

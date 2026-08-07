@@ -1,0 +1,131 @@
+# cargo-deny configuration for RoleBlank OS.
+#
+# Run with:  .\scripts\rb.ps1 deny
+#
+# The posture: advisories and unknown sources are hard failures; licence policy is
+# an allowlist; duplicate versions are a warning rather than an error, because in a
+# 256-crate tree a handful of transitive duplicates is normal and blocking on them
+# would train people to add exceptions reflexively. Duplicates in *cryptographic*
+# crates are called out explicitly below, because there the concern is real: two
+# versions of a hashing crate means two implementations to audit.
+
+[graph]
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+]
+all-features = false
+
+# =============================================================================
+# Security advisories — no tolerance
+# =============================================================================
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# `deny` for everything. An unmaintained security-critical crate is a finding that
+# should be triaged deliberately, not suppressed by configuration.
+yanked = "deny"
+ignore = [
+    # Add entries ONLY with: the advisory id, the date, the reason it does not
+    # apply to this codebase, and a review date. An unexplained ignore is how a
+    # known vulnerability survives an audit.
+    #
+    # Example of the required form:
+    # { id = "RUSTSEC-0000-0000", reason = "not reachable: we never call X. Review 2026-12-01." },
+]
+
+# =============================================================================
+# Licences — allowlist
+# =============================================================================
+[licenses]
+# Permissive licences only. Anything copyleft in a linked dependency would impose
+# obligations on an internal company system that nobody has agreed to.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",       # file-level copyleft; acceptable for an unmodified dependency
+    "OpenSSL",
+    # `webpki-roots` — the Mozilla CA trust store, reached through sqlx's rustls
+    # TLS stack. CDLA-Permissive-2.0 is a permissive *data* licence: it grants
+    # unrestricted use and redistribution of the dataset with no copyleft and no
+    # attribution obligation on derived works. It is the correct licence for a
+    # certificate list, and it is on this list because a root store is not
+    # optional — the alternative is unverified TLS to the database.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+# `roleblank-backend` is not published and has no SPDX licence expression — it is
+# proprietary company software. Without this, cargo-deny reports our own crate as
+# "unlicensed" and fails the run, which trains people to ignore the licence gate.
+# `ignore = true` applies ONLY to crates marked `publish = false`, so a dependency
+# with a missing licence is still a hard failure.
+private = { ignore = true }
+
+# `ring` carries a composite licence that the SPDX expression parser cannot
+# resolve on its own. It is the standard, widely audited crypto backend for
+# rustls; the terms are ISC/MIT/OpenSSL.
+[[licenses.clarify]]
+crate = "ring"
+expression = "ISC AND MIT AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+# =============================================================================
+# Bans
+# =============================================================================
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"          # a wildcard version pin makes the build non-reproducible
+allow-wildcard-paths = false
+
+deny = [
+    # --- unmaintained / superseded ---------------------------------------
+    { crate = "openssl", reason = "use rustls; linking system OpenSSL adds a large C attack surface and a deployment dependency" },
+    { crate = "openssl-sys", reason = "see openssl" },
+    { crate = "native-tls", reason = "use rustls for a consistent, auditable TLS stack" },
+
+    # --- crates whose presence would indicate a design mistake ------------
+    { crate = "chrono", reason = "this project standardises on `time`; two date libraries means two sets of parsing edge cases" },
+    # NOTE: `md-5` is NOT banned, and the reasoning is worth reading before anyone
+    # re-adds the ban. It arrives transitively through `sqlx-postgres`, which needs
+    # it to speak PostgreSQL's legacy `md5` authentication method — a wire-protocol
+    # requirement of the server, not a choice this codebase makes. Nothing in
+    # RoleBlank calls MD5 for anything.
+    #
+    # The control that actually matters is at the database, not here: the
+    # development and CI clusters use `scram-sha-256`, and production must too.
+    # Banning the crate would only make sqlx unbuildable; it would not stop a
+    # server configured for md5 auth. Recorded as an operational requirement in
+    # docs/backend/08-operations.md rather than as a dependency ban.
+    { crate = "sha-1", reason = "the maintained crate is `sha1`; SHA-1 is used ONLY for RFC 6238 TOTP, which mandates it" },
+
+    # --- anything that would let a request reach the filesystem or shell ---
+    { crate = "duct", reason = "the backend never spawns a subprocess" },
+    { crate = "subprocess", reason = "the backend never spawns a subprocess" },
+]
+
+skip = []
+
+# Duplicate versions worth knowing about but not worth failing on. Each entry is a
+# deliberate acknowledgement, not a blanket suppression.
+skip-tree = []
+
+# =============================================================================
+# Sources
+# =============================================================================
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# No git dependencies. A security-critical crate pulled from a branch is a supply
+# chain with no release process, no advisory feed, and no reproducibility.
+allow-git = []
+
+[sources.allow-org]
+github = []

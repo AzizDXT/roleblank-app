@@ -1,0 +1,76 @@
+# =============================================================================
+# RoleBlank OS — repository ignore rules
+# =============================================================================
+
+# --- Rust build output -------------------------------------------------------
+# Large, machine-specific and fully reproducible from source.
+target/
+**/target/
+# Cargo.lock IS committed: this repository produces a binary, not a library, and
+# a reproducible dependency set is a security requirement (CI builds --locked).
+*.rs.bk
+*.pdb
+
+# --- SQLx offline metadata ---------------------------------------------------
+# Generated cache. The project uses SQLx's runtime query API (ADR-001), so this
+# directory is not required to build and should not be committed if it appears.
+.sqlx/
+
+# --- Secrets and local configuration ----------------------------------------
+# Every real .env variant is ignored. `.env.example` is explicitly NOT ignored —
+# it is the documented, credential-free template that must stay in version
+# control so a new developer knows which variables exist.
+.env
+.env.*
+!.env.example
+
+# Certificates and keys must never be committed, whatever the extension.
+*.pem
+*.key
+*.p12
+*.pfx
+
+# --- Backups and database dumps ----------------------------------------------
+# Produced by scripts/backup_dev.sh. These contain real (development) row data,
+# including password hashes and audit records — never in git.
+backups/
+*.dump
+*.sql.gz
+*.bak
+
+# --- Test / tooling output ---------------------------------------------------
+coverage/
+lcov.info
+*.profraw
+*.profdata
+mutants.out*/
+backend/fuzz/artifacts/
+backend/fuzz/corpus/
+backend/fuzz/coverage/
+load-test-results/
+
+# --- Editors and IDEs --------------------------------------------------------
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+.fleet/
+.zed/
+.history/
+
+# --- OS junk -----------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# --- Logs --------------------------------------------------------------------
+*.log
+logs/

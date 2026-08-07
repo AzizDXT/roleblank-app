@@ -1,0 +1,36 @@
+# Keep the build context small and free of anything that must not enter an image
+# layer. Everything listed here is either rebuildable, irrelevant to a release
+# build, or a secret.
+
+# Host build artefacts. Huge, and produced by a different toolchain/OS than the
+# builder stage — copying them in would poison the container's cargo cache.
+target/
+
+# VCS metadata: full history in a layer is both large and a disclosure risk.
+.git
+.gitignore
+.gitattributes
+
+# Documentation never affects the binary.
+*.md
+
+# Test/bench/fuzz trees are not compiled by `cargo build --release --bin`, so
+# excluding them removes cache invalidation from edits that cannot change the
+# shipped artefact.
+tests/
+benches/
+fuzz/
+
+# Environment files carry real credentials. They must never be reachable from a
+# Dockerfile COPY, not even accidentally via a wildcard.
+.env*
+
+# Local editor / OS noise.
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Docker files themselves are not build inputs.
+Dockerfile
+.dockerignore

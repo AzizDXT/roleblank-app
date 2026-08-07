@@ -1,0 +1,235 @@
+###############################################################################
+# 01 — Authentication, sessions, MFA and step-up
+#
+# Run 00-bootstrap.http first. This file takes a brand-new owner from a
+# password-only session to a fully verified one, then exercises sessions,
+# password changes and recovery codes.
+#
+# NEVER COMMIT A REAL CREDENTIAL OR TOKEN TO THIS FILE.
+# `@accessToken` / `@refreshToken` below are placeholders. Paste a real token in
+# while you work and take it back out before committing — and remember that an
+# access token is a live session, not a test fixture.
+###############################################################################
+
+@baseUrl = http://localhost:8090
+
+@email = owner@example.com
+@password = REPLACE_WITH_A_LONG_OWNER_PASSPHRASE
+
+# Copy from the login/refresh response. Access tokens start `rb_at_`, refresh
+# tokens start `rb_rt_`. They are opaque server-side session tokens, NOT JWTs:
+# there is nothing to decode and nothing to verify client-side.
+@accessToken = REPLACE_WITH_ACCESS_TOKEN
+@refreshToken = REPLACE_WITH_REFRESH_TOKEN
+
+# A TOTP code from an authenticator app. Six digits, valid ~30 seconds.
+@totpCode = 000000
+
+# A recovery code from the batch shown once at activation.
+@recoveryCode = REPLACE_WITH_ONE_RECOVERY_CODE
+
+# A session id from GET /api/v1/auth/sessions.
+@sessionId = 00000000-0000-7000-8000-000000000000
+
+
+### Log in
+# Correct response: 200 with {access_token, refresh_token, expires_in: 900,
+# mfa_required, token_type: "Bearer"}. For a freshly bootstrapped owner
+# `mfa_required` is true: the session exists but may reach only the MFA
+# endpoints and /auth/me until a factor is verified.
+#
+# Every failure mode — unknown account, wrong password, suspended, archived —
+# is the same 401 AUTHENTICATION_FAILED. That is deliberate: any distinction
+# here is an account-enumeration oracle.
+POST {{baseUrl}}/api/v1/auth/login
+Content-Type: application/json
+Accept: application/json
+
+{
+  "email": "{{email}}",
+  "password": "{{password}}"
+}
+
+
+### Who am I? (pending-MFA projection)
+# Correct response while `mfa_required` is true: 200 with the REDUCED document —
+# no `capabilities`, no `is_root`, no `auth_level` — plus
+# "mfa_pending": true and "next_action": "MFA_ENROLLMENT_REQUIRED".
+# A session that cannot call a business endpoint has no business learning which
+# business endpoints it would be allowed to call.
+GET {{baseUrl}}/api/v1/auth/me
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### Begin TOTP enrolment
+# Correct response: 200 with {factor_id, secret, otpauth_uri, algorithm, digits,
+# period}. This is the ONLY response in the API that carries a secret, and it
+# carries it exactly once — at rest the factor holds only ciphertext, so the
+# secret can never be read back. Scan `otpauth_uri` and discard it.
+# The factor is inert until it is activated by the next request.
+POST {{baseUrl}}/api/v1/auth/mfa/totp/setup
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### Activate the TOTP factor
+# Correct response: 200 with {mfa_enrolled: true, auth_level, step_up_active,
+# recovery_codes: {codes: [...], generated: N}}. The recovery codes are shown
+# once; only SHA-256 digests are stored. Write them down now or lose them.
+# A wrong code is 400 with a field error, not 401.
+POST {{baseUrl}}/api/v1/auth/mfa/totp/activate
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "code": "{{totpCode}}"
+}
+
+
+### Verify the second factor (on every subsequent login)
+# Correct response: 200 {mfa_required: false, auth_level, step_up_active: true}.
+# The session leaves the pending state and the step-up window opens (600 s by
+# default), during which the dangerous operations in 03-roles-and-permissions
+# and 05-projects-and-tasks will be accepted.
+POST {{baseUrl}}/api/v1/auth/mfa/verify
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "code": "{{totpCode}}"
+}
+
+
+### Verify with a recovery code instead
+# The break-glass path for a lost authenticator. Each code is consumed on use.
+# Correct response: 200, additionally carrying `recovery_codes_remaining` so the
+# user can see the batch draining and regenerate before running out.
+POST {{baseUrl}}/api/v1/auth/mfa/recovery/verify
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "code": "{{recoveryCode}}"
+}
+
+
+### Who am I? (full projection)
+# Correct response after verification: 200 with the FULL document — `is_root`,
+# `auth_level`, `step_up_active` and a `capabilities` array.
+# `capabilities` is a hint for hiding buttons. The backend re-derives every
+# decision on every request regardless of what the client believes, so a client
+# that fakes it gains nothing.
+GET {{baseUrl}}/api/v1/auth/me
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### List my own sessions
+# Correct response: 200 {sessions: [...]}. The caller's sessions only; there is
+# no endpoint for reading anybody else's. `client_ip_hint` and
+# `user_agent_hint` are recognition aids for the human and are never used for
+# authorisation.
+GET {{baseUrl}}/api/v1/auth/sessions
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### Revoke one of my own sessions
+# Correct response: 204. A session id belonging to somebody else answers 404,
+# never 403 — the refusal must not confirm that the session exists.
+DELETE {{baseUrl}}/api/v1/auth/sessions/{{sessionId}}
+Authorization: Bearer {{accessToken}}
+
+
+### Rotate tokens
+# Refresh tokens are single use and rotate on every call.
+# Correct response: 200 with a NEW pair; the old refresh token is now dead.
+# Presenting an already-redeemed refresh token is treated as theft: the whole
+# session family is revoked and the response is 401.
+POST {{baseUrl}}/api/v1/auth/refresh
+Content-Type: application/json
+Accept: application/json
+
+{
+  "refresh_token": "{{refreshToken}}"
+}
+
+
+### Change my own password
+# Correct response: 204. Every other session of this user is revoked, so the
+# caller must obtain new tokens afterwards.
+POST {{baseUrl}}/api/v1/auth/password/change
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "current_password": "REPLACE_WITH_CURRENT_PASSWORD",
+  "new_password": "REPLACE_WITH_A_LONG_NEW_PASSPHRASE"
+}
+
+
+### Request a password reset
+# Correct response: 202 with a FIXED body, byte for byte identical for an
+# existing address, a non-existent address and a structurally invalid one. Do
+# not try to infer account existence from it; there is nothing in it that varies.
+POST {{baseUrl}}/api/v1/auth/password-reset/request
+Content-Type: application/json
+Accept: application/json
+
+{
+  "email": "somebody@example.com"
+}
+
+
+### Complete a password reset
+# The token travels in the BODY, never in the URL — URLs end up in proxy logs,
+# browser history and `Referer` headers.
+# Correct response: 204. An unknown or expired token is 401/400, never a hint
+# about which.
+POST {{baseUrl}}/api/v1/auth/password-reset/confirm
+Content-Type: application/json
+Accept: application/json
+
+{
+  "token": "REPLACE_WITH_RESET_TOKEN_FROM_EMAIL",
+  "new_password": "REPLACE_WITH_A_LONG_NEW_PASSPHRASE"
+}
+
+
+### Regenerate recovery codes  — REQUIRES STEP-UP
+# Correct response: 200 with a fresh batch; the previous batch is dead.
+# Without a recent second factor: 403, code STEP_UP_REQUIRED, with
+# `step_up.window_seconds` telling the client how recent "recent" is, so it can
+# re-prompt rather than give up. Re-run the MFA verify request above and retry.
+POST {{baseUrl}}/api/v1/auth/mfa/recovery/regenerate
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### Disable MFA  — REQUIRES STEP-UP
+# Correct response: 200 {mfa_enrolled: false}.
+# For the system owner this is refused with 403 ROOT_PROTECTED and that refusal
+# is never masked into a 404: MFA cannot be made optional for the owner, and the
+# refusal should be impossible to misdiagnose as a transient failure.
+POST {{baseUrl}}/api/v1/auth/mfa/disable
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### Log out this session
+# Correct response: 204. Revokes only the session presenting the token.
+POST {{baseUrl}}/api/v1/auth/logout
+Authorization: Bearer {{accessToken}}
+
+
+### Log out everywhere
+# Correct response: 200 {revoked_sessions: N}, including the session making the
+# request.
+POST {{baseUrl}}/api/v1/auth/logout-all
+Authorization: Bearer {{accessToken}}
+Accept: application/json

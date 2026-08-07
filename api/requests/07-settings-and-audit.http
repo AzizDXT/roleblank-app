@@ -1,0 +1,155 @@
+###############################################################################
+# 07 — Settings, feature flags and the audit log
+#
+# The audit log is read-only through the API. There is no write endpoint, no
+# edit endpoint and no delete endpoint, and the table refuses UPDATE, DELETE and
+# TRUNCATE at the database level with no exception for administrators — an
+# administrator who can rewrite history can erase their own escalation.
+#
+# NEVER COMMIT A REAL CREDENTIAL OR TOKEN TO THIS FILE.
+###############################################################################
+
+@baseUrl = http://localhost:8090
+@accessToken = REPLACE_WITH_ACCESS_TOKEN
+
+@settingKey = registration.mode
+@flagKey = client_portal
+@auditEventId = 00000000-0000-7000-8000-00000000000a
+@actorUserId = 00000000-0000-7000-8000-000000000001
+@version = 1
+
+
+# =============================================================================
+# Settings
+# =============================================================================
+
+### Read every setting
+# Correct response: 200 {items: [...]}. A fixed catalogue rather than a
+# paginated collection. `is_security_sensitive` marks the settings whose
+# modification is itself a security event.
+GET {{baseUrl}}/api/v1/settings
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### Write one setting
+# The key comes from the PATH and is not a member of the body: a body that also
+# carried the key would let it silently retarget a URL-authorised write.
+# `is_security_sensitive`, `value_type` and `description` are likewise not
+# writable — being able to re-describe a setting is being able to pick which
+# permission guards it.
+#
+# `version` is mandatory. An absent version would make a blind overwrite the
+# default behaviour; a stale one is 409 VERSION_CONFLICT.
+#
+# Correct response: 200 with the updated setting and an incremented `version`.
+# Note: changing `registration.mode` is a security-sensitive write and is
+# audited as one.
+PUT {{baseUrl}}/api/v1/settings/{{settingKey}}
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "value": "INVITE_ONLY",
+  "version": {{version}}
+}
+
+
+### Read every feature flag
+GET {{baseUrl}}/api/v1/feature-flags
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### Turn one feature flag on
+# Correct response: 200 with the updated flag. `version` is mandatory for the
+# same reason as on settings.
+PUT {{baseUrl}}/api/v1/feature-flags/{{flagKey}}
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "enabled": true,
+  "version": {{version}}
+}
+
+
+# =============================================================================
+# Audit
+# =============================================================================
+
+### Read the audit log
+# Cursor-paginated, newest first by default.
+# Correct response: 200 with items carrying seq, id, occurred_at, actor,
+# action_code, target, outcome, request_id, source_ip_hint, metadata and the
+# chain hashes.
+#
+# `metadata` is a closed, sanitised structure written by the server — never a
+# raw request body. No password, no token of any kind, no TOTP secret, no
+# recovery code and no key ever appears in it.
+GET {{baseUrl}}/api/v1/audit/events?limit=50&direction=desc
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### Filter the audit log
+# Every filter is optional. `occurred_from` is inclusive and `occurred_to`
+# exclusive, both RFC 3339.
+GET {{baseUrl}}/api/v1/audit/events?limit=50&action_code=ROLE.ASSIGNED&outcome=DENIED&actor_user_id={{actorUserId}}&occurred_from=2026-08-01T00:00:00Z&occurred_to=2026-09-01T00:00:00Z
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### Read one audit event
+GET {{baseUrl}}/api/v1/audit/events/{{auditEventId}}
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### Verify the hash chain  — REQUIRES STEP-UP
+# Recomputes the HMAC-SHA256 chain over the range and reports the first sequence
+# number at which it breaks, if any.
+#
+# This is a GET behind step-up, which looks odd until you see why: it mutates
+# nothing, but it is expensive enough to be a denial-of-service lever, so it is
+# gated the same way the dangerous writes are. It is the one deliberate
+# exception to "a GET is never behind step-up".
+#
+# Correct response: 200 {valid: true, checked_from_seq, checked_to_seq,
+# events_checked, broken_at_seq: null, verified_at}.
+# Without a recent second factor: 403 STEP_UP_REQUIRED.
+#
+# What a `valid: true` means, precisely: modification, deletion or reordering
+# performed WITHOUT the chain key is detectable. It is not a claim of
+# tamper-proofing against an adversary who holds both the database and the key.
+GET {{baseUrl}}/api/v1/audit/verify?from_seq=1&to_seq=100000
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+###############################################################################
+# Absent by design. Each of these returns 405 (or 404) from the router because
+# no such route exists in ROUTE_TABLE — they are not merely forbidden.
+###############################################################################
+
+### Writing an audit event
+# EXPECTED: 405 / 404. Audit rows are written only by the server as a side
+# effect of the operation being audited. There is no API for forging one.
+POST {{baseUrl}}/api/v1/audit/events
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+
+{
+  "action_code": "NOTHING.HAPPENED",
+  "outcome": "SUCCESS"
+}
+
+
+### Deleting an audit event
+# EXPECTED: 405 / 404. Even with database access the trigger refuses; even with
+# the trigger disabled the runtime role cannot disable it, because it does not
+# own the table.
+DELETE {{baseUrl}}/api/v1/audit/events/{{auditEventId}}
+Authorization: Bearer {{accessToken}}

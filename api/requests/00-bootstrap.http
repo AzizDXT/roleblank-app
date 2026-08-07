@@ -1,0 +1,96 @@
+###############################################################################
+# 00 — Bootstrap and platform probes
+#
+# The very first requests made against a fresh deployment, in order.
+#
+# NEVER COMMIT A REAL CREDENTIAL OR TOKEN TO THIS FILE.
+# Every value below is an obvious placeholder in SCREAMING_SNAKE_CASE. Put the
+# real ones in an untracked environment file (`http-client.env.json` for
+# IntelliJ, `rest-client.environmentVariables` in VS Code settings) or paste
+# them into the editor buffer and discard them. If you find yourself about to
+# `git add` a file containing something that starts `rb_at_`, stop.
+###############################################################################
+
+@baseUrl = http://localhost:8090
+
+# The out-of-band operator secret. It is whatever `RB_BOOTSTRAP_SECRET` was set
+# to for this deployment; it is compared in constant time and never logged.
+@bootstrapSecret = REPLACE_WITH_RB_BOOTSTRAP_SECRET
+
+@ownerEmail = owner@example.com
+@ownerPassword = REPLACE_WITH_A_LONG_OWNER_PASSPHRASE
+
+
+### Liveness probe
+# Answers 200 as long as the process is up. It says nothing about the database.
+# Correct response: 200, body exactly {"status":"ok"} — one field, no version,
+# no hostname, no dependency name.
+GET {{baseUrl}}/health/live
+Accept: application/json
+
+
+### Readiness probe
+# Correct response: 200 {"status":"ok"} when the instance will take traffic,
+# 503 {"status":"not_ready"} when it will not. It never names what is broken —
+# a readiness body that identifies the failing dependency tells an anonymous
+# caller the shape of the deployment.
+GET {{baseUrl}}/health/ready
+Accept: application/json
+
+
+### Metrics
+# Prometheus text exposition. Series are labelled by route *pattern*
+# (`/api/v1/projects/{id}`), never by a concrete path, so label cardinality
+# stays bounded. Anonymous because scrapers do not authenticate — keep it behind
+# a network boundary.
+# Correct response: 200, text/plain, lines beginning `# HELP` / `# TYPE`.
+GET {{baseUrl}}/metrics
+
+
+### Is the system initialised?
+# Correct response: 200 {"initialized":false} on a fresh deployment, and
+# {"initialized":true} afterwards. Exactly one field: anything more would be
+# free reconnaissance for whoever finds the deployment first.
+GET {{baseUrl}}/api/v1/bootstrap/status
+Accept: application/json
+
+
+### Create the system owner  — succeeds at most once, ever
+# Requires the operator secret. Note what is NOT in this body: no
+# `principal_type`, no `status`, no `is_root`, no `role_ids`. The owner's
+# security envelope is written as SQL literals and cannot be chosen by the
+# caller; smuggling any of those fields is a 400 before the service is entered.
+#
+# Correct response: 201 with {user_id, email, display_name,
+# mfa_enrolment_required: true, initialized_at}. No token and no session comes
+# back — the owner must log in normally and enrol a second factor, which is what
+# stops bootstrap from being able to mint a privileged session by itself.
+#
+# On a second attempt: 409, code SYSTEM_ALREADY_INITIALIZED. See
+# 99-attack-probes.http.
+POST {{baseUrl}}/api/v1/bootstrap/root
+Content-Type: application/json
+Accept: application/json
+
+{
+  "bootstrap_secret": "{{bootstrapSecret}}",
+  "email": "{{ownerEmail}}",
+  "display_name": "System Owner",
+  "password": "{{ownerPassword}}"
+}
+
+
+### Confirm initialisation
+# Correct response: 200 {"initialized":true}.
+GET {{baseUrl}}/api/v1/bootstrap/status
+Accept: application/json
+
+
+### Authenticated environment description
+# Needs a fully authenticated session; see 01-auth-and-mfa.http first.
+# Correct response: 200 with exactly three fields — environment, initialized,
+# enabled_features. No build id, no schema version, no hostname, no database,
+# no pool statistics, no permission catalogue.
+GET {{baseUrl}}/api/v1/system/info
+Authorization: Bearer REPLACE_WITH_ACCESS_TOKEN
+Accept: application/json

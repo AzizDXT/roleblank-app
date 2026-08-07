@@ -1,0 +1,218 @@
+###############################################################################
+# 04 — Departments (internal structure) and client accounts (external parties)
+#
+# The two are mirror images and must not be confused. A department membership is
+# always an INTERNAL principal; a client membership is always a CLIENT
+# principal. The database enforces both with triggers, so getting it wrong is a
+# 409 INVARIANT_VIOLATION rather than a quiet mistake.
+#
+# NEVER COMMIT A REAL CREDENTIAL OR TOKEN TO THIS FILE.
+###############################################################################
+
+@baseUrl = http://localhost:8090
+@accessToken = REPLACE_WITH_ACCESS_TOKEN
+
+@departmentId = 00000000-0000-7000-8000-000000000004
+@clientAccountId = 00000000-0000-7000-8000-000000000005
+@internalUserId = 00000000-0000-7000-8000-000000000001
+@clientUserId = 00000000-0000-7000-8000-000000000008
+@version = 1
+@idempotencyKey = REPLACE_WITH_A_FRESH_UUID_PER_CREATE
+
+
+# =============================================================================
+# Departments
+# =============================================================================
+
+### List departments
+# Correct response: 200, a page of departments.
+GET {{baseUrl}}/api/v1/departments?limit=25&status=ACTIVE&sort=name&direction=asc
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### Create a department  — idempotent
+# Departments are flat by design: there is no `parent_id`. A hierarchy brings
+# cycle prevention, transitive visibility and recursive authorisation queries,
+# and adding one later is an additive migration whereas removing one is not.
+# Correct response: 201. A duplicate `code` is 409 UNIQUE_VIOLATION.
+POST {{baseUrl}}/api/v1/departments
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+Idempotency-Key: {{idempotencyKey}}
+
+{
+  "code": "delivery",
+  "name": "Delivery",
+  "description": "Runs client engagements end to end.",
+  "lead_user_id": "{{internalUserId}}"
+}
+
+
+### Read one department
+GET {{baseUrl}}/api/v1/departments/{{departmentId}}
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### Update a department
+# `code` is immutable. `lead_user_id` distinguishes absent (leave the lead
+# alone) from an explicit null (detach the lead) — those are different
+# instructions and the API can tell them apart.
+# Correct response: 200 with an incremented `version`.
+PATCH {{baseUrl}}/api/v1/departments/{{departmentId}}
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "version": {{version}},
+  "name": "Delivery & Support",
+  "lead_user_id": null
+}
+
+
+### Archive a department
+# Correct response: 200 with status ARCHIVED.
+# 409 DEPARTMENT_HAS_LIVE_PROJECTS while any non-archived project still belongs
+# to it — archive or move the projects first.
+POST {{baseUrl}}/api/v1/departments/{{departmentId}}/archive
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "version": {{version}}
+}
+
+
+### List department members
+# Live memberships only. Removal is recorded, not deleted, so the history of who
+# was where survives.
+GET {{baseUrl}}/api/v1/departments/{{departmentId}}/members?limit=50
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### Add a member
+# `role_in_department` is MEMBER or LEAD, and it is not a permission role.
+# Correct response: 201.
+# Passing a CLIENT principal is refused by the database: 409.
+POST {{baseUrl}}/api/v1/departments/{{departmentId}}/members
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "user_id": "{{internalUserId}}",
+  "role_in_department": "MEMBER"
+}
+
+
+### Remove a member
+# Correct response: 204. Sets `removed_at`; the row is retained.
+DELETE {{baseUrl}}/api/v1/departments/{{departmentId}}/members/{{internalUserId}}
+Authorization: Bearer {{accessToken}}
+
+
+# =============================================================================
+# Client accounts
+# =============================================================================
+
+### List client accounts
+GET {{baseUrl}}/api/v1/clients?limit=25&status=ACTIVE&sort=name&direction=asc
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### Create a client account  — idempotent
+# A client account models an external business. It is NOT a tenant: there is one
+# company and one database, and nothing here partitions storage.
+# The account manager is company staff and must be an INTERNAL principal.
+# Correct response: 201.
+POST {{baseUrl}}/api/v1/clients
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+Idempotency-Key: REPLACE_WITH_A_DIFFERENT_FRESH_UUID
+
+{
+  "code": "acme",
+  "name": "Acme Manufacturing Ltd",
+  "description": "Long-standing manufacturing client.",
+  "account_manager_user_id": "{{internalUserId}}"
+}
+
+
+### Read one client account
+GET {{baseUrl}}/api/v1/clients/{{clientAccountId}}
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### Update a client account
+# `code` is immutable, and `status` cannot be set to ARCHIVED here — archival
+# has its own endpoint so it can carry a reason and its own audit action.
+PATCH {{baseUrl}}/api/v1/clients/{{clientAccountId}}
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "version": {{version}},
+  "name": "Acme Manufacturing (UK) Ltd",
+  "status": "ACTIVE"
+}
+
+
+### Archive a client account
+# Correct response: 200 with status ARCHIVED. This removes the visibility root:
+# every project share that depended on an active membership of this account
+# stops resolving, so its people see nothing in the portal afterwards.
+POST {{baseUrl}}/api/v1/clients/{{clientAccountId}}/archive
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "version": {{version}},
+  "reason": "Engagement ended"
+}
+
+
+### List client-account members
+GET {{baseUrl}}/api/v1/clients/{{clientAccountId}}/members?limit=50
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### Attach an external user to a client account
+# Only a CLIENT principal may be a member; an INTERNAL one is refused by the
+# database. The membership is created PENDING and is INERT — it grants no
+# visibility whatsoever — until it is activated by the next request.
+# Correct response: 201 with status PENDING.
+POST {{baseUrl}}/api/v1/clients/{{clientAccountId}}/members
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "user_id": "{{clientUserId}}"
+}
+
+
+### Activate a pending membership
+# This is the moment an external human gains visibility of anything at all.
+# Correct response: 200 with status ACTIVE and `activated_at` set.
+POST {{baseUrl}}/api/v1/clients/{{clientAccountId}}/members/{{clientUserId}}/activate
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### Remove a member
+# Correct response: 204. The membership becomes REMOVED, which withdraws every
+# project that user could see through this account — immediately, because
+# visibility is derived per request and never cached.
+DELETE {{baseUrl}}/api/v1/clients/{{clientAccountId}}/members/{{clientUserId}}
+Authorization: Bearer {{accessToken}}

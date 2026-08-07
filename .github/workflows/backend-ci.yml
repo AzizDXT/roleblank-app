@@ -1,0 +1,244 @@
+# =============================================================================
+# RoleBlank OS — backend CI
+# =============================================================================
+# Three mandatory jobs (quality, test, supply-chain) and one commented-out
+# manual-only job. There is deliberately NO deploy, publish or release step in
+# this workflow: a pipeline that can push artefacts is a pipeline whose token is
+# worth stealing. Release is a separate, human-triggered concern.
+# =============================================================================
+name: backend-ci
+
+on:
+  push:
+    paths:
+      - "backend/**"
+      - "backend/migrations/**"
+      - ".github/workflows/**"
+  pull_request:
+    paths:
+      - "backend/**"
+      - "backend/migrations/**"
+      - ".github/workflows/**"
+
+# Least privilege at the workflow level. No job here needs to write anything back
+# to the repository, so nothing gets more than read access to contents.
+permissions:
+  contents: read
+
+# A newer push to the same branch makes the older run irrelevant; cancelling
+# frees runners instead of burning them on a superseded commit.
+concurrency:
+  group: backend-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail the build on a warning emitted by rustc itself, not just by clippy.
+  RUSTFLAGS: "-D warnings"
+
+defaults:
+  run:
+    # Every cargo invocation belongs to the backend crate; setting it once avoids
+    # repeating `--manifest-path` and prevents a step from silently running at the
+    # repository root.
+    working-directory: backend
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # quality — formatting, lints and a compile check. No database required: the
+  # project uses SQLx's runtime query API precisely so compilation is decoupled
+  # from a live database (ADR-001 / recon R3).
+  # ---------------------------------------------------------------------------
+  quality:
+    name: fmt / clippy / build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false # the checkout token is not needed after clone
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The crate is not at the repository root.
+          workspaces: backend
+
+      - name: cargo fmt (check only)
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        # --all-targets covers tests/benches/examples, which is where sloppy
+        # unwraps usually hide. -D warnings makes every lint a hard failure.
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: cargo build
+        # --locked: CI must build the exact dependency set recorded in
+        # Cargo.lock. If the lockfile is stale, that is a change to review, not
+        # something CI should resolve on its own.
+        run: cargo build --locked
+
+  # ---------------------------------------------------------------------------
+  # test — real PostgreSQL, real migrations, real integration tests.
+  # ---------------------------------------------------------------------------
+  test:
+    name: migrate + test (postgres 18)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    services:
+      postgres:
+        # Same image and major version as development and production. Testing
+        # against a different PostgreSQL major than you deploy is testing a
+        # different database.
+        image: postgres:18.4-alpine
+        env:
+          # ---- CI-ONLY FAKE SUPERUSER PASSWORD -------------------------------
+          # Throwaway credential for an ephemeral container on an ephemeral
+          # runner. It grants access to nothing that outlives this job. It is
+          # written in the clear precisely so nobody mistakes it for a secret.
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci_only_fake_superuser_pw
+          POSTGRES_DB: postgres
+          POSTGRES_INITDB_ARGS: "--data-checksums"
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+          --publish 127.0.0.1:5432:5432
+        # NOTE: the port mapping is expressed via --publish above rather than the
+        # `ports:` key on purpose. `ports: ["5432:5432"]` binds 0.0.0.0 on the
+        # runner; this project never publishes PostgreSQL on 0.0.0.0 anywhere,
+        # not even on a machine that is destroyed ten minutes later.
+
+    env:
+      # -----------------------------------------------------------------------
+      # ALL VALUES BELOW ARE FAKE, CI-ONLY PLACEHOLDERS.
+      # They exist so the binary's fail-closed configuration validation has
+      # something syntactically valid to accept. They are not secrets, they are
+      # not reused anywhere, and they must never appear outside this file.
+      # Production values come from a secret manager at deploy time.
+      # -----------------------------------------------------------------------
+      #
+      # The migrator role owns the schema and is the identity that runs
+      # `migrate`. Integration tests also use it because they create and tear
+      # down fixtures; production splits migrator and runtime strictly.
+      DATABASE_URL: postgres://roleblank_migrator:ci_only_fake_migrator_pw@127.0.0.1:5432/roleblank
+      # Some integration tests need to create/drop scratch databases.
+      TEST_DATABASE_ADMIN_URL: postgres://postgres:ci_only_fake_superuser_pw@127.0.0.1:5432/postgres
+      RB_ENV: test
+      # 32-byte keys, base64. Decoded these literally read
+      # "CI-ONLY-FAKE-KEY-DO-NOT-USE-0001" and
+      # "CI-ONLY-FAKE-AUDIT-CHAIN-KEY-002" — chosen so that anyone who ever finds
+      # one of these in a real environment knows instantly it is wrong.
+      RB_ENCRYPTION_KEY: Q0ktT05MWS1GQUtFLUtFWS1ETy1OT1QtVVNFLTAwMDE=
+      RB_AUDIT_CHAIN_KEY: Q0ktT05MWS1GQUtFLUFVRElULUNIQUlOLUtFWS0wMDI=
+      RB_BOOTSTRAP_SECRET: ci-only-fake-bootstrap-secret-not-a-real-value
+      # Superuser password for the psql provisioning step below.
+      PGPASSWORD: ci_only_fake_superuser_pw
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+
+      - name: Provision migrator and runtime roles
+        # Run from the repository root: the SQL lives outside the crate.
+        working-directory: .
+        # ON_ERROR_STOP=1 turns a failed statement into a failed job; without it
+        # psql happily reports success after skipping broken SQL.
+        # The two passwords are passed as psql variables so the SQL file itself
+        # carries no credential.
+        run: |
+          psql -v ON_ERROR_STOP=1 \
+               -h 127.0.0.1 -p 5432 -U postgres -d postgres \
+               -v migrator_password="ci_only_fake_migrator_pw" \
+               -v app_password="ci_only_fake_app_pw" \
+               -f ops/sql/provision_ci.sql
+
+      - name: Run migrations
+        # The same subcommand production uses. If migrations cannot apply as the
+        # migrator role with exactly these privileges, CI must find out, not ops.
+        run: cargo run --locked --bin roleblank-api -- migrate
+
+      - name: Run tests
+        run: cargo test --locked --all-features
+
+  # ---------------------------------------------------------------------------
+  # supply-chain — advisory database and licence/source policy.
+  # ---------------------------------------------------------------------------
+  # This job is NOT continue-on-error and must never be made so. A known-
+  # vulnerable dependency is a build failure, not a notification. If an advisory
+  # is genuinely inapplicable, record that decision explicitly in deny.toml where
+  # it is reviewable, rather than by weakening the gate.
+  supply-chain:
+    name: cargo audit / cargo deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit and cargo-deny
+        # taiki-e/install-action fetches prebuilt binaries, turning a ~5 minute
+        # source build into a few seconds. Falls back to `cargo install --locked`
+        # if the action is ever unavailable.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+
+      - name: cargo audit
+        # Reads the RustSec advisory DB against Cargo.lock. Non-zero exit on any
+        # unignored advisory.
+        run: cargo audit --deny warnings
+
+      - name: cargo deny check
+        # advisories + bans (duplicate/banned crates) + licenses + sources.
+        # deny.toml lives at the repository root, the manifest in backend/.
+        run: cargo deny --manifest-path Cargo.toml --config ../deny.toml check
+
+  # ---------------------------------------------------------------------------
+  # heavy — fuzzing, mutation testing and load testing.
+  # ---------------------------------------------------------------------------
+  # INTENTIONALLY COMMENTED OUT. These are run MANUALLY, not on every push:
+  #   * cargo-fuzz needs a nightly toolchain and hours to be meaningful; a 5
+  #     minute fuzz run on a PR proves nothing and creates false confidence.
+  #   * cargo-mutants routinely takes 30+ minutes on this crate and its output
+  #     needs a human to triage equivalent mutants.
+  #   * Load testing measures the machine as much as the code; a shared,
+  #     noisy-neighbour CI runner produces percentiles nobody should trust.
+  # Run them from a developer machine (see scripts/rb.ps1 and
+  # scripts/load_test.sh) or on a dedicated, quiet runner on a schedule.
+  #
+  # heavy:
+  #   name: fuzz / mutants / load (manual only)
+  #   runs-on: ubuntu-latest
+  #   if: github.event_name == 'workflow_dispatch'
+  #   timeout-minutes: 360
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #       with:
+  #         persist-credentials: false
+  #     - uses: dtolnay/rust-toolchain@nightly
+  #     - uses: taiki-e/install-action@v2
+  #       with:
+  #         tool: cargo-fuzz,cargo-mutants
+  #     - name: fuzz (time-boxed)
+  #       run: cargo fuzz run <target> -- -max_total_time=3600
+  #     - name: mutation testing
+  #       run: cargo mutants --timeout 300 -- --all-features
+  #     - name: load test
+  #       run: ../scripts/load_test.sh
