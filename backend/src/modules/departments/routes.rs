@@ -4,16 +4,15 @@
 //! authorisation, no validation and no invariant here on purpose: a rule that lives
 //! in a handler is a rule that a second caller of the same service silently skips.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::{delete, get, post};
 use axum::{Json as JsonResponse, Router};
-use uuid::Uuid;
 
 use crate::app::AppState;
 use crate::platform::errors::AppResult;
-use crate::platform::http::extract::{Authenticated, ClientIp, Json};
+use crate::platform::http::extract::{Authenticated, ClientIp, Json, PathId, PathIds};
 use crate::platform::http::idempotency::{self, Idempotent};
 use crate::shared::pagination::{Page, PageQuery};
 
@@ -74,7 +73,7 @@ async fn create(
 async fn detail(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
-    Path(id): Path<Uuid>,
+    PathId(id): PathId,
 ) -> AppResult<JsonResponse<DepartmentResponse>> {
     service::get(&state, &principal, id).await.map(JsonResponse)
 }
@@ -83,7 +82,7 @@ async fn update(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
     ClientIp(ip): ClientIp,
-    Path(id): Path<Uuid>,
+    PathId(id): PathId,
     Json(body): Json<UpdateDepartmentRequest>,
 ) -> AppResult<JsonResponse<DepartmentResponse>> {
     service::update(&state, &principal, Some(ip.to_string()), id, body)
@@ -95,7 +94,7 @@ async fn archive(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
     ClientIp(ip): ClientIp,
-    Path(id): Path<Uuid>,
+    PathId(id): PathId,
     Json(body): Json<ArchiveDepartmentRequest>,
 ) -> AppResult<JsonResponse<DepartmentResponse>> {
     service::archive(&state, &principal, Some(ip.to_string()), id, body)
@@ -106,7 +105,7 @@ async fn archive(
 async fn list_members(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
-    Path(id): Path<Uuid>,
+    PathId(id): PathId,
     Query(query): Query<PageQuery>,
 ) -> AppResult<JsonResponse<Page<DepartmentMemberResponse>>> {
     service::list_members(&state, &principal, id, &query)
@@ -118,7 +117,7 @@ async fn add_member(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
     ClientIp(ip): ClientIp,
-    Path(id): Path<Uuid>,
+    PathId(id): PathId,
     Json(body): Json<AddDepartmentMemberRequest>,
 ) -> AppResult<(StatusCode, JsonResponse<DepartmentMemberResponse>)> {
     let member = service::add_member(&state, &principal, Some(ip.to_string()), id, body).await?;
@@ -129,7 +128,7 @@ async fn remove_member(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
     ClientIp(ip): ClientIp,
-    Path((id, user_id)): Path<(Uuid, Uuid)>,
+    PathIds(id, user_id): PathIds,
 ) -> AppResult<StatusCode> {
     service::remove_member(&state, &principal, Some(ip.to_string()), id, user_id).await?;
     Ok(StatusCode::NO_CONTENT)

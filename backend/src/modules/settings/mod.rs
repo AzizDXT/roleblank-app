@@ -18,6 +18,10 @@ pub use dto::{
     FeatureFlagResponse, SettingResponse, UpdateFeatureFlagRequest, UpdateSettingRequest,
 };
 pub use routes::router;
+/// Exported so the `PathKey` extractor can reject a malformed key using **this**
+/// rule rather than a second copy of it. Two copies of a validation grammar drift,
+/// and the copy that drifts looser is the one an attacker finds.
+pub use service::validate_key;
 pub use service::{
     list_feature_flags, list_settings, update_feature_flag, update_setting, REGISTRATION_MODES,
     REGISTRATION_MODE_KEY,

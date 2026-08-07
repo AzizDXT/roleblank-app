@@ -250,6 +250,24 @@ client_memberships     id, client_account_id, user_id,
 A user may belong to several client accounts — the membership table is the relationship,
 never a `users.client_id` column, precisely so that assumption never has to be unwound.
 
+### `SUSPENDED` exists in the schema and has no endpoint that produces it
+
+`client_memberships.status` and `client_accounts.status` both admit `SUSPENDED`, and
+the visibility predicate correctly treats it as granting nothing. But the API offers
+only `add_member` → `PENDING`, `activate` → `ACTIVE`, and `remove` → `REMOVED`.
+**Nothing sets `SUSPENDED`.**
+
+This was found while writing integration tests: the full `PENDING → ACTIVE →
+SUSPENDED → REMOVED` walk is not API-drivable, and the tests set the column directly
+to assert the behaviour *from* that state (reinstatement by `activate`, and no
+visibility while suspended).
+
+It is a gap rather than a bug — the state is honoured everywhere it is read, and an
+operator can set it by hand — but "suspend a client's access without removing the
+relationship" is an obvious operational need and there is no way to ask for it.
+Recorded here rather than quietly adding an endpoint, because it needs a decision
+about who may suspend and whether it is a dangerous permission.
+
 ## 6. Operations
 
 ```

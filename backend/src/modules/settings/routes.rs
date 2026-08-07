@@ -4,13 +4,13 @@
 //! decision live in the service, so calling the service directly — from a test, a
 //! CLI subcommand or another module — is equally protected.
 
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::routing::{get, put};
 use axum::Router;
 
 use crate::app::AppState;
 use crate::platform::errors::AppResult;
-use crate::platform::http::extract::{Authenticated, Json};
+use crate::platform::http::extract::{Authenticated, Json, PathKey};
 
 use super::dto::{
     FeatureFlagResponse, SettingResponse, UpdateFeatureFlagRequest, UpdateSettingRequest,
@@ -40,13 +40,15 @@ async fn list_settings(
     ))
 }
 
-/// The path segment arrives as a `String` and is validated in the service. Taking
-/// it as anything more structured would move a rejection into axum's extractor,
-/// whose plain-text rejection body is not our error shape.
+/// `PathKey` applies the key grammar in the extractor, so a malformed key is a
+/// problem+json validation error rather than axum's plain-text rejection or a
+/// `404` from a lookup that never ran. The service validates the key again — it
+/// is reachable without going through HTTP, and its guarantees may not depend on
+/// which caller arrived first.
 async fn update_setting(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
-    Path(key): Path<String>,
+    PathKey(key): PathKey,
     Json(request): Json<UpdateSettingRequest>,
 ) -> AppResult<axum::Json<SettingResponse>> {
     Ok(axum::Json(
@@ -66,7 +68,7 @@ async fn list_feature_flags(
 async fn update_feature_flag(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
-    Path(key): Path<String>,
+    PathKey(key): PathKey,
     Json(request): Json<UpdateFeatureFlagRequest>,
 ) -> AppResult<axum::Json<FeatureFlagResponse>> {
     Ok(axum::Json(

@@ -1,12 +1,11 @@
 //! Axum handlers for tasks. Parse, delegate, serialise — no business rules.
 
 use axum::extract::rejection::QueryRejection;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::{delete, get};
 use axum::{Json as AxumJson, Router};
-use uuid::Uuid;
 
 use super::dto::{
     AssignTaskRequest, CancelTaskQuery, ClientTaskListQuery, ClientTaskResponse, CreateTaskRequest,
@@ -15,7 +14,7 @@ use super::dto::{
 use super::service;
 use crate::app::AppState;
 use crate::platform::errors::{AppError, AppResult};
-use crate::platform::http::extract::{Authenticated, ClientIp, Json};
+use crate::platform::http::extract::{Authenticated, ClientIp, Json, PathId, PathIds};
 use crate::platform::http::idempotency::{self, Idempotent};
 use crate::shared::pagination::Page;
 
@@ -77,7 +76,7 @@ async fn list(
 async fn list_for_project(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
-    Path(project_id): Path<Uuid>,
+    PathId(project_id): PathId,
     params: Result<Query<TaskListQuery>, QueryRejection>,
 ) -> AppResult<AxumJson<Page<TaskResponse>>> {
     let params = query(params)?;
@@ -111,7 +110,7 @@ async fn create(
 async fn get_one(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
-    Path(id): Path<Uuid>,
+    PathId(id): PathId,
 ) -> AppResult<AxumJson<TaskResponse>> {
     Ok(AxumJson(service::get(&state, &principal, id).await?))
 }
@@ -120,7 +119,7 @@ async fn patch(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
     ClientIp(ip): ClientIp,
-    Path(id): Path<Uuid>,
+    PathId(id): PathId,
     Json(body): Json<UpdateTaskRequest>,
 ) -> AppResult<AxumJson<TaskResponse>> {
     Ok(AxumJson(
@@ -133,7 +132,7 @@ async fn cancel(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
     ClientIp(ip): ClientIp,
-    Path(id): Path<Uuid>,
+    PathId(id): PathId,
     params: Result<Query<CancelTaskQuery>, QueryRejection>,
 ) -> AppResult<StatusCode> {
     let params = query(params)?;
@@ -144,7 +143,7 @@ async fn cancel(
 async fn list_assignees(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
-    Path(id): Path<Uuid>,
+    PathId(id): PathId,
 ) -> AppResult<AxumJson<Vec<TaskAssigneeResponse>>> {
     Ok(AxumJson(
         service::list_assignees(&state, &principal, id).await?,
@@ -155,7 +154,7 @@ async fn assign(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
     ClientIp(ip): ClientIp,
-    Path(id): Path<Uuid>,
+    PathId(id): PathId,
     Json(body): Json<AssignTaskRequest>,
 ) -> AppResult<StatusCode> {
     service::assign(&state, &principal, &Some(ip.to_string()), id, body).await?;
@@ -166,7 +165,7 @@ async fn unassign(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
     ClientIp(ip): ClientIp,
-    Path((id, user_id)): Path<(Uuid, Uuid)>,
+    PathIds(id, user_id): PathIds,
 ) -> AppResult<StatusCode> {
     service::unassign(&state, &principal, &Some(ip.to_string()), id, user_id).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -177,7 +176,7 @@ async fn unassign(
 async fn client_list_for_project(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
-    Path(project_id): Path<Uuid>,
+    PathId(project_id): PathId,
     params: Result<Query<ClientTaskListQuery>, QueryRejection>,
 ) -> AppResult<AxumJson<Page<ClientTaskResponse>>> {
     let params = query(params)?;
@@ -189,7 +188,7 @@ async fn client_list_for_project(
 async fn client_get(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
-    Path(id): Path<Uuid>,
+    PathId(id): PathId,
 ) -> AppResult<AxumJson<ClientTaskResponse>> {
     Ok(AxumJson(service::client_get(&state, &principal, id).await?))
 }

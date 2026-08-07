@@ -6,12 +6,11 @@
 //! to a direct service call, and the services are what the tests exercise.
 
 use axum::extract::rejection::QueryRejection;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::{delete, get, post};
 use axum::{Json as AxumJson, Router};
-use uuid::Uuid;
 
 use super::dto::{
     AddProjectMemberRequest, ArchiveProjectRequest, ClientProjectListQuery, ClientProjectResponse,
@@ -21,7 +20,7 @@ use super::dto::{
 use super::service;
 use crate::app::AppState;
 use crate::platform::errors::{AppError, AppResult};
-use crate::platform::http::extract::{Authenticated, ClientIp, Json};
+use crate::platform::http::extract::{Authenticated, ClientIp, Json, PathId, PathIds};
 use crate::platform::http::idempotency::{self, Idempotent};
 use crate::shared::pagination::Page;
 
@@ -107,7 +106,7 @@ async fn create(
 async fn get_one(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
-    Path(id): Path<Uuid>,
+    PathId(id): PathId,
 ) -> AppResult<AxumJson<ProjectResponse>> {
     Ok(AxumJson(service::get(&state, &principal, id).await?))
 }
@@ -116,7 +115,7 @@ async fn patch(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
     ClientIp(ip): ClientIp,
-    Path(id): Path<Uuid>,
+    PathId(id): PathId,
     Json(body): Json<UpdateProjectRequest>,
 ) -> AppResult<AxumJson<ProjectResponse>> {
     Ok(AxumJson(
@@ -128,7 +127,7 @@ async fn archive(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
     ClientIp(ip): ClientIp,
-    Path(id): Path<Uuid>,
+    PathId(id): PathId,
     Json(body): Json<ArchiveProjectRequest>,
 ) -> AppResult<AxumJson<ProjectResponse>> {
     Ok(AxumJson(
@@ -139,7 +138,7 @@ async fn archive(
 async fn list_members(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
-    Path(id): Path<Uuid>,
+    PathId(id): PathId,
 ) -> AppResult<AxumJson<Vec<ProjectMemberResponse>>> {
     Ok(AxumJson(
         service::list_members(&state, &principal, id).await?,
@@ -150,7 +149,7 @@ async fn add_member(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
     ClientIp(ip): ClientIp,
-    Path(id): Path<Uuid>,
+    PathId(id): PathId,
     Json(body): Json<AddProjectMemberRequest>,
 ) -> AppResult<StatusCode> {
     service::add_member(&state, &principal, &Some(ip.to_string()), id, body).await?;
@@ -161,7 +160,7 @@ async fn remove_member(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
     ClientIp(ip): ClientIp,
-    Path((id, user_id)): Path<(Uuid, Uuid)>,
+    PathIds(id, user_id): PathIds,
 ) -> AppResult<StatusCode> {
     service::remove_member(&state, &principal, &Some(ip.to_string()), id, user_id).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -170,7 +169,7 @@ async fn remove_member(
 async fn list_clients(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
-    Path(id): Path<Uuid>,
+    PathId(id): PathId,
 ) -> AppResult<AxumJson<Vec<ProjectClientLinkResponse>>> {
     Ok(AxumJson(
         service::list_client_links(&state, &principal, id).await?,
@@ -181,7 +180,7 @@ async fn share(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
     ClientIp(ip): ClientIp,
-    Path(id): Path<Uuid>,
+    PathId(id): PathId,
     Json(body): Json<ShareProjectRequest>,
 ) -> AppResult<StatusCode> {
     service::share_with_client(&state, &principal, &Some(ip.to_string()), id, body).await?;
@@ -192,7 +191,7 @@ async fn unshare(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
     ClientIp(ip): ClientIp,
-    Path((id, client_account_id)): Path<(Uuid, Uuid)>,
+    PathIds(id, client_account_id): PathIds,
 ) -> AppResult<StatusCode> {
     service::unshare_from_client(
         &state,
@@ -221,7 +220,7 @@ async fn client_list(
 async fn client_get(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
-    Path(id): Path<Uuid>,
+    PathId(id): PathId,
 ) -> AppResult<AxumJson<ClientProjectResponse>> {
     Ok(AxumJson(service::client_get(&state, &principal, id).await?))
 }

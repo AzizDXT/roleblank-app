@@ -117,17 +117,54 @@ async fn read_of_an_unknown_department_is_not_found() {
 }
 
 /// A malformed path parameter must be refused before any handler runs, so it can
-/// never reach a query or a permission decision.
+/// never reach a query or a permission decision — and the refusal must be the
+/// API's own error shape.
+///
+/// This covers all three properties `PathId` exists to guarantee, because each was
+/// broken by the `Path<Uuid>` this route used to extract:
+///
+/// 1. `application/problem+json` with a stable `code`, per
+///    `docs/backend/07-api-contract.md` §1 and §2. axum's rejection was
+///    `text/plain`, leaving a client that branches on `code` with nothing.
+/// 2. The rejected segment is **not** reflected. axum's rejection echoed it
+///    verbatim, which is the reflection gadget every other refusal in this
+///    codebase avoids — see `shared::pagination`, which names the allowed sort
+///    fields and never the rejected one.
+/// 3. No Rust binding or parser internals named. axum's rejection quoted both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_malformed_identifier_never_reaches_the_handler() {
     let app = TestApp::spawn().await;
     let root = bootstrap_root(&app).await;
+
+    // Distinctive enough that finding it anywhere in the body proves reflection,
+    // and shaped like the traversal and injection payloads a prober would send.
+    const BAD: &str = "not-a-uuid-and-also-..-etc-passwd";
+
     let response = app
-        .get("/api/v1/departments/not-a-uuid", Some(&root.token))
+        .get(&format!("/api/v1/departments/{BAD}"), Some(&root.token))
         .await;
     response
-        .assert_status(StatusCode::BAD_REQUEST)
+        .assert_error(StatusCode::BAD_REQUEST, "VALIDATION_FAILED")
         .assert_no_secrets();
+
+    let raw = String::from_utf8_lossy(&response.raw);
+    assert!(
+        !raw.contains(BAD),
+        "the rejected value was reflected: {raw}"
+    );
+    assert!(
+        !raw.contains("Cannot parse"),
+        "leaked axum's wording: {raw}"
+    );
+    assert!(
+        !raw.to_lowercase().contains("invalid url"),
+        "leaked axum's wording: {raw}"
+    );
+
+    // The field error carries the specific, stable reason alongside the envelope
+    // code, so a client can tell a bad identifier from a bad body field.
+    assert_eq!(response.str_at("/errors/0/code"), "INVALID_UUID");
+    assert_eq!(response.str_at("/errors/0/field"), "id");
 
     // Nothing was read and nothing was written: the request died in the extractor.
     let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM departments")
@@ -135,16 +172,88 @@ async fn a_malformed_identifier_never_reaches_the_handler() {
         .await
         .expect("count departments");
     assert_eq!(count, 0);
+}
 
-    // The `code`/`application/problem+json` contract is deliberately NOT asserted
-    // here, and that is a finding rather than an omission: this route extracts
-    // `Path<Uuid>`, so the rejection is axum's own `text/plain` body, which names
-    // the Rust field and echoes the caller's value back. `authorization::routes`
-    // and `audit::routes` parse `Path<String>` by hand precisely to avoid that —
-    // see the comments there — and the same treatment has not reached the
-    // departments, clients, projects, tasks, identity or settings routers. Pinning
-    // the current shape here would cement the deviation; asserting the intended one
-    // would fail. Reported instead.
+/// The two-parameter routes take `PathIds`, and a malformed value in **either**
+/// position must be refused identically. The second position is the easier one to
+/// forget, and it is the one that resolves a membership — the row that decides
+/// `DEPARTMENT` scope — so a handler must never see a half-parsed pair.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_identifier_in_either_position_is_refused_the_same_way() {
+    let app = TestApp::spawn().await;
+    let root = bootstrap_root(&app).await;
+    let department = create_department(&app, &root.token, "operations", "Operations").await;
+
+    const BAD: &str = "not-a-uuid-and-also-..-etc-passwd";
+    let real = Uuid::now_v7();
+
+    for (path, field) in [
+        (format!("/api/v1/departments/{BAD}/members/{real}"), "id"),
+        (
+            format!("/api/v1/departments/{department}/members/{BAD}"),
+            "sub_id",
+        ),
+    ] {
+        let response = app.delete(&path, Some(&root.token)).await;
+        response
+            .assert_error(StatusCode::BAD_REQUEST, "VALIDATION_FAILED")
+            .assert_no_secrets();
+
+        let raw = String::from_utf8_lossy(&response.raw);
+        assert!(!raw.contains(BAD), "{path} reflected the rejected value");
+        assert_eq!(response.str_at("/errors/0/code"), "INVALID_UUID");
+        assert_eq!(response.str_at("/errors/0/field"), field);
+    }
+
+    // No membership was created, removed or even looked up.
+    let (members,): (i64,) = sqlx::query_as("SELECT count(*) FROM department_memberships")
+        .fetch_one(&app.db)
+        .await
+        .expect("count department memberships");
+    assert_eq!(members, 0);
+}
+
+/// `/settings/{key}` takes `PathKey`, so a key outside the grammar the database
+/// `CHECK` enforces is a validation error rather than a `404`. A `404` would be an
+/// answer about whether the key exists, produced by a lookup that never ran.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_settings_key_is_a_validation_error_not_a_lookup() {
+    let app = TestApp::spawn().await;
+    let root = bootstrap_root(&app).await;
+
+    const BAD_KEY: &str = "Registration.Mode..DROP-TABLE-system_settings";
+
+    let before: Vec<(String, i32)> =
+        sqlx::query_as("SELECT key, version FROM system_settings ORDER BY key")
+            .fetch_all(&app.db)
+            .await
+            .expect("read settings");
+
+    let response = app
+        .put(
+            &format!("/api/v1/settings/{BAD_KEY}"),
+            Some(&root.token),
+            json!({ "value": "DISABLED", "version": 1 }),
+        )
+        .await;
+    response
+        .assert_error(StatusCode::BAD_REQUEST, "VALIDATION_FAILED")
+        .assert_no_secrets();
+
+    let raw = String::from_utf8_lossy(&response.raw);
+    assert!(
+        !raw.contains(BAD_KEY),
+        "the rejected key was reflected: {raw}"
+    );
+    assert_eq!(response.str_at("/errors/0/field"), "key");
+
+    // No row was inserted and no version moved: the request died in the extractor.
+    let after: Vec<(String, i32)> =
+        sqlx::query_as("SELECT key, version FROM system_settings ORDER BY key")
+            .fetch_all(&app.db)
+            .await
+            .expect("read settings");
+    assert_eq!(before, after, "a refused key still touched a settings row");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

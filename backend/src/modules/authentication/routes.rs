@@ -17,19 +17,18 @@
 //!
 //! The router is returned unmounted. It expects to be nested at `/api/v1/auth`.
 
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::Router;
-use uuid::Uuid;
 
 use crate::app::AppState;
 use crate::modules::authentication::service::ClientHints;
 use crate::modules::authentication::{dto, mfa, service};
 use crate::platform::errors::AppResult;
 use crate::platform::http::extract::{
-    Authenticated, ClientIp, Json, MfaPendingSession, UserAgentHint,
+    Authenticated, ClientIp, Json, MfaPendingSession, PathId, UserAgentHint,
 };
 
 /// The authentication routes, relative to their mount point (`/api/v1/auth`).
@@ -157,7 +156,7 @@ async fn revoke_session(
     Authenticated(principal): Authenticated,
     ip: ClientIp,
     agent: UserAgentHint,
-    Path(session_id): Path<Uuid>,
+    PathId(session_id): PathId,
 ) -> AppResult<impl IntoResponse> {
     let response =
         service::revoke_own_session(&state, &principal, session_id, &hints(ip, agent)).await?;

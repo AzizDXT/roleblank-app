@@ -8,16 +8,15 @@
 //! rejects an MFA-pending session automatically. A handler cannot forget to think
 //! about MFA, because the safe extractor is the default one.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::{delete, get, post};
 use axum::Router;
-use uuid::Uuid;
 
 use crate::app::AppState;
 use crate::platform::errors::AppResult;
-use crate::platform::http::extract::{Authenticated, ClientIp, Json};
+use crate::platform::http::extract::{Authenticated, ClientIp, Json, PathId};
 use crate::platform::http::idempotency::{self, Idempotent};
 use crate::shared::pagination::Page;
 
@@ -69,7 +68,7 @@ async fn list_users(
 async fn get_user(
     State(state): State<AppState>,
     principal: Authenticated,
-    Path(id): Path<Uuid>,
+    PathId(id): PathId,
 ) -> AppResult<axum::Json<UserResponse>> {
     Ok(axum::Json(service::get_user(&state, &principal, id).await?))
 }
@@ -77,7 +76,7 @@ async fn get_user(
 async fn update_user(
     State(state): State<AppState>,
     principal: Authenticated,
-    Path(id): Path<Uuid>,
+    PathId(id): PathId,
     Json(request): Json<UpdateUserRequest>,
 ) -> AppResult<axum::Json<UserResponse>> {
     Ok(axum::Json(
@@ -88,7 +87,7 @@ async fn update_user(
 async fn suspend_user(
     State(state): State<AppState>,
     principal: Authenticated,
-    Path(id): Path<Uuid>,
+    PathId(id): PathId,
     Json(request): Json<SuspendUserRequest>,
 ) -> AppResult<axum::Json<UserResponse>> {
     Ok(axum::Json(
@@ -99,7 +98,7 @@ async fn suspend_user(
 async fn reactivate_user(
     State(state): State<AppState>,
     principal: Authenticated,
-    Path(id): Path<Uuid>,
+    PathId(id): PathId,
     Json(request): Json<ReactivateUserRequest>,
 ) -> AppResult<axum::Json<UserResponse>> {
     Ok(axum::Json(
@@ -110,7 +109,7 @@ async fn reactivate_user(
 async fn archive_user(
     State(state): State<AppState>,
     principal: Authenticated,
-    Path(id): Path<Uuid>,
+    PathId(id): PathId,
     Json(request): Json<ArchiveUserRequest>,
 ) -> AppResult<axum::Json<UserResponse>> {
     Ok(axum::Json(
@@ -156,7 +155,7 @@ async fn list_invitations(
 async fn revoke_invitation(
     State(state): State<AppState>,
     principal: Authenticated,
-    Path(id): Path<Uuid>,
+    PathId(id): PathId,
 ) -> AppResult<axum::Json<InvitationResponse>> {
     Ok(axum::Json(
         invitations::revoke_invitation(&state, &principal, id).await?,

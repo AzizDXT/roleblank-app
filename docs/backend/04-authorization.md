@@ -299,6 +299,31 @@ Two consequences worth stating because they are easy to get wrong:
 The rule is applied per-principal-type, not blanket, and is implemented once in
 `AppError::for_principal` rather than at each call site.
 
+## 10a. An inconsistency you will meet when building a client
+
+When an actor's scope resolves to **no rows at all**, the modules do not agree:
+
+| Endpoint | Response |
+| --- | --- |
+| `GET /api/v1/projects`, `GET /api/v1/tasks` | **`200`** with an empty page |
+| `GET /api/v1/departments`, `/clients`, `/users` | **`403 AUTHORIZATION_DENIED`** |
+
+Both are defensible. "You may list, and the list is empty" is the more useful
+answer for a collection an employee legitimately holds a narrow scope over. "You
+hold nothing here at all" is the more honest answer where holding no scope means
+the actor has no business on that surface.
+
+Neither is a defect and both are asserted by `integration/scope_filtering.rs`, but a
+client must handle both — a UI that treats `403` on a list as "session broken" will
+misbehave for a perfectly ordinary employee. Recorded here rather than silently
+harmonised, because harmonising it is an API change and needs its own decision.
+
+Related: `iam.users.read@ASSIGNED` reaches nothing and always refuses. A user record
+has no assignment relation, so the scope is meaningless on that resource. It is not
+rejected at grant time — that would require the delegation guard to know which
+scopes are meaningful per resource type, which is a larger model than the one
+ADR-003 chose.
+
 ## 11. Caching
 
 **There is none.** Effective permissions are recomputed from the database on every request

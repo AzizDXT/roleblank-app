@@ -291,17 +291,17 @@ cargo test
 | `tests/router_registry.rs` | 5 | **PASS** |
 | `tests/golden_scenario.rs` | 1 | **PASS** |
 | `tests/benchmarks.rs` | 4 | ignored by default; run separately in release mode |
-| **Total** | **861** | **861 passed, 0 failed** |
+| **Total** | **903** | **903 passed, 0 failed** |
 
 Line coverage, `cargo llvm-cov`: **90.37%** overall (31 347 regions).
 
 ---
 
-## 12a. The adversarial round — eight real defects
+## 12a. The adversarial round — nine real defects
 
 The suite stood at **622 tests, all green, all four gates passing**. Three
 adversarial agents were then set on the system with instructions to break it rather
-than confirm it. They found **eight genuine defects**. Three would have reached
+than confirm it. They found **nine genuine defects**. Three would have reached
 production with no signal at all.
 
 ### D1 — Sixteen security tests existed on disk and had never been compiled
@@ -370,6 +370,34 @@ budget — during exactly the outage the budget exists to survive. Fixed with a
 `modules::outbox::idempotency` existed in full and the header is in the OpenAPI
 document for six `POST` routes, but nothing read it. A retried create made a second
 object. Fixed with an `Idempotent<T>` extractor wired into all six.
+
+
+### D9 — `Path<Uuid>` rejections bypassed the error contract in seven modules
+
+`GET /api/v1/departments/not-a-uuid` returned:
+
+```
+400  Content-Type: text/plain; charset=utf-8
+Invalid URL: Cannot parse `id` with value `not-a-uuid`: UUID parsing failed…
+```
+
+Three broken promises at once: it is not `application/problem+json` and carries no
+stable `code`, so a client has nothing to branch on; it **reflects the
+attacker-controlled path segment** back in the body; and it names the Rust binding.
+
+The reflection is the part that matters most, because this codebase refuses to do it
+everywhere else — the pagination sort allowlist deliberately names the *permitted*
+fields and never the rejected value, with a test asserting exactly that. Two modules
+(`authorization`, `audit`) already parsed `Path<String>` by hand with comments
+explaining why. Seven did not: `departments`, `clients`, `projects`, `tasks`,
+`identity`, `settings`, and `authentication`.
+
+Found by an integration test that recorded the deviation rather than cementing it.
+Fixed with shared `PathId` / `PathIds` / `PathKey` extractors across **41 call
+sites**, carrying a comment that ends "do not simplify these back to `Path<Uuid>`".
+`PathKey` delegates to the settings module's own `validate_key` rather than
+re-deriving the grammar — a second copy of a validation regex drifts, and the looser
+copy is the one that gets found.
 
 ### Two smaller findings
 
