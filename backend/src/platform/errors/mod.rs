@@ -350,11 +350,29 @@ struct ProblemDetails<'a> {
     errors: Option<&'a [FieldError]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     step_up: Option<StepUpHint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version_conflict: Option<VersionConflictHint>,
 }
 
 #[derive(Debug, Serialize)]
 struct StepUpHint {
     window_seconds: u64,
+}
+
+/// The two versions a losing writer needs, as *data* rather than as prose.
+///
+/// `detail` already states both numbers, but `detail` is human text that rule 1 of
+/// this module says may be reworded at any time. A client that wants to re-read and
+/// retry automatically — which is the entire point of optimistic concurrency — would
+/// otherwise have to parse an English sentence to find out what the current version
+/// is. Emitting the pair as a field makes the retry loop machine-writable and makes
+/// a test able to assert it without asserting on prose.
+#[derive(Debug, Serialize)]
+struct VersionConflictHint {
+    /// The version the client sent.
+    expected: i32,
+    /// The version the row actually holds now. Re-read and retry with this.
+    actual: i32,
 }
 
 impl IntoResponse for AppError {
@@ -384,6 +402,13 @@ impl IntoResponse for AppError {
             }),
             _ => None,
         };
+        let version_conflict = match &self {
+            AppError::VersionConflict { expected, actual } => Some(VersionConflictHint {
+                expected: *expected,
+                actual: *actual,
+            }),
+            _ => None,
+        };
 
         let code = self.code();
         let body = ProblemDetails {
@@ -395,6 +420,7 @@ impl IntoResponse for AppError {
             request_id,
             errors,
             step_up,
+            version_conflict,
         };
 
         let payload = serde_json::to_vec(&body).unwrap_or_else(|_| {

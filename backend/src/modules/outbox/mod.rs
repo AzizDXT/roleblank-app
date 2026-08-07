@@ -33,8 +33,13 @@ use sqlx::postgres::PgPool;
 use sqlx::{Postgres, Transaction};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+/// Re-exported so a caller of [`OutboxWorker::run`] — `cli.rs`, or a test that
+/// needs to prove the worker shuts down without abandoning a claim — does not have
+/// to take a direct dependency on `tokio-util` just to name the argument this
+/// module's own public API demands.
+pub use tokio_util::sync::CancellationToken;
 
 use crate::platform::errors::AppError;
 use crate::platform::observability::sanitize;
@@ -67,6 +72,28 @@ pub const MAX_BACKOFF_SECONDS: u64 = 3600;
 /// Jitter as a percentage of the backoff. ±20% is enough to break up a thundering
 /// herd without materially changing the schedule an operator reads off a dashboard.
 pub const JITTER_PERCENT: u64 = 20;
+
+/// How long a claim is respected by other workers before the row is claimable again.
+///
+/// **Why this exists.** `FOR UPDATE SKIP LOCKED` only excludes workers that are
+/// claiming at the *same instant*: the claiming `UPDATE` is a single autocommit
+/// statement, so its row locks are gone the moment it returns. Without a lease, a
+/// second worker polling a few milliseconds later sees rows that are still `PENDING`
+/// — the claim does not move them out of that status — and claims them again while
+/// the first worker is still delivering them. That was measured, not theorised: six
+/// workers claiming 300 events took 601 claims between them.
+///
+/// The visible consequence is a duplicated password-reset or invitation email, which
+/// at-least-once delivery tolerates. The invisible one is worse: both workers then
+/// call `mark_failed` on the same row, `attempts` is incremented twice per real
+/// attempt, and a deliverable message is dead-lettered at half its intended budget
+/// during exactly the provider outage the budget exists to survive.
+///
+/// Sixty seconds is chosen so that it comfortably exceeds one delivery attempt
+/// (which is bounded by the provider's own timeout) while keeping recovery from a
+/// killed worker to one minute. A row whose worker died mid-attempt is re-claimable
+/// once the lease lapses; a row whose worker shut down cleanly was already released.
+pub const CLAIM_LEASE_SECONDS: i64 = 60;
 
 /// Budget for `last_error`.
 ///
@@ -155,6 +182,22 @@ pub struct InvitationPayload {
 
 /// The longest address the API accepts, mirroring `shared::validation::MAX_EMAIL_LEN`.
 const MAX_RECIPIENT_LEN: usize = 254;
+
+/// Build the link a recipient clicks.
+///
+/// One helper rather than a `format!` at each call site, because the two call sites
+/// (a password reset and an invitation) must agree on how the base URL's trailing
+/// slash is handled — `https://os.example.com/` and `https://os.example.com` must
+/// produce the same link, or one deployment's links silently gain a `//`.
+///
+/// The token needs no percent-encoding: it is an ASCII prefix followed by
+/// base64url-no-pad, whose alphabet is `[A-Za-z0-9_-]` and contains no character
+/// that is special in a query string. That is a property of `tokens::generate`, not
+/// an assumption, and the unit test below pins it — a future token format that used
+/// standard base64 would otherwise produce URLs silently truncated at the first `+`.
+pub fn action_link(base_url: &str, path: &str, token: &str) -> String {
+    format!("{}{path}?token={token}", base_url.trim_end_matches('/'))
+}
 
 /// Structural check on a recipient read back out of a payload.
 ///
@@ -349,12 +392,19 @@ pub fn next_delay_seconds(id: Uuid, attempts: i32) -> u64 {
 
 /// One claimed row. Explicit columns, explicit types — the worker never does
 /// `SELECT *`, so adding a column to the table cannot change what it reads.
+///
+/// Public, together with [`OutboxWorker::claim`], because the no-double-claim
+/// property is the single most important thing about running more than one worker
+/// and it cannot be demonstrated through `run`: `run` delivers and marks each row
+/// terminal within microseconds, so two workers racing through it would pass
+/// whether or not `SKIP LOCKED` were present. A test has to be able to hold several
+/// claims open at once and compare the sets.
 #[derive(Debug, Clone, sqlx::FromRow)]
-struct ClaimedEvent {
-    id: Uuid,
-    event_type: String,
-    payload: serde_json::Value,
-    attempts: i32,
+pub struct ClaimedEvent {
+    pub id: Uuid,
+    pub event_type: String,
+    pub payload: serde_json::Value,
+    pub attempts: i32,
 }
 
 pub struct OutboxWorker {
@@ -542,17 +592,28 @@ impl OutboxWorker {
 
     /// Atomically take ownership of a batch.
     ///
-    /// `FOR UPDATE SKIP LOCKED` is what makes this safe with several workers and no
-    /// leader election: each worker's `SELECT` locks the rows it picks and *skips*
-    /// rows another worker has already locked, so two workers never claim the same
-    /// event and neither one blocks on the other. The alternative designs — an
-    /// advisory lock making one instance the leader, or a `SELECT` followed by a
-    /// conditional `UPDATE` — either serialise all delivery through one process or
+    /// Two mechanisms, and both are needed.
+    ///
+    /// `FOR UPDATE SKIP LOCKED` handles *simultaneous* claims: each worker's inner
+    /// `SELECT` locks the rows it picks and steps over rows another worker's
+    /// in-flight statement already holds, so two claims running at the same instant
+    /// partition the queue and neither blocks on the other. The alternative designs
+    /// — an advisory lock making one instance the leader, or a `SELECT` followed by
+    /// a conditional `UPDATE` — either serialise all delivery through one process or
     /// reintroduce the race they were meant to remove.
+    ///
+    /// The `claimed_at` predicate handles *consecutive* claims, and is the part that
+    /// is easy to leave out. This is one autocommit statement, so its row locks are
+    /// released the moment it returns, and a claimed row is still `PENDING` — the
+    /// claim deliberately does not move it to a separate status, because a crash
+    /// between claiming and delivering would then strand it in a state nothing
+    /// sweeps. So without the lease a worker polling milliseconds later re-claims
+    /// rows the first worker is at that moment delivering. See
+    /// [`CLAIM_LEASE_SECONDS`] for what that costs.
     ///
     /// `ORDER BY available_at, id` keeps delivery roughly FIFO and makes the scan
     /// match `outbox_events_claimable_idx` exactly.
-    async fn claim(&self) -> Result<Vec<ClaimedEvent>, AppError> {
+    pub async fn claim(&self) -> Result<Vec<ClaimedEvent>, AppError> {
         let rows: Vec<ClaimedEvent> = sqlx::query_as(
             "UPDATE outbox_events
                 SET status = 'PENDING',
@@ -563,6 +624,8 @@ impl OutboxWorker {
                       FROM outbox_events
                      WHERE status IN ('PENDING', 'FAILED')
                        AND available_at <= now()
+                       AND (claimed_at IS NULL
+                            OR claimed_at <= now() - ($3::bigint * interval '1 second'))
                      ORDER BY available_at, id
                      LIMIT $2
                      FOR UPDATE SKIP LOCKED
@@ -571,6 +634,7 @@ impl OutboxWorker {
         )
         .bind(&self.worker_id)
         .bind(i64::from(self.batch_size))
+        .bind(CLAIM_LEASE_SECONDS)
         .fetch_all(&self.pool)
         .await
         .map_err(AppError::from)?;
@@ -814,6 +878,33 @@ mod tests {
             "jitter spread only {} distinct delays over 1000 events",
             delays.len()
         );
+    }
+
+    /// The lease has to be longer than a delivery attempt and shorter than an
+    /// operator's patience. Pinned so a future edit has to think about both ends.
+    #[test]
+    fn the_claim_lease_sits_between_one_attempt_and_one_retry() {
+        // `const` blocks: these compare two constants, so the check belongs at
+        // compile time and clippy is right to refuse a runtime assertion for it.
+        const {
+            assert!(
+                CLAIM_LEASE_SECONDS > 0,
+                "a zero lease reinstates the double-claim"
+            )
+        };
+        const {
+            assert!(
+                CLAIM_LEASE_SECONDS >= 30,
+                "the lease must comfortably exceed one delivery attempt"
+            )
+        };
+        const {
+            assert!(
+                (CLAIM_LEASE_SECONDS as u64) <= MAX_BACKOFF_SECONDS,
+                "a lease longer than the maximum backoff would delay recovery from a \
+                 killed worker beyond the retry schedule itself"
+            )
+        };
     }
 
     #[test]
@@ -1065,6 +1156,41 @@ mod tests {
     }
 
     // ---- event types ------------------------------------------------------
+
+    // ---- links ------------------------------------------------------------
+
+    #[test]
+    fn an_action_link_is_built_the_same_way_whatever_the_base_url_looks_like() {
+        let token = "rb_pr_AbC-123_xyz";
+        for base in ["https://os.example.com", "https://os.example.com/"] {
+            assert_eq!(
+                action_link(base, "/password-reset/confirm", token),
+                "https://os.example.com/password-reset/confirm?token=rb_pr_AbC-123_xyz"
+            );
+        }
+    }
+
+    /// The reason `action_link` may skip percent-encoding. If the token alphabet
+    /// ever gains `+`, `/` or `=`, this fails here rather than producing links that
+    /// truncate in a mail client.
+    #[test]
+    fn generated_tokens_are_url_safe_without_encoding() {
+        for prefix in [
+            crate::platform::crypto::tokens::RESET_TOKEN_PREFIX,
+            crate::platform::crypto::tokens::INVITE_TOKEN_PREFIX,
+        ] {
+            for _ in 0..50 {
+                let t = crate::platform::crypto::tokens::generate(prefix).expect("csprng");
+                let plaintext = t.plaintext.expose();
+                assert!(
+                    plaintext
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+                    "token `{plaintext}` contains a character that must be percent-encoded"
+                );
+            }
+        }
+    }
 
     #[test]
     fn event_types_are_unique_and_fit_the_column_constraint() {

@@ -339,6 +339,40 @@ pub async fn complete(
     Ok(())
 }
 
+/// Release a reservation whose work did not happen.
+///
+/// The counterpart to `complete`. `begin` reserves the key *before* the work runs,
+/// which is what makes two simultaneous requests deterministic — but it also means a
+/// request that then fails validation, authorisation or a database constraint has
+/// consumed a key for work that did not occur. Leaving the reservation would make a
+/// client's corrected retry, with the same key and a corrected body, a `409` for the
+/// next 24 hours; and a retry with the *same* body would be told the work was
+/// already done when it was not.
+///
+/// `status = 'IN_PROGRESS'` in the predicate means this can never delete a record
+/// that has already stored a response, so a late or duplicated call is a no-op
+/// rather than a way to erase a completed reservation.
+///
+/// Infallible by signature: the caller is already returning an error, and replacing
+/// the real failure with "the cleanup failed" would tell the client nothing useful.
+/// A failure is logged and the record is left to the retention sweep.
+pub async fn abandon(pool: &PgPool, record_id: Uuid) {
+    let result =
+        sqlx::query("DELETE FROM idempotency_records WHERE id = $1 AND status = 'IN_PROGRESS'")
+            .bind(record_id)
+            .execute(pool)
+            .await;
+
+    if let Err(e) = result {
+        tracing::warn!(
+            record_id = %record_id,
+            error.kind = ?std::mem::discriminant(&e),
+            "could not release an idempotency reservation for work that failed; \
+             the key stays reserved until it expires"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

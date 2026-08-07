@@ -3,6 +3,7 @@
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::Response;
 use axum::routing::{delete, get};
 use axum::{Json as AxumJson, Router};
 use uuid::Uuid;
@@ -15,6 +16,7 @@ use super::service;
 use crate::app::AppState;
 use crate::platform::errors::{AppError, AppResult};
 use crate::platform::http::extract::{Authenticated, ClientIp, Json};
+use crate::platform::http::idempotency::{self, Idempotent};
 use crate::shared::pagination::Page;
 
 fn query<T>(result: Result<Query<T>, QueryRejection>) -> AppResult<T> {
@@ -84,14 +86,26 @@ async fn list_for_project(
     ))
 }
 
+/// Honours `Idempotency-Key` (`api/openapi.yaml`), so a retried create replays the
+/// original task rather than adding a duplicate to the project.
 async fn create(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
     ClientIp(ip): ClientIp,
-    Json(body): Json<CreateTaskRequest>,
-) -> AppResult<(StatusCode, AxumJson<TaskResponse>)> {
-    let task = service::create(&state, &principal, &Some(ip.to_string()), body).await?;
-    Ok((StatusCode::CREATED, AxumJson(task)))
+    body: Idempotent<CreateTaskRequest>,
+) -> AppResult<Response> {
+    let principal_id = principal.user_id();
+    let inner = state.clone();
+    idempotency::create(
+        &state,
+        principal_id,
+        "tasks.create",
+        body,
+        move |request| async move {
+            service::create(&inner, &principal, &Some(ip.to_string()), request).await
+        },
+    )
+    .await
 }
 
 async fn get_one(

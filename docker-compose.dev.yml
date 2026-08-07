@@ -1,4 +1,4 @@
-# =============================================================================
+﻿# =============================================================================
 # RoleBlank OS — DEVELOPMENT compose file
 # =============================================================================
 # THIS IS NOT PRODUCTION ORCHESTRATION. Do not copy it to a server.
@@ -32,6 +32,9 @@
 services:
   postgres:
     image: postgres:18.4-alpine
+    # See scripts/rb.ps1: the test harness needs far more than the default 100
+    # short-lived connections. Production sizing is a separate decision.
+    command: ["postgres", "-c", "max_connections=400", "-c", "shared_buffers=256MB"]
     container_name: roleblank-postgres
     environment:
       # ---------------------------------------------------------------------

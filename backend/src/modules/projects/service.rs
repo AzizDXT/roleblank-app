@@ -801,7 +801,6 @@ pub async fn share_with_client(
     id: Uuid,
     request: ShareProjectRequest,
 ) -> AppResult<()> {
-    state.require_step_up_for(principal, PERM_SHARE)?;
     let note = v::optional_text("note", request.note.as_deref(), v::MAX_REASON_LEN)?;
 
     let mut tx = state.begin().await?;
@@ -832,6 +831,15 @@ pub async fn share_with_client(
         tx.commit().await?;
         return Err(denied);
     }
+    // Step-up is demanded **after** authorisation, not before.
+    //
+    // Checking it first is cheaper, but it answers every caller — including an
+    // external CLIENT, which can never hold `projects.clients.share` at all —
+    // with `403 STEP_UP_REQUIRED`. That distinguishes an internal-only route from
+    // one that does not exist, and `docs/backend/04-authorization.md` §10 requires
+    // a client to receive `404` there. Authorising first also stops the API telling
+    // an unauthorised employee which of its controls it would have to defeat.
+    state.require_step_up_for(principal, PERM_SHARE)?;
 
     if status_of(&row)? == ProjectStatus::Archived {
         return Err(AppError::conflict(
@@ -899,8 +907,6 @@ pub async fn unshare_from_client(
     id: Uuid,
     client_account_id: Uuid,
 ) -> AppResult<()> {
-    state.require_step_up_for(principal, PERM_SHARE)?;
-
     let mut tx = state.begin().await?;
     let row = repo::find_for_update(&mut tx, id)
         .await?
@@ -928,6 +934,8 @@ pub async fn unshare_from_client(
         tx.commit().await?;
         return Err(denied);
     }
+    // After authorisation, for the same reason as `share_with_client`.
+    state.require_step_up_for(principal, PERM_SHARE)?;
 
     if !repo::unshare_from_client(&mut tx, id, client_account_id, principal.user_id()).await? {
         return Err(AppError::NotFound);

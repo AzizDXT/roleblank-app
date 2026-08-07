@@ -10,6 +10,7 @@
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::Response;
 use axum::routing::{delete, get, post};
 use axum::Router;
 use uuid::Uuid;
@@ -17,6 +18,7 @@ use uuid::Uuid;
 use crate::app::AppState;
 use crate::platform::errors::AppResult;
 use crate::platform::http::extract::{Authenticated, ClientIp, Json};
+use crate::platform::http::idempotency::{self, Idempotent};
 use crate::shared::pagination::Page;
 
 use super::dto::{
@@ -120,13 +122,25 @@ async fn archive_user(
 // Invitations
 // =============================================================================
 
+/// Honours `Idempotency-Key` (`api/openapi.yaml`). An invitation is a deferred
+/// grant of authority, so a duplicate produced by a retry is a second live way into
+/// the company — and the one-pending-per-address index would turn the retry into an
+/// opaque `409` rather than the original response.
 async fn create_invitation(
     State(state): State<AppState>,
     principal: Authenticated,
-    Json(request): Json<CreateInvitationRequest>,
-) -> AppResult<(StatusCode, axum::Json<InvitationResponse>)> {
-    let response = invitations::create_invitation(&state, &principal, request).await?;
-    Ok((StatusCode::CREATED, axum::Json(response)))
+    request: Idempotent<CreateInvitationRequest>,
+) -> AppResult<Response> {
+    let principal_id = principal.user_id();
+    let inner = state.clone();
+    idempotency::create(
+        &state,
+        principal_id,
+        "invitations.create",
+        request,
+        move |body| async move { invitations::create_invitation(&inner, &principal, body).await },
+    )
+    .await
 }
 
 async fn list_invitations(

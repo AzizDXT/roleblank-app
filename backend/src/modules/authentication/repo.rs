@@ -11,7 +11,6 @@
 //! parameters; the classification of "is this token reusable" lives in
 //! `sessions.rs` where it can be tested without a database.
 
-use serde_json::Value;
 use sqlx::{PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -515,11 +514,15 @@ pub async fn update_password(
 // Password reset
 // =============================================================================
 
+/// Explicit columns, and no more than the reset flow needs.
+///
+/// `display_name` is deliberately absent: the reset message is addressed by email
+/// and greets nobody by name, so selecting the name would be personal data loaded
+/// on an anonymous, unauthenticated request for no purpose.
 #[derive(Debug, sqlx::FromRow)]
 pub struct ResetSubject {
     pub user_id: Uuid,
     pub email: String,
-    pub display_name: String,
     pub principal_type: String,
     pub status: String,
 }
@@ -532,7 +535,6 @@ pub async fn find_reset_subject(
         r#"
         SELECT u.id             AS user_id,
                u.email          AS email,
-               u.display_name   AS display_name,
                u.principal_type AS principal_type,
                u.status         AS status
           FROM users u
@@ -878,29 +880,12 @@ pub async fn count_live_recovery_codes(
 // =============================================================================
 // Outbox
 // =============================================================================
-
-/// Enqueue a mail event **inside the caller's transaction**.
-///
-/// The event and the state change it describes commit together: a `tokio::spawn`
-/// after commit loses the side effect on a crash, and a send before commit produces
-/// a side effect for a change that rolled back.
-///
-/// This lives here only because `modules::outbox` does not exist yet. When it
-/// lands, this function moves to `outbox::service` and this module calls that,
-/// per `MODULE_GUIDE.md` §1 — a module calls another module's service, never its
-/// repository.
-pub async fn enqueue_outbox_event(
-    tx: &mut Transaction<'_, Postgres>,
-    id: Uuid,
-    event_type: &str,
-    payload: Value,
-) -> AppResult<()> {
-    sqlx::query("INSERT INTO outbox_events (id, event_type, payload) VALUES ($1,$2,$3)")
-        .bind(id)
-        .bind(event_type)
-        .bind(payload)
-        .execute(&mut **tx)
-        .await
-        .map_err(AppError::from)?;
-    Ok(())
-}
+//
+// There is deliberately no `enqueue_outbox_event` here any more. This module used
+// to own a local `INSERT INTO outbox_events` because `modules::outbox` did not yet
+// exist; that module now does, and the local copy had drifted from it — it wrote an
+// event type the worker has no handler for, so every password-reset message was
+// dead-lettered on its first delivery attempt. Enqueueing now goes through
+// `outbox::enqueue`, which validates the event type against the registered
+// handlers at the call site (MODULE_GUIDE.md §1: a module calls another module's
+// service, never its repository, and never re-implements it).

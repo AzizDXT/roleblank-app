@@ -280,86 +280,114 @@ Run against PostgreSQL 18.4 in the container, whole suite, single invocation:
 cargo test
 ```
 
-| Binary | Tests | Result | Wall clock |
-| --- | --- | --- | --- |
-| `--lib` (unit + property) | 581 | **PASS** | 0.90 s |
-| `tests/golden_scenario.rs` | 1 | **PASS** | 0.50 s |
-| `tests/openapi_contract.rs` | 5 | **PASS** | 0.01 s |
-| `tests/router_registry.rs` | 5 | **PASS** | 0.00 s |
-| `tests/race_suite.rs` | 7 | **PASS** | 0.53 s |
-| `tests/security_suite.rs` | 23 | **PASS** | 0.70 s |
-| `tests/benchmarks.rs` | 4 | ignored by default; executed separately in release mode | — |
-| **Total** | **622** | **622 passed, 0 failed** | ~2.7 s |
+| Binary | Tests | Result |
+| --- | --- | --- |
+| `--lib` (unit + property) | 586 | **PASS** |
+| `tests/integration_suite.rs` | 121 | **PASS** |
+| `tests/security_suite.rs` | 80 | **PASS** |
+| `tests/race_suite.rs` | 53 | **PASS** |
+| `tests/failure_injection.rs` | 10 | **PASS** |
+| `tests/openapi_contract.rs` | 5 | **PASS** |
+| `tests/router_registry.rs` | 5 | **PASS** |
+| `tests/golden_scenario.rs` | 1 | **PASS** |
+| `tests/benchmarks.rs` | 4 | ignored by default; run separately in release mode |
+| **Total** | **861** | **861 passed, 0 failed** |
 
-### The golden end-to-end scenario — PASS
+Line coverage, `cargo llvm-cov`: **90.37%** overall (31 347 regions).
 
-Executed from an empty database through the real router and the real middleware
-stack: bootstrap status reports uninitialised → ROOT created → **second bootstrap
-refused with `SYSTEM_ALREADY_INITIALIZED`** → login returns `mfa_required` →
-**the MFA-pending session is refused on `/users` and `/projects` with
-`MFA_REQUIRED`** → TOTP enrolment and activation → recovery codes issued → full
-authentication → `/auth/me` confirms `is_root` and `mfa_pending = false` →
-**simulated process restart** → the session still resolves, proving authoritative
-state is in the database → **audit chain verifies intact** → exactly one ownership
-row remains.
+---
 
-The scenario additionally asserts that the stored password is an Argon2id PHC
-string containing no plaintext, and that neither the bootstrap secret nor the
-password appears anywhere in the audit log.
+## 12a. The adversarial round — eight real defects
 
-### Bootstrap race — PASS
+The suite stood at **622 tests, all green, all four gates passing**. Three
+adversarial agents were then set on the system with instructions to break it rather
+than confirm it. They found **eight genuine defects**. Three would have reached
+production with no signal at all.
 
-**100 simultaneous bootstrap attempts**, released together from a barrier so the
-race is genuine rather than a spawn loop that serialises itself. Result: **exactly
-one `201`**, 99 refused (`409` where another attempt won, `429` where the per-IP
-bootstrap limit refused it first — a hundred simultaneous attempts from one address
-*is* an attack). The database holds one ownership row and **one user**, confirming
-that every losing transaction rolled back cleanly rather than leaving an orphan.
+### D1 — Sixteen security tests existed on disk and had never been compiled
 
-### Two defects found by these runs and fixed
+`tests/security/attack_probes.rs` (509 lines of anonymous-surface probes) was
+never declared in `tests/security_suite.rs`. It was invisible to `cargo test`.
 
-Both were real, both were found by the tests rather than by reading:
+An unregistered test does not fail — it disappears. Nothing in the toolchain
+reports it. `security_suite.rs` now carries a comment requiring every file under
+`tests/security/` to be declared, and the first run of the recovered file
+immediately exposed D2.
 
-1. **The audit chain never verified.** `entry_hash` covered a nanosecond-precision
-   timestamp while PostgreSQL `timestamptz` stores microseconds, so every entry
-   reported as tampered the moment it was read back. Fixed by truncating to
-   microsecond precision *before* hashing, so the value hashed is exactly the value
-   stored. Regression test:
-   `audit::tests::timestamps_are_truncated_to_what_postgresql_stores`.
+### D2 — The login timing-oracle test measured the rate limiter, not Argon2
 
-2. **The rate limiter's key table grew without bound.** Eviction only dropped
-   buckets idle for over an hour, so a burst of fresh keys — an attacker rotating
-   source addresses — evicted nothing. The limiter became exactly the
-   memory-exhaustion vector its own comment warned about. Its own test caught it.
-   The first fix used least-recently-used eviction, and a second test then showed
-   **that was exploitable**: an attacker who exhausted their allowance against an
-   account could touch it and then flood `max_keys` newer keys, making the victim's
-   drained bucket the oldest and evicting it — resetting the penalty. Final policy
-   evicts by *remaining tokens*, so a bucket at zero is the last thing discarded.
-   Tests: `the_key_table_is_bounded_under_key_rotation`,
-   `an_actively_limited_key_survives_eviction_pressure`,
-   `a_saturated_table_degrades_instead_of_refusing_everyone`.
+Failed with *"the unknown-account path is 12.2x different (known=50 566µs
+unknown=4 145µs)"*. Fourteen logins from one address exceed the ten-per-minute
+per-IP quota, so the second batch returned `429` in microseconds without hashing.
+The equalisation itself is sound; the test now resets the buckets between samples.
 
-### One contract gap found by review, not by test — and the control added for it
+### D3 — `403 ROOT_PROTECTED` identified the system owner to an external principal
 
-`GET /api/v1/users/{id}/permission-overrides` was implemented and mounted but
-declared in neither `ROUTE_TABLE` nor the OpenAPI document. The drift test compares
-those two artefacts, so a route absent from **both** was invisible to it.
+`identity::service` checked `is_root` **before** authorisation, so a CLIENT
+probing `PATCH /users/{id}`, `/suspend`, `/archive` or `/reactivate` received
+`403 ROOT_PROTECTED` for the owner and `404` for every other identifier — a
+boolean oracle identifying the owner to a principal that may not know any internal
+user exists. `deny_root` now shapes the error by principal type.
 
-Fixed by declaring the route, and a new control was added so the class of problem is
-caught in future: `routes::tests::every_catalogued_permission_is_either_routed_or_knowingly_reserved`
-fails if any catalogued permission has no route, unless it is explicitly listed as
-knowingly reserved or as dynamically enforced. It immediately surfaced four cases —
-three genuinely reserved (`iam.users.create`, `iam.sessions.read`,
-`iam.sessions.revoke`) and one, `settings.security.write`, that is enforced *after*
-the target row is loaded because the requirement depends on that row's
-`is_security_sensitive`. Both categories are now named in the test with reasons.
+### D4 — `403 STEP_UP_REQUIRED` advertised an internal-only route to a CLIENT
 
-**Residual risk, stated plainly:** the drift test still cannot see a route that
-exists in the axum router but in neither the table nor the spec. Enumerating axum's
-live route table is not supported by the framework. The mitigation is the review that
-found this one; a source-scanning test over each module's `routes.rs` would close it
-properly and is recorded as deferred work.
+`share_with_client`/`unshare_from_client` called `require_step_up_for` as their
+first statement, before loading the row or authorising. A CLIENT — which can never
+hold `projects.clients.share` — got `403` where §10 requires `404`. It also told
+an unauthorised employee precisely which control to defeat next. Step-up now runs
+**after** the object-level check.
+
+### D5 — `step_up = true` declared on three routes and never enforced
+
+`POST`/`PATCH`/`DELETE /api/v1/roles` declare step-up in `ROUTE_TABLE` **and** in
+the OpenAPI document, but `iam.roles.create/update/delete` are not `is_dangerous`,
+so `require_step_up_for` was a silent no-op. A password-only stolen session could
+author an empty role, fill it by `PATCH`, and change what every existing holder may
+do. The drift tests compare the table against the spec — **neither compares either
+against runtime behaviour.** Fixed with an explicit `require_step_up`.
+
+### D6 — Every password-reset and invitation email was dead-lettered
+
+Both producers built their outbox payload with a free `json!` instead of the type
+the worker deserialises: one used an unregistered event type, the other a shape
+`InvitationPayload` cannot parse. Both went straight to `DEAD`. **The endpoints
+returned success**, so nothing surfaced it. Found by a test asking whether every
+event the application enqueues is actually deliverable. The old reset payload also
+carried the raw token while being documented not to.
+
+### D7 — Concurrent outbox workers double-claimed events
+
+Six workers claiming 300 events produced **601 claims**. `FOR UPDATE SKIP LOCKED`
+only excludes claims running at the same instant; a claimed row stays `PENDING`, so
+a worker polling milliseconds later re-claims it. Duplicate mail is tolerable under
+at-least-once delivery; the invisible harm is both workers calling `mark_failed`,
+double-incrementing `attempts` and dead-lettering deliverable mail at half its
+budget — during exactly the outage the budget exists to survive. Fixed with a
+60-second claim lease, which also gives crash recovery a defined window.
+
+### D8 — `Idempotency-Key` documented on six endpoints, implemented on none
+
+`modules::outbox::idempotency` existed in full and the header is in the OpenAPI
+document for six `POST` routes, but nothing read it. A retried create made a second
+object. Fixed with an `Idempotent<T>` extractor wired into all six.
+
+### Two smaller findings
+
+- The reuse-detection audit event **redacted its own payload**: `AuditMetadata`
+  refuses any key containing `"token"`, so the invalidated-token count was dropped
+  and every genuine detection also emitted an ERROR accusing the call site of
+  writing a secret — training operators to ignore that alarm.
+- `VERSION_CONFLICT` carried `expected`/`actual` only inside `detail`, which the
+  contract says may be reworded at any time; a client's retry loop had to parse
+  English. Now a structured `version_conflict` object.
+
+### What this round says about the earlier green result
+
+622 tests and four green gates described the tests, not the system. The happy path
+passed throughout. What found these was asking *"what if the system is lying to
+me?"* — is the mail actually deliverable, is the declared step-up actually enforced,
+is the refusal shaped differently for the one principal who must not learn the
+difference.
 
 ## 12b. Quality and supply-chain gates
 
@@ -400,6 +428,43 @@ which would have shipped a broken container:
   while doing nothing to stop a server configured for md5 auth; the control that
   actually matters is `scram-sha-256` at the database, recorded in
   `08-operations.md`.
+
+
+## 12c. Coverage
+
+Measured with `cargo llvm-cov --summary-only` over the whole suite.
+
+**Overall: 57.84% → 90.37%** after the adversarial and integration rounds.
+
+| Layer | Before | After |
+| --- | --- | --- |
+| Business services (`projects`/`tasks`/`identity`) | 12–15% | **87%** |
+| Module HTTP handlers (`*/routes.rs`) | 12–25% | **97–100%** |
+| Module repositories (`*/repo.rs`) | 17–31% | **93–98%** |
+| `system/repo.rs` — `/health/ready` had never been called | **0%** | **91.7%** |
+| `settings/service.rs` | 67.7% | **95.5%** |
+| `outbox/mod.rs` | 66.7% | **93.4%** |
+| Client-isolation predicate (`projects/visibility.rs`) | 99.3% | **99.3%** |
+| Crypto, rate limiting, validation, pagination | 93–100% | **93–100%** |
+
+### What is still uncovered, and why 100% is not the target
+
+The brief says *"do not game coverage"*. These are the remaining gaps, each stated
+rather than papered over:
+
+| Location | Coverage | Why |
+| --- | --- | --- |
+| `platform/observability/logging.rs` | **0%** | `init` installs a **process-global** subscriber. Calling it from a test corrupts every other test in the binary. It runs on every real start of `serve` |
+| `platform/config/mod.rs` | 56% | `from_env` reads process environment variables; exercising each branch means mutating global process state, which is unsound under parallel tests. The **validation** logic — the part that fails closed — is separately and fully tested |
+| `platform/database/mod.rs` | 76% | The uncovered arms are driver failure modes (`WorkerCrashed`, `Tls`) that require corrupting the driver itself |
+| `platform/errors/mod.rs` | 83% | Unreachable `sqlx::Error` arms, and the serialisation fallback that exists so a panic in an error path cannot drop a connection |
+| `platform/http/middleware.rs` | 90% | `panic_response`. Covering it means writing a handler that panics on purpose — injecting a defect to move a number |
+| `modules/audit/chain.rs` | — | `Err(_) => vec![0u8; 32]` in `entry_hash` is unreachable: HMAC accepts any key length. It exists so a broken key cannot take the process down mid-transaction |
+
+Every one of these is either process-global state, an unreachable defensive branch,
+or a failure mode that would have to be manufactured. Reaching 100% would require
+adding defects or fake test logic — buying a number at the cost of the trust the
+number is supposed to carry.
 
 ## 13. Known blocked items
 

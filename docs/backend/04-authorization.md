@@ -1,4 +1,4 @@
-# 04 — Authorization
+﻿# 04 — Authorization
 
 ## 1. The rule
 
@@ -169,6 +169,32 @@ can_delegate(actor, permission_code, requested_scope) -> bool
   return actor_scopes.any(|a| derivable(a, requested_scope))
 ```
 
+### Step-up is a property of the *route*, not only of the permission
+
+`is_dangerous` makes the delegation guard demand a recent second factor, but three
+routes require step-up without their permission being dangerous:
+
+```
+POST   /api/v1/roles          PATCH /api/v1/roles/{id}          DELETE /api/v1/roles/{id}
+```
+
+`iam.roles.create`, `.update` and `.delete` are ordinary permissions — creating an
+empty role confers nothing. What is dangerous is the *sequence*: create a role,
+`PATCH` permissions into it, and every existing holder gains them. So the route
+contract in `ROUTE_TABLE` carries `step_up = true` and
+`authorization::service` calls `state.require_step_up(principal)` **explicitly**.
+
+This is written down because it was wrong once. The routes declared `step_up = true`
+in both `ROUTE_TABLE` and the OpenAPI document, but the service only called
+`require_step_up_for(permission)`, which is a no-op for a permission that is not
+dangerous — so the requirement was documented and unenforced. A password-only
+stolen session could author a role and fill it. Found by
+`delegation_matrix::delegation_without_a_recent_second_factor_is_refused`.
+
+**The general lesson:** the drift tests compare `ROUTE_TABLE` against the OpenAPI
+document. Neither compares either against *runtime behaviour*. A route flag is a
+claim, and a claim needs a test.
+
 ### The derivation lattice
 
 Scopes are **not** totally ordered, and pretending they are is how privilege escalation
@@ -267,7 +293,8 @@ Two consequences worth stating because they are easy to get wrong:
 | CLIENT requests an object it cannot see | **`404 RESOURCE_NOT_FOUND`** — a `403` would confirm the object exists |
 | CLIENT calls an internal-only route | **`404`** — the route's existence is not the client's business |
 | INTERNAL principal lacks a permission on a resource that exists and is within the company | **`403 AUTHORIZATION_DENIED`** — existence disclosure inside the company is acceptable and a `404` here would make operational support impossible |
-| Any principal targets ROOT with a forbidden authorisation operation | **`403 ROOT_PROTECTED`** — ROOT's existence is not a secret; the refusal should be unmistakable |
+| An **internal** principal targets ROOT with a forbidden operation | **`403 ROOT_PROTECTED`** — inside the company, ROOT's existence is not a secret and the refusal must be unmistakable |
+| An **external** principal targets ROOT | **`404`** — `403 ROOT_PROTECTED` would identify the owner to a principal that may not know any internal user exists. This was a real leak, found by `client_escape::a_client_cannot_identify_the_system_owner_by_probing`: probing `PATCH /users/{id}` returned `403` for the owner and `404` for everyone else, a boolean oracle. `identity::service::deny_root` now shapes the error by principal type |
 
 The rule is applied per-principal-type, not blanket, and is implemented once in
 `AppError::for_principal` rather than at each call site.

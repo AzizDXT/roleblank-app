@@ -46,7 +46,9 @@ async fn missing_and_malformed_bearer_headers_are_refused() {
     let app = TestApp::spawn().await;
 
     // No header at all.
-    app.get("/api/v1/auth/me", None).await.assert_error(StatusCode::UNAUTHORIZED, "AUTHENTICATION_FAILED");
+    app.get("/api/v1/auth/me", None)
+        .await
+        .assert_error(StatusCode::UNAUTHORIZED, "AUTHENTICATION_FAILED");
 
     let malformed = [
         "",
@@ -91,7 +93,9 @@ async fn a_token_in_the_query_string_is_refused_distinctly() {
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::empty())
             .expect("request");
-        app.request(request).await.assert_error(StatusCode::BAD_REQUEST, "BAD_REQUEST");
+        app.request(request)
+            .await
+            .assert_error(StatusCode::BAD_REQUEST, "BAD_REQUEST");
     }
 }
 
@@ -161,8 +165,20 @@ async fn login_timing_does_not_reveal_whether_an_account_exists() {
     bootstrapped(&app).await;
 
     async fn median_micros(app: &TestApp, email: &str) -> u128 {
+        use roleblank_backend::platform::http::rate_limit::keys;
+        let peer = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
         let mut samples = Vec::new();
         for _ in 0..7 {
+            // Clear the limiter before each sample. Fourteen logins from one address
+            // exceed the ten-per-minute per-IP quota, and a `429` returns in
+            // microseconds without hashing anything — so without this the second
+            // batch measures the rate limiter rather than Argon2, and the test
+            // reports a twelve-fold "timing leak" that does not exist. (Found when
+            // this suite was wired into the test binary; it had never been run.)
+            app.state.limiter.reset(&keys::login_ip(peer)).await;
+            app.state.limiter.reset(&keys::login_account(email)).await;
+
             let start = std::time::Instant::now();
             let _ = app
                 .post(
@@ -199,11 +215,18 @@ async fn an_oversized_body_is_refused_at_the_transport() {
     // Well beyond the 256 KiB limit.
     let huge = "x".repeat(2 * 1024 * 1024);
     let response = app
-        .post("/api/v1/auth/login", None, json!({"email": "a@b.test", "password": huge}))
+        .post(
+            "/api/v1/auth/login",
+            None,
+            json!({"email": "a@b.test", "password": huge}),
+        )
         .await;
 
     assert!(
-        matches!(response.status, StatusCode::PAYLOAD_TOO_LARGE | StatusCode::BAD_REQUEST),
+        matches!(
+            response.status,
+            StatusCode::PAYLOAD_TOO_LARGE | StatusCode::BAD_REQUEST
+        ),
         "an oversized body produced {} instead of being refused",
         response.status
     );
@@ -239,8 +262,14 @@ async fn malformed_json_is_refused_without_leaking_serde_detail() {
         response.assert_no_secrets();
         // serde's message names Rust types and field paths — it must not reach the client.
         let text = String::from_utf8_lossy(&response.raw);
-        assert!(!text.contains("LoginRequest"), "a Rust type name leaked: {text}");
-        assert!(!text.contains("line 1 column"), "a serde position leaked: {text}");
+        assert!(
+            !text.contains("LoginRequest"),
+            "a Rust type name leaked: {text}"
+        );
+        assert!(
+            !text.contains("line 1 column"),
+            "a serde position leaked: {text}"
+        );
     }
 }
 
@@ -274,7 +303,9 @@ async fn an_unsupported_content_type_is_refused() {
         .method(Method::POST)
         .uri("/api/v1/auth/login")
         .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
-        .body(Body::from(r#"{"email":"a@b.test","password":"wrong password here"}"#))
+        .body(Body::from(
+            r#"{"email":"a@b.test","password":"wrong password here"}"#,
+        ))
         .expect("request");
     let response = app.request(request).await;
     assert_ne!(response.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
@@ -326,12 +357,19 @@ async fn sql_injection_strings_are_inert() {
 
     for injection in injections {
         // As a login identifier.
-        app.post("/api/v1/auth/login", None, json!({"email": injection, "password": injection}))
-            .await
-            .assert_no_secrets();
+        app.post(
+            "/api/v1/auth/login",
+            None,
+            json!({"email": injection, "password": injection}),
+        )
+        .await
+        .assert_no_secrets();
 
         // As a sort parameter — refused by allowlist, and the value is not echoed.
-        let encoded = injection.replace(' ', "%20").replace('\'', "%27").replace('"', "%22");
+        let encoded = injection
+            .replace(' ', "%20")
+            .replace('\'', "%27")
+            .replace('"', "%22");
         let response = app
             .get(&format!("/api/v1/users?sort={encoded}"), Some(&token))
             .await;
@@ -341,12 +379,17 @@ async fn sql_injection_strings_are_inert() {
             response.status
         );
         let text = String::from_utf8_lossy(&response.raw);
-        assert!(!text.contains("DROP"), "the rejected sort value was echoed back: {text}");
+        assert!(
+            !text.contains("DROP"),
+            "the rejected sort value was echoed back: {text}"
+        );
     }
 
     // The database is intact.
-    let users: (i64,) =
-        sqlx::query_as("SELECT count(*) FROM users").fetch_one(&app.db).await.expect("count");
+    let users: (i64,) = sqlx::query_as("SELECT count(*) FROM users")
+        .fetch_one(&app.db)
+        .await
+        .expect("count");
     assert_eq!(users.0, 1);
     let tables: (i64,) = sqlx::query_as(
         "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public'",
@@ -373,7 +416,9 @@ async fn pagination_parameters_are_bounded() {
         "cursor=notavalidcursor",
         &format!("cursor={}", "A".repeat(10_000)),
     ] {
-        let response = app.get(&format!("/api/v1/users?{query}"), Some(&token)).await;
+        let response = app
+            .get(&format!("/api/v1/users?{query}"), Some(&token))
+            .await;
         assert!(
             response.status.is_client_error(),
             "{query} was accepted with status {}",
@@ -402,11 +447,16 @@ async fn crlf_payloads_cannot_forge_a_log_line() {
     .await;
 
     // Whatever was stored, no audit metadata may contain a raw line break.
-    let metadata: Vec<(serde_json::Value,)> =
-        sqlx::query_as("SELECT metadata FROM audit_events").fetch_all(&app.db).await.expect("read");
+    let metadata: Vec<(serde_json::Value,)> = sqlx::query_as("SELECT metadata FROM audit_events")
+        .fetch_all(&app.db)
+        .await
+        .expect("read");
     for (value,) in metadata {
         let text = serde_json::to_string(&value).expect("serialise");
-        assert!(!text.contains("\\r\\n"), "a CRLF sequence survived into audit metadata: {text}");
+        assert!(
+            !text.contains("\\r\\n"),
+            "a CRLF sequence survived into audit metadata: {text}"
+        );
     }
 }
 
@@ -422,7 +472,10 @@ async fn security_headers_are_present_on_every_response() {
         let response = app.get(path, None).await;
         assert_eq!(response.status.is_success(), expect_ok);
         assert_eq!(
-            response.headers.get("x-content-type-options").and_then(|v| v.to_str().ok()),
+            response
+                .headers
+                .get("x-content-type-options")
+                .and_then(|v| v.to_str().ok()),
             Some("nosniff"),
             "missing nosniff on {path}"
         );
@@ -454,7 +507,11 @@ async fn trace_and_connect_are_refused() {
             .body(Body::empty())
             .expect("request");
         let response = app.request(request).await;
-        assert_eq!(response.status, StatusCode::METHOD_NOT_ALLOWED, "{method} was accepted");
+        assert_eq!(
+            response.status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{method} was accepted"
+        );
     }
 }
 
@@ -483,7 +540,10 @@ async fn a_hostile_request_id_header_is_replaced_not_echoed() {
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
             .to_string();
-        assert!(!echoed.contains(' '), "a hostile request id was echoed: {echoed:?}");
+        assert!(
+            !echoed.contains(' '),
+            "a hostile request id was echoed: {echoed:?}"
+        );
         assert!(echoed.len() <= 64);
     }
 }
@@ -497,8 +557,15 @@ async fn health_endpoints_leak_no_infrastructure_detail() {
         let response = app.get(path, None).await;
         let text = String::from_utf8_lossy(&response.raw).to_lowercase();
         for forbidden in [
-            "postgres", "roleblank-postgres", "5432", "password", "migrator",
-            "sqlx", "/work", "version", "host",
+            "postgres",
+            "roleblank-postgres",
+            "5432",
+            "password",
+            "migrator",
+            "sqlx",
+            "/work",
+            "version",
+            "host",
         ] {
             assert!(
                 !text.contains(forbidden),

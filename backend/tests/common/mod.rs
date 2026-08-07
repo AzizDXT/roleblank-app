@@ -19,6 +19,7 @@ use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::Value;
+use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tokio::sync::OnceCell;
 use tower::ServiceExt;
@@ -58,6 +59,21 @@ const TEMPLATE_DB: &str = "roleblank_test_template";
 
 static TEMPLATE: OnceCell<()> = OnceCell::const_new();
 
+/// A one-connection pool.
+///
+/// Every pool a test opens counts against PostgreSQL's global `max_connections`,
+/// and the suite runs one `TestApp` per test thread. A default-sized pool (ten
+/// connections) multiplied by twenty-four parallel tests exhausts the server and
+/// the failure surfaces as an unrelated `503` in the middle of an attack, which is
+/// exactly the kind of noise that makes a security suite untrustworthy.
+async fn small_pool(url: &str) -> Result<PgPool, sqlx::Error> {
+    PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(30))
+        .connect(url)
+        .await
+}
+
 /// Execute a DDL statement that had to be assembled at runtime.
 ///
 /// `CREATE DATABASE` and `DROP DATABASE` cannot take a bound parameter for the
@@ -81,7 +97,7 @@ async fn exec_ddl(pool: &PgPool, sql: String) -> Result<(), sqlx::Error> {
 async fn ensure_template() {
     TEMPLATE
         .get_or_init(|| async {
-            let admin = PgPool::connect(&admin_url()).await.expect("connect as superuser");
+            let admin = small_pool(&admin_url()).await.expect("connect as superuser");
 
             // Recreate from scratch so a schema change never leaves a stale template.
             let _ = exec_ddl(
@@ -97,7 +113,7 @@ async fn ensure_template() {
                 .expect("create the template database");
             admin.close().await;
 
-            let pool = PgPool::connect(&base_url_for(TEMPLATE_DB))
+            let pool = small_pool(&base_url_for(TEMPLATE_DB))
                 .await
                 .expect("connect to the template as migrator");
             database::MIGRATOR.run(&pool).await.expect("migrations must apply from empty");
@@ -120,7 +136,7 @@ impl TestApp {
         // A UUID-derived name: parallel test binaries must not collide.
         let database_name = format!("rb_test_{}", Uuid::now_v7().simple());
 
-        let admin = PgPool::connect(&admin_url())
+        let admin = small_pool(&admin_url())
             .await
             .expect("connect as superuser");
         exec_ddl(
@@ -161,7 +177,7 @@ impl TestApp {
     /// A pool connected as the **runtime** role, for tests that verify what the
     /// application identity is and is not permitted to do at the database level.
     pub async fn runtime_role_pool(&self) -> PgPool {
-        PgPool::connect(&runtime_url_for(&self.database_name))
+        small_pool(&runtime_url_for(&self.database_name))
             .await
             .expect("connect as the runtime role")
     }
@@ -255,7 +271,7 @@ impl Drop for TestApp {
                 Err(_) => return,
             };
             rt.block_on(async {
-                if let Ok(admin) = PgPool::connect(&url).await {
+                if let Ok(admin) = small_pool(&url).await {
                     let _ = exec_ddl(
                         &admin,
                         format!(
@@ -396,9 +412,14 @@ pub fn test_config(database: &str) -> Config {
         public_base_url: "http://localhost:8090".into(),
         database: DatabaseConfig {
             url: Secret::new(base_url_for(database)),
-            max_connections: 8,
+            // Four is the smallest size that still lets one request hold a
+            // transaction while a second, concurrent request contends for the same
+            // row — which is what the race and refresh-reuse tests exercise. Eight
+            // multiplied by the test-thread count exhausted PostgreSQL's
+            // `max_connections` and turned unrelated assertions into `503`s.
+            max_connections: 4,
             min_connections: 1,
-            acquire_timeout: Duration::from_secs(5),
+            acquire_timeout: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(60),
             max_lifetime: Duration::from_secs(300),
             statement_timeout: Duration::from_secs(15),

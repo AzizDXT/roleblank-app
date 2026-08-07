@@ -6,6 +6,7 @@
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::Response;
 use axum::routing::{delete, get, post};
 use axum::{Json as JsonResponse, Router};
 use uuid::Uuid;
@@ -13,6 +14,7 @@ use uuid::Uuid;
 use crate::app::AppState;
 use crate::platform::errors::AppResult;
 use crate::platform::http::extract::{Authenticated, ClientIp, Json};
+use crate::platform::http::idempotency::{self, Idempotent};
 use crate::shared::pagination::{Page, PageQuery};
 
 use super::dto::{
@@ -48,14 +50,25 @@ async fn list(
         .map(JsonResponse)
 }
 
+/// Honours `Idempotency-Key` (`api/openapi.yaml`).
 async fn create(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
     ClientIp(ip): ClientIp,
-    Json(body): Json<CreateDepartmentRequest>,
-) -> AppResult<(StatusCode, JsonResponse<DepartmentResponse>)> {
-    let created = service::create(&state, &principal, Some(ip.to_string()), body).await?;
-    Ok((StatusCode::CREATED, JsonResponse(created)))
+    body: Idempotent<CreateDepartmentRequest>,
+) -> AppResult<Response> {
+    let principal_id = principal.user_id();
+    let inner = state.clone();
+    idempotency::create(
+        &state,
+        principal_id,
+        "departments.create",
+        body,
+        move |request| async move {
+            service::create(&inner, &principal, Some(ip.to_string()), request).await
+        },
+    )
+    .await
 }
 
 async fn detail(

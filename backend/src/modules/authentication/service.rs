@@ -22,6 +22,7 @@ use crate::modules::authentication::principal::Principal;
 use crate::modules::authentication::{dto, repo, sessions};
 use crate::modules::authorization::domain::PrincipalType;
 use crate::modules::authorization::evaluator;
+use crate::modules::outbox::{self, PasswordResetPayload};
 use crate::platform::crypto::{password, tokens};
 use crate::platform::errors::{AppError, AppResult};
 use crate::platform::http::rate_limit::{keys, RateLimitDecision};
@@ -34,6 +35,12 @@ const HOUR: StdDuration = StdDuration::from_secs(3600);
 /// Reset links are short-lived on purpose: the window in which a link sitting in a
 /// mailbox is useful to an attacker is the window this constant sets.
 const RESET_TOKEN_TTL: Duration = Duration::minutes(30);
+
+/// The public route the reset link points at, per
+/// `docs/product/01-application-structure.md` §`public.password_reset.confirm`.
+/// It is a front-end path, not this API's path: the recipient opens a page that
+/// then calls `POST /api/v1/auth/password-reset/confirm` with the token in a body.
+const PASSWORD_RESET_CONFIRM_PATH: &str = "/password-reset/confirm";
 
 const STATUS_ACTIVE: &str = "ACTIVE";
 
@@ -370,8 +377,17 @@ pub async fn refresh(
                         .meta(
                             AuditMetadata::new()
                                 .int("presented_generation", i64::from(row.generation))
+                                // Named `invalidated_count`, not `tokens_invalidated`.
+                                // `AuditMetadata` refuses any key *containing*
+                                // "token" — a deliberately blunt safety net — so the
+                                // obvious name was silently replaced by
+                                // `tokens_invalidated__redacted: true`, and every
+                                // genuine reuse detection also emitted an ERROR log
+                                // line accusing this call site of writing a secret.
+                                // The value is a count, so the fix is the name, not
+                                // an exemption in the net.
                                 .int(
-                                    "tokens_invalidated",
+                                    "invalidated_count",
                                     i64::try_from(killed).unwrap_or(i64::MAX),
                                 )
                                 .str("action_taken", "session_family_revoked"),
@@ -854,17 +870,29 @@ pub async fn request_password_reset(
     // produces a link for a token that rolled back, and a spawn after commit loses
     // the mail on a crash. The plaintext token exists here and in the mail body,
     // nowhere else — the outbox worker logs the event id and type only.
-    repo::enqueue_outbox_event(
+    //
+    // The payload is built from `outbox::PasswordResetPayload` rather than from a
+    // free `json!`, and enqueued through `outbox::enqueue` rather than through a
+    // local INSERT, because both halves of this contract are the worker's. A
+    // hand-written event type or a hand-shaped payload is not rejected at enqueue
+    // time by anything the writer can see; it is rejected at *delivery* time, hours
+    // later, as a permanent failure — so every password-reset message would be
+    // dead-lettered and no user would ever receive a link. Going through the typed
+    // producer makes that a compile error instead.
+    let reset_payload = serde_json::to_value(PasswordResetPayload {
+        to: subject.email.clone(),
+        reset_url: outbox::action_link(
+            &state.config.public_base_url,
+            PASSWORD_RESET_CONFIRM_PATH,
+            token.plaintext.expose(),
+        ),
+        expires_in_minutes: u32::try_from(RESET_TOKEN_TTL.whole_minutes()).unwrap_or(u32::MAX),
+    })
+    .map_err(|_| AppError::internal("could not serialise the password-reset mail payload"))?;
+    outbox::enqueue(
         &mut tx,
-        Uuid::now_v7(),
-        "PASSWORD_RESET_REQUESTED",
-        serde_json::json!({
-            "user_id": subject.user_id,
-            "email": subject.email,
-            "display_name": subject.display_name,
-            "reset_token": token.plaintext.expose(),
-            "expires_at": dto::rfc3339(expires_at),
-        }),
+        outbox::event_type::MAIL_PASSWORD_RESET,
+        reset_payload,
     )
     .await?;
 

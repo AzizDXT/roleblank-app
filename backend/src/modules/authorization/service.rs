@@ -597,6 +597,21 @@ pub async fn create_role(
     if let Err(e) = state.require(principal, ROLES_CREATE, &Target::Collection) {
         return Err(refuse(state, tx, principal, ip, "role.create", None, e).await);
     }
+    // `ROUTE_TABLE` declares this route `step_up = true` and the OpenAPI document
+    // publishes that requirement, but `iam.roles.create` is **not** flagged
+    // dangerous in the catalogue, so `require_step_up_for` would be a silent no-op
+    // and `check_role_authoring` only demands a second factor for the *dangerous
+    // permissions inside* the role. A role with no dangerous contents — including
+    // an empty one, which can then be filled by `PATCH` — was therefore authored by
+    // a password-only session while the published contract said otherwise.
+    //
+    // Authoring a role shapes the authority of everyone who will ever hold it, so
+    // the declared requirement is enforced rather than left as a promise the code
+    // does not keep. Explicit, like `audit::verify`, because the catalogue's
+    // dangerous flag is not the thing being asserted here.
+    if let Err(e) = state.require_step_up(principal) {
+        return Err(refuse(state, tx, principal, ip, "role.create", None, e).await);
+    }
     // `is_system` is hard-coded false: the API has no path to authoring a built-in
     // role, and `check_role_authoring` would refuse one anyway.
     if let Err(e) = authorise_role_authoring(
@@ -682,6 +697,21 @@ pub async fn update_role(
     };
 
     if let Err(e) = state.require(principal, ROLES_UPDATE, &Target::Collection) {
+        return Err(refuse(
+            state,
+            tx,
+            principal,
+            ip,
+            "role.update",
+            Some((TARGET_ROLE, role.id)),
+            e,
+        )
+        .await);
+    }
+    // Declared `step_up = true` in `ROUTE_TABLE`; see `create_role` for why it must
+    // be enforced explicitly. Editing a role changes what every current holder may
+    // do, which is the most far-reaching authority change the API offers.
+    if let Err(e) = state.require_step_up(principal) {
         return Err(refuse(
             state,
             tx,
@@ -818,6 +848,19 @@ pub async fn delete_role(
     };
 
     if let Err(e) = state.require(principal, ROLES_DELETE, &Target::Collection) {
+        return Err(refuse(
+            state,
+            tx,
+            principal,
+            ip,
+            "role.delete",
+            Some((TARGET_ROLE, role.id)),
+            e,
+        )
+        .await);
+    }
+    // Declared `step_up = true` in `ROUTE_TABLE`; see `create_role`.
+    if let Err(e) = state.require_step_up(principal) {
         return Err(refuse(
             state,
             tx,

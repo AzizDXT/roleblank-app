@@ -582,9 +582,27 @@ async fn deny_root(
         tracing::error!(error = %e, "failed to record a ROOT protection event");
     }
 
-    // Never masked into a 404, even for an external principal: the refusal must be
-    // impossible to misdiagnose as a transient failure (docs/backend/04 §10).
-    AppError::RootProtected
+    // Inside the company the refusal is deliberately unmistakable: a `403
+    // ROOT_PROTECTED` cannot be misdiagnosed as a transient failure, and existence
+    // disclosure to an employee is acceptable (docs/backend/04 §10).
+    //
+    // Across the external trust boundary it is not. `is_root` is checked *before*
+    // authorisation, so an external CLIENT that supplies the owner's identifier
+    // receives `403` where every other identifier — real or invented — receives
+    // `404`. That difference identifies the system owner's user id to a principal
+    // that is not permitted to know any internal user exists at all, which is the
+    // client envelope (boundary 2 of the threat model) losing to a diagnostic
+    // nicety. The envelope wins; the refusal is masked for external principals only.
+    //
+    // `hide_from_external` is deliberately not used: it maps only
+    // `AuthorizationDenied`, and widening it would also mask the refusal on the
+    // authorisation routes, where the unmistakable error is the documented and
+    // correct answer for the internal principals that can reach them.
+    if principal.is_external() {
+        AppError::NotFound
+    } else {
+        AppError::RootProtected
+    }
 }
 
 /// Remove the system owner from a set of target ids **before** a bulk operation

@@ -25,6 +25,7 @@ use crate::modules::authentication::principal;
 use crate::modules::authorization::catalog;
 use crate::modules::authorization::delegation::{self, DelegationRequest, RoleSummary};
 use crate::modules::authorization::domain::{PrincipalType, Scope, ScopeType, Target};
+use crate::modules::outbox;
 use crate::platform::crypto::{password, tokens};
 use crate::platform::errors::{AppError, AppResult};
 use crate::platform::http::extract::{Authenticated, ClientIp};
@@ -49,6 +50,13 @@ const MIN_TTL_HOURS: i64 = 1;
 const MAX_TTL_HOURS: i64 = 720; // 30 days
 
 const ACCEPT_RATE_WINDOW: StdDuration = StdDuration::from_secs(3600);
+
+/// The public route the invitation link points at, per
+/// `docs/product/01-application-structure.md` §`public.invitation.accept`. A
+/// front-end path: the recipient opens a page which then calls
+/// `POST /api/v1/invitations/accept` with the token in the body, never in a URL
+/// this API sees (TH-36).
+const INVITATION_ACCEPT_PATH: &str = "/invitations/accept";
 
 // =============================================================================
 // Creation
@@ -148,7 +156,8 @@ pub async fn create_invitation(
     // secret-scanning tooling and makes presenting it to the wrong endpoint fail
     // loudly instead of ambiguously.
     let token = tokens::generate(tokens::INVITE_TOKEN_PREFIX)?;
-    let expires_at = OffsetDateTime::now_utc() + Duration::hours(ttl_hours(state).await);
+    let ttl = ttl_hours(state).await;
+    let expires_at = OffsetDateTime::now_utc() + Duration::hours(ttl);
 
     let invitation = NewInvitation {
         id: Uuid::now_v7(),
@@ -197,16 +206,27 @@ pub async fn create_invitation(
     // row: a `tokio::spawn` after commit could lose the mail on a crash, and a send
     // before commit could deliver a token for an invitation that rolled back.
     //
-    // NOTE: `modules::outbox` is being written in parallel. If this path does not
-    // resolve yet, that is expected and the call is the agreed contract.
-    let payload = serde_json::json!({
-        "invitation_id": invitation.id,
-        "email": email,
-        "display_name": display_name,
-        "token": token.plaintext.expose(),
-        "expires_at": rfc3339(expires_at),
-    });
-    crate::modules::outbox::enqueue(&mut tx, "mail.invitation", payload).await?;
+    // The payload is built from `outbox::InvitationPayload`, the type the worker
+    // deserialises, rather than from a free `json!`. A hand-shaped payload is not
+    // rejected here — it is rejected at delivery, as a *permanent* failure, so the
+    // invitation would dead-letter and the invitee would simply never hear from us
+    // while the invitation row sat happily PENDING. The type makes that a compile
+    // error rather than a silent operational hole.
+    let payload = serde_json::to_value(outbox::InvitationPayload {
+        to: email.clone(),
+        invite_url: outbox::action_link(
+            &state.config.public_base_url,
+            INVITATION_ACCEPT_PATH,
+            token.plaintext.expose(),
+        ),
+        // The inviter's own name, so the recipient can tell a legitimate invitation
+        // from a phishing attempt. It is user-controlled text and is sanitised and
+        // bounded by the mail builder before it reaches a message body.
+        inviter_display_name: principal.session.display_name.clone(),
+        expires_in_hours: u32::try_from(ttl).unwrap_or(u32::MAX),
+    })
+    .map_err(|_| AppError::internal("could not serialise the invitation mail payload"))?;
+    outbox::enqueue(&mut tx, outbox::event_type::MAIL_INVITATION, payload).await?;
 
     let row = repo::find_invitation_for_update(&mut tx, invitation.id)
         .await?

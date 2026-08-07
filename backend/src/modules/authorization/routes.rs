@@ -16,6 +16,7 @@
 
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, Uri};
+use axum::response::Response;
 use axum::routing::{delete, get};
 use axum::Router;
 use uuid::Uuid;
@@ -23,6 +24,7 @@ use uuid::Uuid;
 use crate::app::AppState;
 use crate::platform::errors::{AppError, AppResult};
 use crate::platform::http::extract::{Authenticated, ClientIp, Json};
+use crate::platform::http::idempotency::{self, Idempotent};
 use crate::shared::pagination::{Page, PageQuery};
 
 use super::dto::*;
@@ -95,14 +97,26 @@ async fn list_roles(
     ))
 }
 
+/// Honours `Idempotency-Key` (`api/openapi.yaml`). Creating a role creates
+/// authority, so a duplicate created by a retry is a duplicate grant of it.
 async fn create_role(
     State(state): State<AppState>,
     principal: Authenticated,
     ip: ClientIp,
-    Json(body): Json<CreateRoleRequest>,
-) -> AppResult<(StatusCode, axum::Json<RoleDetailResponse>)> {
-    let role = service::create_role(&state, &principal.0, ip.hint(), body).await?;
-    Ok((StatusCode::CREATED, axum::Json(role)))
+    body: Idempotent<CreateRoleRequest>,
+) -> AppResult<Response> {
+    let principal_id = principal.user_id();
+    let inner = state.clone();
+    idempotency::create(
+        &state,
+        principal_id,
+        "roles.create",
+        body,
+        move |request| async move {
+            service::create_role(&inner, &principal.0, ip.hint(), request).await
+        },
+    )
+    .await
 }
 
 async fn get_role(

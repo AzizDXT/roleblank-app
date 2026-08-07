@@ -1,4 +1,4 @@
-<#
+﻿<#
     RoleBlank OS — developer command interface (Windows host).
 
     WHY THIS EXISTS
@@ -95,7 +95,12 @@ function Db-Up {
         '-v', "${VolPgData}:/var/lib/postgresql",
         '-p', "127.0.0.1:${PgPort}:5432",
         '--health-cmd', 'pg_isready -U postgres', '--health-interval', '3s', '--health-retries', '20',
-        $PgImage
+        $PgImage,
+        # The integration harness gives every test its own database and pool, and cargo
+        # runs test binaries in parallel. PostgreSQL's default 100 connections is the
+        # binding constraint, not the code: exceeding it surfaces as 503 in the middle
+        # of unrelated assertions, which reads like a product defect and is not one.
+        '-c', 'max_connections=400', '-c', 'shared_buffers=256MB'
     )
     for ($i = 0; $i -lt 40; $i++) {
         Start-Sleep -Milliseconds 750
