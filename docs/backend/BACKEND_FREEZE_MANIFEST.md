@@ -59,7 +59,7 @@ eventually disagree.
 | HIGH | **0** |
 | MEDIUM | **0** |
 | LOW | **0 actionable** (all fixed with regression tests, or accepted with reasons in `audit/LOW_INFO_DISPOSITION.md`) |
-| INFO | 7 classified and accepted |
+| INFO | 4 classified and accepted; 3 were reversed and fixed |
 
 ## Known limitations
 
@@ -71,10 +71,18 @@ mislead someone who assumed otherwise.
    implementation of the `RateLimiter` trait first (release gate RR-3).
 2. **Mail delivery is at-least-once.** The outbox claims, sends, then marks sent; a
    crash in that window re-delivers. Handlers must be safe to run twice.
-3. **SMTP is implemented but has never been exercised against a real server.** The
-   transport, its TLS modes and its configuration refusals are unit-tested; actual
-   delivery to a live mail provider is untested here because no production
-   credentials exist in this environment.
+3. **SMTP is selectable and configured-checked, but has never delivered to a real
+   server.** The transport, both TLS modes, the required-field refusals and the
+   port-25 refusal are tested, and `RB_MAIL_PROVIDER=smtp` is verified to be
+   accepted by a live process. Actual delivery to a mail provider is untested here
+   because no production credentials exist in this environment.
+
+   An earlier revision of this manifest said SMTP was "implemented but never
+   exercised". That was too generous: `Config::from_env` had no `smtp` arm at all,
+   so the transport could not be selected by any configuration, and the validator's
+   own remediation text told operators to set a value that refused startup. Found
+   by the final adversarial sweep, fixed, and recorded here rather than quietly
+   corrected.
 4. **Test databases leak.** The harness `Drop` spawns a detached cleanup thread that
    dies with the process. Bounded per run, cleaned by `rb.ps1 db-reset`.
 5. **Real clock passage is simulated.** Expiry is tested by writing past timestamps;

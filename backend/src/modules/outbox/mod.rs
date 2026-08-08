@@ -410,6 +410,9 @@ pub struct ClaimedEvent {
 pub struct OutboxWorker {
     pool: PgPool,
     mail: Arc<dyn MailProvider>,
+    /// So a delivery failure is visible to an operator as a number, not only as a
+    /// log line and a `last_error` column somebody has to go and read.
+    metrics: Arc<crate::platform::observability::metrics::Metrics>,
     poll_interval: Duration,
     batch_size: u32,
     /// Recorded in `claimed_by` so an operator can tell which instance is stuck.
@@ -462,6 +465,7 @@ impl OutboxWorker {
     pub fn new(
         pool: PgPool,
         mail: Arc<dyn MailProvider>,
+        metrics: Arc<crate::platform::observability::metrics::Metrics>,
         poll_interval: Duration,
         batch_size: u32,
         worker_id: impl Into<String>,
@@ -470,6 +474,7 @@ impl OutboxWorker {
         Self {
             pool,
             mail,
+            metrics,
             // A zero poll interval would spin the CPU and hammer the database; a
             // misconfigured value must degrade to "poll often", not to "busy loop".
             poll_interval: poll_interval.max(Duration::from_millis(100)),
@@ -487,10 +492,18 @@ impl OutboxWorker {
     pub fn with_derived_id(
         pool: PgPool,
         mail: Arc<dyn MailProvider>,
+        metrics: Arc<crate::platform::observability::metrics::Metrics>,
         poll_interval: Duration,
         batch_size: u32,
     ) -> Self {
-        Self::new(pool, mail, poll_interval, batch_size, default_worker_id())
+        Self::new(
+            pool,
+            mail,
+            metrics,
+            poll_interval,
+            batch_size,
+            default_worker_id(),
+        )
     }
 
     /// The supervised loop.
@@ -675,6 +688,7 @@ impl OutboxWorker {
 
     async fn mark_failed(&self, event: &ClaimedEvent, err: HandlerError) -> Result<(), AppError> {
         let stored = sanitise_last_error(err.message());
+        self.metrics.outbox_failure();
 
         if err.is_permanent() {
             sqlx::query(

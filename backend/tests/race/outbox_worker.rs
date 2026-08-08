@@ -104,6 +104,7 @@ fn worker(app: &TestApp, provider: Arc<dyn mail::MailProvider>, id: &str) -> Out
     OutboxWorker::new(
         app.db.clone(),
         provider,
+        app.state.metrics.clone(),
         // Below the 100 ms floor the constructor imposes, deliberately: the clamp is
         // what stops a misconfiguration becoming a busy loop, and relying on it here
         // means the suite notices if it is ever removed.
@@ -141,6 +142,7 @@ async fn concurrent_workers_never_claim_the_same_event_twice() {
             let worker = OutboxWorker::new(
                 app.db.clone(),
                 Arc::new(mail::LogSinkProvider),
+                app.state.metrics.clone(),
                 Duration::from_millis(100),
                 EVENTS as u32,
                 format!("racer-{n}"),

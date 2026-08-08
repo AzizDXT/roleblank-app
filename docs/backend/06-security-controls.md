@@ -217,7 +217,7 @@ ungranted *and* refused by an unconditional trigger.
 
 | Class | Why it does not apply |
 | --- | --- |
-| SSRF | No endpoint accepts a URL, hostname or IP and performs an outbound fetch. The backend makes **zero** outbound HTTP requests |
+| SSRF | No endpoint accepts a URL, hostname or IP and performs an outbound fetch. The one outbound connection the process can make is SMTP, to a host taken from `RB_SMTP_HOST` — operator configuration, never request input — so no request can steer it |
 | Command injection | The process never spawns a subprocess; `duct` and `subprocess` are banned in `deny.toml` |
 | Path traversal | No endpoint accepts a filesystem path; no static file is served |
 | File upload | No upload endpoint exists (`12-future-storage.md` records the controls required before one ships) |
@@ -234,8 +234,11 @@ future-architecture document — not an ad-hoc endpoint.
 - 256 crates resolved; `Cargo.lock` committed.
 - No git dependencies, no wildcard versions, no alpha/beta/nightly.
 - `deny.toml`: advisories and unknown sources are hard failures; licences are an
-  allowlist; `openssl`, `native-tls`, `md-5`, `chrono`, `duct` and `subprocess` are
-  banned with stated reasons.
+  allowlist; `openssl`, `openssl-sys`, `native-tls`, `chrono`, `duct` and
+  `subprocess` are banned with stated reasons. `md-5` is **not** banned — it arrives
+  through `sqlx-postgres` for PostgreSQL's legacy md5 authentication, and the real
+  control is requiring `scram-sha-256` at the server rather than pretending the
+  crate can be removed.
 - Security-critical crate rationale is in `00-reconnaissance.md` §5.
 
 ## 14. Future egress requirements

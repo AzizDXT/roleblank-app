@@ -1,9 +1,10 @@
 //! Outbound mail behind a trait.
 //!
-//! There is deliberately **no production provider**. The brief forbids pretending
-//! a message was delivered, so the three implementations here are honest about
-//! what they do: one records that a message was due, one writes it to disk for a
-//! developer to read, and one refuses outright. `Config::validate_production`
+//! The production provider is `SmtpProvider` — SMTP over TLS and nothing else.
+//! Alongside it are three development implementations, and the rule they all obey
+//! is that none of them ever pretends a message was delivered: one records that a
+//! message was due, one writes it to disk for a developer to read, and one refuses
+//! outright. `Config::validate_production`
 //! already refuses to start production with either development sink selected.
 //!
 //! The security property that shapes every implementation: **a password-reset or

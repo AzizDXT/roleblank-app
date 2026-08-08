@@ -137,8 +137,15 @@ fn denied_ids(actor: &ActorContext) -> Vec<Uuid> {
             continue; // corrupt authorisation data fails closed, never open
         }
         match denial.scope.scope_type {
-            // A DEPARTMENT-scoped denial covers the departments the actor belongs to.
-            ScopeType::Department => denied.extend(actor.department_ids.iter().copied()),
+            // DEPARTMENT and ASSIGNED both resolve to "the departments the actor
+            // belongs to" for this listing — `predicate_for` maps them to the same
+            // `IdSet`, built from `actor.department_ids`. They must therefore deny
+            // the same set; handling only DEPARTMENT left an ASSIGNED-scoped DENY
+            // silently ignored by the collection route while the object route
+            // honoured it.
+            ScopeType::Department | ScopeType::Assigned => {
+                denied.extend(actor.department_ids.iter().copied())
+            }
             ScopeType::Resource => {
                 if denial.scope.resource_type == Some(ResourceType::Department) {
                     if let Some(id) = denial.scope.resource_id {
@@ -146,8 +153,8 @@ fn denied_ids(actor: &ActorContext) -> Vec<Uuid> {
                     }
                 }
             }
-            // GLOBAL is already total; ASSIGNED and SELF name no department.
-            ScopeType::Global | ScopeType::Assigned | ScopeType::Own => {}
+            // GLOBAL is already total; SELF names no department.
+            ScopeType::Global | ScopeType::Own => {}
         }
     }
     denied.sort_unstable();

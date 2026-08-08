@@ -276,6 +276,12 @@ async fn delete_is_granted_on_exactly_the_expected_tables() {
             "idempotency_records".to_string(),
             "outbox_events".to_string(),
             "role_permissions".to_string(),
+            // Added by 0012. `DELETE /api/v1/roles/{id}` is fully authorised and
+            // then could not execute its final statement, so it returned `500` for
+            // every caller. The statement itself still carries
+            // `AND is_system = false`, so the grant does not widen what an
+            // authorised caller can reach.
+            "roles".to_string(),
             "user_permission_overrides".to_string(),
             "user_role_assignments".to_string(),
         ],
@@ -467,5 +473,66 @@ async fn public_has_no_privileges_on_the_schema() {
     assert_eq!(
         public_grants.0, 0,
         "PUBLIC holds table privileges in the public schema"
+    );
+}
+
+/// Replay the statements `authorization::service::delete_role` issues, as the role
+/// the application actually runs as.
+///
+/// This is the test that would have caught the defect 0012 fixes, and the reason
+/// the grant-list test above did not: that one asserts the deletable set equals a
+/// list it already knew, so it can detect a grant *disappearing* and can never
+/// detect one that was never there. Pinning the current answer cannot discover that
+/// the answer is wrong.
+///
+/// The integration tests drive this route and pass, because the harness connects as
+/// `roleblank_migrator`, which owns the tables. Three defects of exactly this shape
+/// have now been found — the missing `SELECT` on `permissions`, the missing
+/// `UPDATE` on the audit sequence, and this one — so the rule is: any statement the
+/// application issues must be exercised at least once by the role that will issue
+/// it in production.
+#[tokio::test]
+async fn the_runtime_role_can_delete_a_custom_role() {
+    let app = TestApp::spawn().await;
+    let runtime = app.runtime_role_pool().await;
+
+    let role_id = Uuid::now_v7();
+    // Seeded as the migrator, because creating the row is not what is under test.
+    sqlx::query(
+        "INSERT INTO roles (id, code, name, description, allowed_principal_type, is_system)
+         VALUES ($1, $2, 'Doomed', '', 'INTERNAL', false)",
+    )
+    .bind(role_id)
+    .bind(format!("doomed_{}", role_id.simple()))
+    .execute(&app.db)
+    .await
+    .expect("seed a custom role");
+
+    // The two statements the service issues, in order, as the runtime role.
+    sqlx::query("DELETE FROM role_permissions WHERE role_id = $1")
+        .bind(role_id)
+        .execute(&runtime)
+        .await
+        .expect("the runtime role must be able to clear a role's permissions");
+
+    let deleted = sqlx::query("DELETE FROM roles WHERE id = $1 AND is_system = false")
+        .bind(role_id)
+        .execute(&runtime)
+        .await
+        .expect("the runtime role must be able to delete a custom role");
+    assert_eq!(deleted.rows_affected(), 1, "the role was not deleted");
+
+    // The grant must not have opened a way to remove a built-in role. That is held
+    // by the statement's own predicate, not by the privilege, so it is asserted
+    // rather than assumed.
+    let system_removed = sqlx::query("DELETE FROM roles WHERE id = $1 AND is_system = false")
+        .bind(Uuid::parse_str("00000000-0000-7000-8000-000000000001").expect("seeded role id"))
+        .execute(&runtime)
+        .await
+        .expect("statement should run");
+    assert_eq!(
+        system_removed.rows_affected(),
+        0,
+        "a built-in role was deleted; the is_system predicate is the only thing stopping it"
     );
 }

@@ -241,13 +241,17 @@ async fn general_ip_limit(
     request: Request,
     next: Next,
 ) -> Result<Response, AppError> {
-    crate::platform::http::rate_limit::enforce(
+    if let Err(refusal) = crate::platform::http::rate_limit::enforce(
         state.limiter.as_ref(),
         &crate::platform::http::rate_limit::keys::general_ip(ip),
         state.config.rate_limits.general_per_ip_per_minute,
         crate::platform::http::rate_limit::MINUTE,
     )
-    .await?;
+    .await
+    {
+        state.metrics.rate_limit_event();
+        return Err(refusal);
+    }
     Ok(next.run(request).await)
 }
 

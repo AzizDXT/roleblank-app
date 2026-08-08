@@ -192,13 +192,20 @@ async fn general_principal_limit(app: &AppState, principal: &Principal) -> Resul
     } else {
         app.config.rate_limits.general_per_principal_per_minute
     };
-    rate_limit::enforce(
+    let decision = rate_limit::enforce(
         app.limiter.as_ref(),
         &rate_limit::keys::general_principal(principal.user_id()),
         quota,
         rate_limit::MINUTE,
     )
-    .await
+    .await;
+    if decision.is_err() {
+        // Counted so an operator can see throttling happening at all. Without this
+        // the `/metrics` series existed and was never incremented, which is the same
+        // "documented but absent" shape the limiter itself had.
+        app.metrics.rate_limit_event();
+    }
+    decision
 }
 
 /// A session that has authenticated with a password but not yet completed MFA.

@@ -1301,3 +1301,92 @@ async fn a_targeted_denial_hides_the_user_from_the_listing_too() {
         "the listing returned a user the object decision denies"
     );
 }
+
+/// The narrow-denial parity property, for the `ASSIGNED` scope.
+///
+/// The first round of this fix handled `RESOURCE` denials (and `DEPARTMENT` for
+/// departments) and missed `ASSIGNED`, so an `ASSIGNED`-scoped DENY still blocked
+/// `GET /clients/{id}` while leaving the row in `GET /clients`. `ASSIGNED` means
+/// "the accounts I manage" on the allow side, so it has to mean the same on the
+/// deny side; it cannot be expressed as a list of ids, which is why it was easy to
+/// forget.
+#[tokio::test]
+async fn an_assigned_scoped_denial_hides_managed_clients_from_the_listing() {
+    let w = World::build().await;
+
+    // Make the administrator the account manager, so ASSIGNED actually resolves.
+    sqlx::query("UPDATE client_accounts SET account_manager_user_id = $1 WHERE id = $2")
+        .bind(w.admin.id)
+        .bind(w.client_account_a)
+        .execute(&w.app.db)
+        .await
+        .expect("assign the account manager");
+
+    sqlx::query(
+        "INSERT INTO user_permission_overrides
+             (id, user_id, permission_code, effect, scope_type, granted_by)
+         VALUES ($1, $2, 'clients.read', 'DENY', 'ASSIGNED', $3)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(w.admin.id)
+    .bind(w.root.id)
+    .execute(&w.app.db)
+    .await
+    .expect("seed an ASSIGNED denial");
+
+    let object = w
+        .app
+        .get(
+            &format!("/api/v1/clients/{}", w.client_account_a),
+            w.admin.bearer(),
+        )
+        .await;
+    assert!(
+        object.status == StatusCode::FORBIDDEN || object.status == StatusCode::NOT_FOUND,
+        "the object route ignored an ASSIGNED denial: {}",
+        object.status
+    );
+
+    let listing = w.app.get("/api/v1/clients", w.admin.bearer()).await;
+    assert_eq!(listing.status, StatusCode::OK, "listing failed");
+    assert!(
+        !listing
+            .json()
+            .to_string()
+            .contains(&w.client_account_a.to_string()),
+        "the listing returned a managed client the object decision denies"
+    );
+}
+
+/// The same property for departments, where `ASSIGNED` and `DEPARTMENT` both
+/// resolve to the actor's own departments.
+#[tokio::test]
+async fn an_assigned_scoped_denial_hides_the_department_from_the_listing() {
+    let w = World::build().await;
+
+    // The manager is a member of `w.department`, so ASSIGNED resolves to it.
+    sqlx::query(
+        "INSERT INTO user_permission_overrides
+             (id, user_id, permission_code, effect, scope_type, granted_by)
+         VALUES ($1, $2, 'departments.read', 'DENY', 'ASSIGNED', $3)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(w.manager.id)
+    .bind(w.root.id)
+    .execute(&w.app.db)
+    .await
+    .expect("seed an ASSIGNED denial");
+
+    let listing = w.app.get("/api/v1/departments", w.manager.bearer()).await;
+    // Either a refusal or an empty page is correct — what must never happen is the
+    // denied department coming back in the body.
+    if listing.status == StatusCode::OK {
+        assert!(
+            !listing
+                .json()
+                .to_string()
+                .contains(&w.department.to_string()),
+            "the listing returned a department an ASSIGNED denial covers"
+        );
+    }
+}

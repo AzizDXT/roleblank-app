@@ -31,7 +31,7 @@ use axum::Router;
 use crate::app::AppState;
 use crate::modules::authentication::service::ClientHints;
 use crate::modules::authentication::{dto, mfa, service};
-use crate::platform::errors::AppResult;
+use crate::platform::errors::{AppError, AppResult};
 use crate::platform::http::extract::{
     Authenticated, ClientIp, Json, MfaPendingSession, PathId, UserAgentHint,
 };
@@ -75,7 +75,17 @@ async fn login(
     agent: UserAgentHint,
     Json(body): Json<dto::LoginRequest>,
 ) -> AppResult<impl IntoResponse> {
-    let response = service::login(&state, &hints(ip, agent), body).await?;
+    // Counted at the boundary rather than at each of `login`'s six early returns,
+    // so a future refusal path cannot be added without being counted. Only genuine
+    // credential failures are recorded — a throttle or a malformed body is a
+    // different operational signal and has its own series.
+    let response = service::login(&state, &hints(ip, agent), body)
+        .await
+        .inspect_err(|e| {
+            if matches!(e, AppError::AuthenticationFailed) {
+                state.metrics.auth_failure();
+            }
+        })?;
     Ok((StatusCode::OK, axum::Json(response)))
 }
 

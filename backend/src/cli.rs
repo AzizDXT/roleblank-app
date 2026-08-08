@@ -249,6 +249,7 @@ async fn serve() -> Result<(), String> {
     let worker = crate::modules::outbox::OutboxWorker::new(
         state.db.clone(),
         crate::modules::outbox::mail::build(&state.config.mail),
+        state.metrics.clone(),
         state.config.outbox_poll_interval,
         state.config.outbox_batch_size,
         worker_id,

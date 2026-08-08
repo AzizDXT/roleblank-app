@@ -101,6 +101,13 @@ async fn metrics(State(state): State<AppState>) -> AppResult<Response> {
         return Err(AppError::NotFound);
     }
 
+    // Sampled at scrape time rather than tracked continuously: the pool already
+    // knows its own size and idle count, so mirroring them on every checkout would
+    // be bookkeeping for a number nobody reads between scrapes. Without this the
+    // two gauges were published and never written — the same "documented but
+    // absent" shape the rest of this closure has been removing.
+    state.metrics.db_pool(state.db.size(), state.db.num_idle());
+
     let body = state.metrics.render();
     Ok((
         StatusCode::OK,

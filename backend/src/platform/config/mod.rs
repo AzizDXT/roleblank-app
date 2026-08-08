@@ -627,12 +627,56 @@ impl Config {
             },
             Some("dev_sink") | None => MailProviderKind::DevSink,
             Some("disabled") => MailProviderKind::Disabled,
+            Some("smtp") => {
+                let host = env_var("RB_SMTP_HOST").unwrap_or_default();
+                let username = env_var("RB_SMTP_USERNAME").unwrap_or_default();
+                let password = env_var("RB_SMTP_PASSWORD").unwrap_or_default();
+                let from = env_var("RB_SMTP_FROM").unwrap_or_default();
+                let implicit_tls = env_parse("RB_SMTP_IMPLICIT_TLS", true, &mut errors);
+                let default_port = if implicit_tls { 465 } else { 587 };
+                let port = env_parse("RB_SMTP_PORT", default_port, &mut errors);
+
+                // Every one of the four is required. A half-configured transport
+                // that starts is worse than one that refuses, because the first
+                // invitation is where you find out.
+                for (key, value) in [
+                    ("RB_SMTP_HOST", &host),
+                    ("RB_SMTP_USERNAME", &username),
+                    ("RB_SMTP_PASSWORD", &password),
+                    ("RB_SMTP_FROM", &from),
+                ] {
+                    if value.trim().is_empty() {
+                        errors.push(format!(
+                            "{key} is required when RB_MAIL_PROVIDER=smtp; refusing to \
+                             start with a half-configured mail transport"
+                        ));
+                    }
+                }
+
+                // Port 25 is the server-to-server relay port, not the submission
+                // port. Authenticated submission there is almost always a mistake,
+                // and many networks silently drop it — which presents as
+                // "invitations stopped working" with nothing to point at.
+                if port == 25 {
+                    errors.push(
+                        "RB_SMTP_PORT=25 is the relay port, not the submission port. \
+                         Use 465 (implicit TLS) or 587 (STARTTLS).",
+                    );
+                }
+
+                MailProviderKind::Smtp(Box::new(SmtpConfig {
+                    host,
+                    port,
+                    implicit_tls,
+                    username,
+                    password: Secret::new(password),
+                    from,
+                }))
+            }
             Some(other) => {
                 errors.push(format!(
                     "RB_MAIL_PROVIDER `{other}` is not implemented. \
-                     Supported: dev_sink | dev_file | disabled. \
-                     A production SMTP/API provider is deferred work — see \
-                     docs/backend/08-operations.md."
+                     Supported: smtp | dev_sink | dev_file | disabled."
                 ));
                 MailProviderKind::Disabled
             }
@@ -852,6 +896,12 @@ impl Config {
                 // than at the first invitation.
                 if smtp.host.trim().is_empty() {
                     errors.push("RB_SMTP_HOST is empty");
+                }
+                // Checked here as well as in the parser, because the documentation
+                // names all four and a reader should not have to know which of the
+                // two layers happens to catch which one.
+                if smtp.username.trim().is_empty() {
+                    errors.push("RB_SMTP_USERNAME is empty");
                 }
                 if smtp.password.expose().trim().is_empty() {
                     errors.push("RB_SMTP_PASSWORD is empty");
