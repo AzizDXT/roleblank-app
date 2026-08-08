@@ -55,6 +55,25 @@ control rather than outside it. It is fixed.
 
 ## 3. Accepted, with reasons
 
+> **Update — three of the items below were subsequently FIXED**, not accepted, once
+> the files they lived in were free. Recorded here rather than silently edited into
+> the table, because the reasoning for accepting them was sound at the time and the
+> reason they changed is worth keeping:
+>
+> * **`AppState::not_found_or_denied` — DELETED.** It had zero callers while
+>   `AppError::hide_from_external`, the same rule, had seven. A dead duplicate of a
+>   *security* rule is the one nobody re-reads when the rule changes.
+> * **`evaluator::holds_any` docstring — CORRECTED.** It claimed to build the
+>   `/auth/me` capability list; `capability_list` does that. The false claim was the
+>   harm, exactly as this entry argued.
+> * **The metrics layer (§4 below) — APPLIED.** `/metrics` promised request volumes
+>   and error rates and recorded neither. Wired outermost, keyed on `MatchedPath`
+>   rather than the raw URI so cardinality stays bounded, with a test asserting that
+>   refused requests are counted too.
+>
+> `L4` (leaked test databases) remains accepted and is recorded as a known
+> limitation in `BACKEND_FREEZE_MANIFEST.md`.
+
 | ID | Description | Why it is accepted |
 |---|---|---|
 | **§26 A-01** | `platform/observability/metrics.rs` is ~1 072 lines and only two series are ever recorded; no metrics layer is installed | **Half-accepted, and the half that matters is blocked on file ownership.** The real defect is not the dead code — it is that `GET /metrics` carries a prominent comment warning that it "publishes request volumes, error rates and authorisation-denial counts", and two of those three are never observed. Closing that requires installing a metrics layer in `platform/http/middleware.rs`, which is reserved by the concurrent rate-limit workstream and was being rewritten while this closure ran. The patch is in §4 below, unapplied. Deleting the eight unused methods instead would also close it, and is deliberately *not* done unilaterally: `rate_limit_event` in particular is plausibly about to acquire a caller |
