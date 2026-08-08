@@ -124,11 +124,21 @@ escape to the weaker layout.
 14 fixed, 7 accepted, 1 reclassified then fixed. Full table with reasoning:
 `audit/LOW_INFO_DISPOSITION.md`.
 
-The accepted items are all INFO and all documentation or unused-code observations,
-with two worth naming because they carry real cost: `AppState::not_found_or_denied`
-is a second implementation of a security rule already expressed by
-`AppError::hide_from_external`, and `evaluator::holds_any`'s docstring misdescribes
-how `/auth/me` works.
+Two of those acceptances were **later reversed and fixed**, once the files they
+lived in were no longer being edited by another workstream:
+
+* `AppState::not_found_or_denied` — a second expression of the rule that an external
+  principal sees `404` where an internal one sees `403`. It had zero callers while
+  `AppError::hide_from_external`, the same rule, had seven. **Deleted.** Two
+  implementations of one security rule drift the moment somebody teaches one of them
+  about a new error variant, and the dead one is the one nobody re-reads.
+* `evaluator::holds_any` claimed in its doc comment to build the `/auth/me`
+  capability list. It does not — `capability_list` does — and its only caller is a
+  unit test. **Corrected.** The false claim was the harm, not the dead function.
+
+What remains accepted is documentation and unused-code cleanup with no security
+content, plus the leaked-test-database limitation, which is recorded in the freeze
+manifest rather than hidden.
 
 ## 7. Test inventory and coverage
 
