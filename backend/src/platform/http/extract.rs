@@ -244,6 +244,65 @@ where
     }
 }
 
+/// Query-string extraction with our error shape.
+///
+/// # Why this exists instead of `Query<T>`
+///
+/// This is the query-string half of the `PathId` argument below, and it was found
+/// missing on six routes. `axum::extract::Query<T>` rejects with:
+///
+/// ```text
+/// 400 Content-Type: text/plain; charset=utf-8
+/// Failed to deserialize query string: is_admin: unknown field `is_admin`,
+/// expected one of `cursor`, `limit`, `sort`, `direction`, `principal_type`,
+/// `status`, `search`
+/// ```
+///
+/// which breaks the same three promises `Path<Uuid>` broke:
+///
+/// 1. **It is not `application/problem+json` and carries no `code`.** A client
+///    branching on `code` — the only thing `platform::errors` guarantees is stable
+///    — gets plain text with nothing to branch on.
+/// 2. **It reflects attacker-controlled input.** The rejected parameter name is
+///    echoed verbatim, which is precisely the reflection gadget `FieldError::
+///    message` and `shared::pagination` go out of their way to avoid.
+/// 3. **It enumerates the DTO.** The list of accepted parameters is the internal
+///    field set of the request struct, handed out on a refusal.
+///
+/// `projects`, `tasks`, `authorization` and `audit` each grew a private version of
+/// this; `identity`, `departments` and `clients` did not, so those six listings
+/// answered in `text/plain`. It lives here so a new listing gets the behaviour by
+/// default rather than by remembering to. Found by
+/// `tests/hardening/leakage.rs`; see
+/// `docs/backend/audit/SECTION_9_13_FINDINGS.md` §10 finding H-1.
+pub struct ValidatedQuery<T>(pub T);
+
+impl<T, S> FromRequestParts<S> for ValidatedQuery<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        match axum::extract::Query::<T>::try_from_uri(&parts.uri) {
+            Ok(axum::extract::Query(value)) => Ok(ValidatedQuery(value)),
+            Err(rejection) => {
+                // The rejection's own text repeats the caller's string and names
+                // the DTO's fields. It is logged against the request id, never
+                // returned.
+                tracing::debug!(
+                    rejection = %sanitize::log_value(rejection.body_text()),
+                    "rejected a query string"
+                );
+                Err(AppError::BadRequest(
+                    "The query string is not valid for this endpoint, or contains unrecognised parameters.",
+                ))
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Path parameters
 // ---------------------------------------------------------------------------

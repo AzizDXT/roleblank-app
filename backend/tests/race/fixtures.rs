@@ -19,7 +19,9 @@
 
 #![allow(dead_code)] // each suite uses a different subset
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Arc;
 
 use axum::http::StatusCode;
 use serde_json::{json, Value};
@@ -28,7 +30,7 @@ use uuid::Uuid;
 use roleblank_backend::platform::http::rate_limit::keys;
 use roleblank_backend::shared::secret::Secret;
 
-use crate::common::{TestApp, TEST_PASSWORD};
+use crate::common::{TestApp, TestResponse, TEST_PASSWORD};
 
 /// The address the harness's requests appear to come from.
 ///
@@ -380,4 +382,117 @@ pub async fn audit_count(app: &TestApp, action_code: &str) -> i64 {
         .await
         .expect("count audit events");
     row.0
+}
+
+// ---------------------------------------------------------------------------
+// Measured races
+// ---------------------------------------------------------------------------
+
+/// The outcome distribution of a race, counted rather than asserted away.
+///
+/// **Why counting matters.** "The test passed" is not evidence about a race: a
+/// suite that spawns a hundred tasks and asserts `winners == 1` reports the same
+/// green whether the losers were clean `409`s or ninety-nine `500`s that happened
+/// to leave the database consistent. An audit needs the distribution, so this type
+/// records every status and every stable `code` and prints them.
+#[derive(Default, Debug, Clone)]
+pub struct Tally {
+    pub by_status: BTreeMap<u16, usize>,
+    pub by_code: BTreeMap<String, usize>,
+    pub total: usize,
+}
+
+impl Tally {
+    pub fn record(&mut self, response: &TestResponse) {
+        self.total += 1;
+        *self.by_status.entry(response.status.as_u16()).or_insert(0) += 1;
+        // Only failures carry a stable error `code`. A *success* body may happen to
+        // have a field called `code` too — a project's code, for instance — and
+        // counting that alongside the error codes produced evidence like
+        // `codes={"VERSION_CONFLICT": 49, "race-proj-50": 1}`, which invites exactly
+        // the wrong reading.
+        if response.status.is_client_error() || response.status.is_server_error() {
+            if let Some(code) = response.error_code() {
+                *self.by_code.entry(code.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    /// How many responses carried a given HTTP status.
+    pub fn status(&self, status: StatusCode) -> usize {
+        self.by_status
+            .get(&status.as_u16())
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// How many responses carried a given stable error `code`.
+    ///
+    /// Tests assert on this rather than on the status alone, because a `409` that
+    /// means "you lost the race" and a `409` that means "your body was malformed"
+    /// are the same number and completely different claims.
+    pub fn code(&self, code: &str) -> usize {
+        self.by_code.get(code).copied().unwrap_or_default()
+    }
+
+    /// Every 5xx. A race may legitimately produce refusals; it may never produce a
+    /// server error, which always means the application failed to anticipate a
+    /// state it created for itself.
+    pub fn server_errors(&self) -> usize {
+        self.by_status
+            .iter()
+            .filter(|(status, _)| **status >= 500)
+            .map(|(_, count)| *count)
+            .sum()
+    }
+
+    /// Statuses outside an expected set, for an assertion message that says which.
+    pub fn unexpected(&self, allowed: &[StatusCode]) -> BTreeMap<u16, usize> {
+        let allowed: Vec<u16> = allowed.iter().map(StatusCode::as_u16).collect();
+        self.by_status
+            .iter()
+            .filter(|(status, _)| !allowed.contains(status))
+            .map(|(status, count)| (*status, *count))
+            .collect()
+    }
+
+    /// Print the distribution, so `--nocapture` yields the measured evidence the
+    /// audit report quotes rather than a re-derivation of it.
+    pub fn report(&self, label: &str) {
+        println!(
+            "RACE-EVIDENCE {label}: n={} statuses={:?} codes={:?}",
+            self.total, self.by_status, self.by_code
+        );
+    }
+}
+
+/// Run `concurrency` genuinely simultaneous operations and tally the outcomes.
+///
+/// **Why a barrier and not just a spawn loop.** Spawning N tasks in a loop usually
+/// lets the first complete before the last is scheduled, so the "race" never
+/// overlaps and the test passes without exercising anything. Every task here parks
+/// on the barrier and is released only once all of them have arrived, which is the
+/// closest a single process can get to N requests landing at the same instant.
+pub async fn race<F, Fut>(concurrency: usize, op: F) -> Tally
+where
+    F: Fn(usize) -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = TestResponse> + Send + 'static,
+{
+    let barrier = Arc::new(tokio::sync::Barrier::new(concurrency));
+    let mut handles = Vec::with_capacity(concurrency);
+    for index in 0..concurrency {
+        let barrier = barrier.clone();
+        let op = op.clone();
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            op(index).await
+        }));
+    }
+
+    let mut tally = Tally::default();
+    for handle in handles {
+        let response = handle.await.expect("a racing task must not panic");
+        tally.record(&response);
+    }
+    tally
 }

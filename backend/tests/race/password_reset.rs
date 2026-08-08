@@ -166,6 +166,158 @@ async fn two_simultaneous_confirmations_consume_the_token_once() {
     );
 }
 
+/// A distinct passphrase per racer, so that a double-apply is *observable*.
+///
+/// Fifty identical passwords would make two successful writes indistinguishable
+/// from one — the account would hold the right password either way and the bug
+/// would pass.
+fn racer_password(n: usize) -> String {
+    format!("racing passphrase number {n} zulu")
+}
+
+/// Fifty simultaneous confirmations of one token (§7).
+///
+/// **What the extra scale buys over the two-way test above.** Two confirmations
+/// contend for the token row and nothing else. Fifty also contend for the
+/// connection pool and the per-IP quota, so this is where a lock held across a
+/// second pool acquisition, or a rows-affected gate that was quietly dropped,
+/// stops being theoretical. The end state must still be a *single* well-defined
+/// password — not "one of the fifty, probably".
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn fifty_simultaneous_confirmations_consume_the_token_once() {
+    const ATTEMPTS: usize = 50;
+
+    let app = Arc::new(TestApp::spawn().await);
+    let (user_id, session_token, token) = subject_with_live_reset(&app).await;
+
+    // Hand the confirm path its full per-IP budget back: the reset *request* above
+    // already spent one, and this test is about the token, not the quota. The quota
+    // still binds during the race — it is 5/hour and shared between request and
+    // confirm — so most racers are refused by the limiter before they ever reach
+    // the token. That is a correct outer defence, and the counts are reported.
+    fixtures::reset_password_reset_limits(&app, SUBJECT).await;
+
+    // Which racer won, recorded as it happens. Reading it back afterwards by trying
+    // all fifty candidates would cost fifty Argon2id verifications at production
+    // parameters for no extra assurance.
+    let winners: Arc<std::sync::Mutex<Vec<usize>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let tally = {
+        let app = app.clone();
+        let winners = winners.clone();
+        fixtures::race(ATTEMPTS, move |n| {
+            let app = app.clone();
+            let token = token.clone();
+            let winners = winners.clone();
+            async move {
+                let response = app
+                    .post(
+                        "/api/v1/auth/password-reset/confirm",
+                        None,
+                        json!({"token": token, "new_password": racer_password(n)}),
+                    )
+                    .await;
+                if response.status == StatusCode::OK {
+                    winners.lock().expect("winner list").push(n);
+                }
+                response
+            }
+        })
+        .await
+    };
+    tally.report("password_reset_confirm x50");
+
+    assert_eq!(
+        tally.server_errors(),
+        0,
+        "concurrent confirmation produced server errors: {:?}",
+        tally.by_status
+    );
+    assert!(
+        tally
+            .unexpected(&[
+                StatusCode::OK,
+                StatusCode::UNAUTHORIZED,
+                StatusCode::TOO_MANY_REQUESTS,
+            ])
+            .is_empty(),
+        "every losing confirmation must be a clean 401 or 429, got: {:?}",
+        tally.by_status
+    );
+    assert_eq!(
+        tally.status(StatusCode::OK),
+        1,
+        "exactly one confirmation may succeed, got {:?}",
+        tally.by_status
+    );
+
+    // A loser must not be able to tell a spent link from a forged one: anything more
+    // specific confirms to whoever holds a stolen link that it was genuine.
+    assert_eq!(
+        tally.code("AUTHENTICATION_FAILED"),
+        tally.status(StatusCode::UNAUTHORIZED),
+        "a losing confirmation returned a code other than AUTHENTICATION_FAILED"
+    );
+
+    // ---- one well-defined final password ----------------------------------
+    let winners = winners.lock().expect("winner list").clone();
+    assert_eq!(
+        winners.len(),
+        1,
+        "expected exactly one winner, got {winners:?}"
+    );
+    let winner = winners[0];
+    assert!(
+        password_is(&app, user_id, &racer_password(winner)).await,
+        "the account does not hold the winning racer's password"
+    );
+    assert!(
+        !password_is(&app, user_id, TEST_PASSWORD).await,
+        "the original password still works after a successful reset"
+    );
+    // A neighbour's password must not have been applied on top of the winner's.
+    let neighbour = (winner + 1) % ATTEMPTS;
+    assert!(
+        !password_is(&app, user_id, &racer_password(neighbour)).await,
+        "a losing confirmation's password was applied as well — its write was not \
+         rolled back with its transaction"
+    );
+
+    // ---- the token was consumed exactly once ------------------------------
+    let tokens: (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(*) FILTER (WHERE consumed_at IS NOT NULL)
+           FROM password_reset_tokens WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&app.db)
+    .await
+    .expect("count reset tokens");
+    assert_eq!(tokens.0, 1, "more than one reset token exists");
+    assert_eq!(tokens.1, 1, "the token was not consumed exactly once");
+
+    // ---- every session is gone --------------------------------------------
+    // A recovery that leaves the attacker's session alive is not a recovery.
+    let live_sessions = fixtures::count(
+        &app,
+        "SELECT count(*) FROM sessions WHERE revoked_at IS NULL",
+    )
+    .await;
+    assert_eq!(
+        live_sessions, 0,
+        "{live_sessions} sessions survived the reset"
+    );
+    app.get("/api/v1/auth/me", Some(&session_token))
+        .await
+        .assert_error(StatusCode::UNAUTHORIZED, "AUTHENTICATION_FAILED");
+
+    // Exactly one completion audited: two would mean a loser committed an audit row
+    // for a password change that rolled back.
+    assert_eq!(
+        fixtures::audit_count(&app, "PASSWORD.RESET_COMPLETED").await,
+        1
+    );
+}
+
 /// A successful reset kills every session, including any the attacker who prompted
 /// the reset already holds. A reset that leaves a live session is not a recovery.
 #[tokio::test]

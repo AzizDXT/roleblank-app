@@ -1,9 +1,15 @@
 # Performance Report
 
 **Date of measurement:** 2026-08-07
-**Every number below was produced by an executed run.** Nothing here is estimated,
-extrapolated, or copied from another system. Where a measurement was not taken,
-that is stated rather than filled in.
+**Method:** release build, real HTTP load against a real PostgreSQL.
+**Every number below was produced by an executed run.** Nothing is estimated,
+extrapolated, or carried forward from an earlier report. Where a measurement was
+not taken, or was taken under a caveat, that is stated rather than filled in.
+
+This report replaces an earlier version whose numbers came from in-process
+micro-benchmarks (`tests/benchmarks.rs`). Those measured cryptographic primitives
+in isolation; they did not measure the server. This one drives the actual API over
+the network.
 
 ---
 
@@ -12,207 +18,403 @@ that is stated rather than filled in.
 | Item | Value |
 | --- | --- |
 | Host | Windows 11 Home 10.0.26200 |
-| CPU | Intel Core Ultra 9 290HX Plus — 24 physical / 24 logical cores |
-| RAM | 63.37 GB |
-| Execution environment | `rust:1-bookworm` container (rustc 1.97.1, identical to the host toolchain) |
-| Cores visible to the process | 24 |
-| Build profile | **release** (`opt-level = 3`, `lto = "thin"`, `codegen-units = 1`) |
-| Target | x86_64 |
-| Database | `postgres:18.4-alpine`, data checksums enabled, same Docker network |
+| Host CPU | Intel Core Ultra 9 290HX Plus — 24 physical / 24 logical cores |
+| Host RAM | 63.37 GB |
+| Cores visible to the containers | 24 |
+| RAM visible to the containers | 31.03 GB (Docker Desktop VM allocation) |
+| Toolchain | `rustc 1.97.1 (8bab26f4f 2026-07-14)`, `cargo 1.97.1` |
+| Build profile | **release** (`opt-level = 3`, `lto = "thin"`, `codegen-units = 1`, `strip = "symbols"`) |
+| Binary | `target/release/roleblank-api`, 9 435 152 bytes |
+| Database | `postgres:18.4-alpine`, data checksums enabled, `max_connections=400`, `shared_buffers=256MB` |
+| Load generator | **`oha` 1.15.0** (`ghcr.io/hatoo/oha:latest`), in containers on the same Docker network |
+| Network path | container → container over the `roleblank_net` bridge (no host loopback hop, no TLS) |
 
 Everything runs containerised because the Windows host enforces an Application
 Control policy that refuses to execute freshly compiled unsigned binaries
 (`os error 4551`). See `00-reconnaissance.md` §3.
 
-Reproduce with:
+### Application configuration as measured
 
-```bash
-cargo test --release --test benchmarks -- --ignored --nocapture
+Defaults were used throughout. **Nothing was tuned to improve a number.**
+
+| Setting | Value | Where it comes from |
+| --- | --- | --- |
+| `RB_DB_MAX_CONNECTIONS` | 32 | default `(cpu_count * 2).clamp(5, 32)` |
+| `RB_DB_MIN_CONNECTIONS` | 1 | default |
+| `RB_AUTH_HASHING_MAX_CONCURRENCY` | 8 | default `cpu_count.min(8)` |
+| Argon2id | m=19 456 KiB, t=2, p=1 | default |
+| `RB_ENV` | `development` | required to run without TLS / secret manager |
+| Session TTLs, body limits, page sizes | defaults | — |
+
+### Data volume under test
+
+A dedicated database (`roleblank_perf`) on the same PostgreSQL server, migrated by
+the real `migrate` command and populated **through the public HTTP API only** — no
+direct SQL writes, so every row is one the application itself would produce.
+
+| Table | Rows |
+| --- | --- |
+| `users` | 1 (the ROOT owner) |
+| `departments` | 1 |
+| `client_accounts` | 1 |
+| `projects` | 40 |
+| `tasks` | 400 |
+| `audit_events` | 760 |
+
+This is a **small** dataset. The collection reads below return the first page of 25
+from 40 projects and 400 tasks. Numbers here therefore characterise the request
+path — authentication, authorisation, serialisation — and not index behaviour at
+scale. A missing index on a million-row table would not show up here, and this
+report does not claim otherwise.
+
+---
+
+## 2. How the scenarios are split, and why
+
+Two populations are measured and reported **separately, never blended**:
+
+- **Normal API traffic** — reads whose cost is dominated by the database and the
+  per-request authentication path.
+- **Authentication (`POST /auth/login`)** — dominated by Argon2id, which is
+  memory-hard *by design* and intentionally three to four orders of magnitude more
+  expensive than anything else here.
+
+Mixing even a small share of logins into the general run would drag the aggregate
+p95/p99 toward the Argon2id cost and tell the truth about neither population.
+
+A second split matters just as much and is the main finding of this report:
+**single-session load and multi-session load are not the same measurement.** Every
+authenticated request writes to its own `sessions` row, so driving load through one
+bearer token measures row-lock contention on one tuple, not the API. Both are
+reported.
+
+---
+
+## 3. Normal API — results
+
+### 3.1 Unauthenticated baseline (single generator, c=50, 30 s)
+
+| Endpoint | Conc. | Requests | p50 | p95 | p99 | req/s | Errors |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `GET /health/live` | 50 | 7 277 296 | **0.17 ms** | 0.45 ms | 0.69 ms | **242 524** | 0.00 % |
+| `GET /health/ready` | 50 | 796 416 | **1.51 ms** | 3.93 ms | 7.94 ms | **26 543** | 0.00 % |
+
+`/health/live` touches neither the database nor authentication: it is the floor,
+and it establishes that neither the HTTP stack nor the Tokio runtime is a
+constraint at any load this system will see. `/health/ready` adds one pool checkout
+and one trivial round trip; the ~26 500/s it sustains is the baseline database tax,
+and it is *twenty times* what any authenticated endpoint achieves. That gap is the
+subject of §5.
+
+### 3.2 Authenticated, **one** bearer token (single generator, c=50, 30 s)
+
+| Endpoint | Conc. | Requests | p50 | p95 | p99 | req/s | Errors |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `GET /api/v1/auth/me` | 50 | 35 756 | 32.37 ms | 101.07 ms | 153.95 ms | 1 193 | 0.00 % |
+| `GET /api/v1/projects?limit=25` | 50 | 35 396 | 32.22 ms | 101.92 ms | 170.38 ms | 1 181 | 0.00 % |
+| `GET /api/v1/tasks?limit=25` | 50 | 38 251 | 31.06 ms | 90.31 ms | 134.56 ms | 1 277 | 0.00 % |
+| `GET /api/v1/users/{id}/permissions` | 50 | 39 789 | 29.92 ms | 86.30 ms | 126.26 ms | 1 328 | 0.00 % |
+
+`GET /api/v1/users/{id}/permissions` is the authorisation-heavy endpoint: it loads
+the target user's role-derived grants and per-user overrides and evaluates the
+entire 47-entry permission catalogue against them.
+
+**The result that matters is the flatness of that column.** Four endpoints with
+very different work — a 2.6 KiB identity read, a 12.3 KiB project page, a 10.4 KiB
+task page, and a full authorisation evaluation — all land within 12 % of each
+other. When endpoints with different work cost the same, the cost is not in the
+endpoints. It is in what they share.
+
+### 3.3 Concurrency sweep, `GET /auth/me`, one token (10 s each)
+
+| Concurrency | p50 | p95 | p99 | req/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | **1.88 ms** | 4.57 ms | 11.88 ms | 420 |
+| 4 | 3.56 ms | 19.93 ms | 43.35 ms | 632 |
+| 16 | 8.26 ms | 26.86 ms | 39.26 ms | **1 497** |
+| 50 | 28.30 ms | 85.13 ms | 123.95 ms | 1 379 |
+| 100 | 65.69 ms | 168.55 ms | 350.03 ms | 1 201 |
+
+A single authenticated request costs **1.88 ms**. Throughput peaks near c=16 and
+then *falls* as concurrency rises while latency grows super-linearly. That shape —
+throughput decreasing under added load — is contention, not saturation.
+
+### 3.4 Authenticated, **eight distinct sessions** (8 generators × c=6 = 48 concurrent, 30 s)
+
+Same user, same permissions, same data; the only change is that the load is spread
+over eight `sessions` rows instead of one.
+
+| Endpoint | Conc. | Requests | p50 (range) | p95 (range) | p99 (range) | req/s | Errors |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `GET /api/v1/auth/me` | 48 | 102 148 | **8.84–9.11 ms** | 39.05–40.43 ms | 68.55–71.10 ms | **3 406** | 0.00 % |
+| `GET /api/v1/projects?limit=25` | 48 | 37 843 | 11.72–12.21 ms | 49.43–57.37 ms | 95.97–111.90 ms | 1 263 | 0.00 % |
+| `GET /api/v1/tasks?limit=25` | 48 | 38 901 | 10.23–10.38 ms | 23.14–23.95 ms | 41.06–42.98 ms | 1 298 | 0.00 % |
+| `GET /api/v1/users/{id}/permissions` | 48 | 38 106 | 14.21–14.51 ms | 23.87–25.96 ms | 33.29–42.35 ms | 1 272 | 0.00 % |
+
+**Derivation, stated because it affects how these should be read.** `oha` cannot
+rotate a header per request, so eight generator containers were run in parallel,
+one bearer token each. Throughput is the **sum** of the eight reported rates; the
+percentile columns give the **range across the eight generators**, not a merged
+distribution. The generators agreed closely (see the narrow ranges), so the range
+is a fair summary — but it is a range of eight separate measurements, not a single
+population percentile, and it is not presented as one.
+
+Spreading `/auth/me` over eight sessions raised throughput **2.5×** (1 379 → 3 406
+req/s) and cut p50 **3.2×** (28.3 → ~9.0 ms) at the same concurrency. Nothing else
+changed. The collection reads improved in latency but not in throughput, because
+they hit a second limit described below.
+
+---
+
+## 4. Authentication — measured separately
+
+`POST /api/v1/auth/login` is both intentionally expensive (Argon2id) and
+intentionally rate limited (10 per IP per minute; 5 per account per minute, reset
+on success). **A throughput number for this endpoint would be meaningless** — it
+would measure the rate limiter. Latency is the honest measurement, and the sampler
+paces itself to stay inside the quota so that no 429 is ever counted as a login.
+
+Measured with a purpose-written sampler (stdlib Python, one request in flight per
+source IP) rather than `oha`, because `oha` cannot pace to a per-IP quota and
+because 429 responses — which return in ~150 µs — must be excluded from the latency
+population rather than silently averaged into it.
+
+| Scenario | Concurrency | Requests | p50 | p95 | p99 | min | max | Errors |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `POST /api/v1/auth/login` | 6 (6 source IPs × 1) | 120 | **27.97 ms** | 52.25 ms | 65.01 ms | 23.29 ms | 103.24 ms | **0.00 %** |
+
+Pacing: 20 logins per source IP, 6.5 s apart (9.2/min/IP, under the 10/min quota),
+across 6 container IPs — 120 requests, all `200`, no 429 and no other status.
+Mean 32.27 ms, standard deviation 10.95 ms.
+
+A cross-check with `oha` at c=1 (sequential, 8 successful logins) gave p50 32.76 ms
+with a 44.15 ms maximum, consistent with the above.
+
+**Reading this.** ~28 ms at p50 for a full login — Argon2id verification at
+m=19 456 KiB / t=2 / p=1, plus session creation, plus an audit append — is the
+right side of the trade-off. It is expensive enough to be meaningful against
+offline cracking and cheap enough that a human does not perceive it. The p99 of
+65 ms reflects contention for the 8-permit hashing semaphore at concurrency 6,
+which is the semaphore doing its job.
+
+**What was deliberately not done:** login was not driven at high concurrency. Doing
+so measures the queue in front of the hasher and then the rate limiter, and reports
+429 latency as if it were login performance. An earlier attempt at c=8 without
+pacing produced 46 `429`s out of 64 requests and percentiles in the hundreds of
+microseconds — a textbook example of the misleading result this pacing exists to
+avoid. It is not reported as a login measurement.
+
+Worst-case resident memory devoted to hashing remains permits × m_cost =
+8 × 19 MiB ≈ **152 MiB**; size containers accordingly (`08-operations.md` §10).
+**No change to the Argon2id cost factor is warranted by these numbers.**
+
+---
+
+## 5. The bottleneck, identified
+
+**Every authenticated request performs a write.** `authentication::principal`
+issues, after the session lookup and before any endpoint work:
+
+```sql
+UPDATE sessions SET last_activity_at = now() WHERE id = $1 AND revoked_at IS NULL
 ```
 
-The harness is `backend/tests/benchmarks.rs`. It reports **percentiles, not means**:
-a mean hides the tail, and the tail is what a user experiences. Each measurement
-warms up first, because the first call pays allocator and page-fault costs that are
-not representative of steady state.
+It runs outside any transaction, so it is its own auto-commit transaction and its
+own WAL flush. This was not inferred from the code; it was **observed in
+`pg_stat_activity` while load was running**.
+
+Sampled during `GET /auth/me` at c=50 with **one** session:
+
+| wait_event_type | wait_event | state | backends |
+| --- | --- | --- | ---: |
+| LWLock | LockManager | active | 14 |
+| Lock | tuple | active | 10 |
+| Lock | transactionid | active | 4 |
+| — | (on CPU) | active | 3 |
+
+…with **30 of 32 pool connections executing that single `UPDATE` statement.**
+
+Sampled again during `GET /api/v1/projects` at c=48 with **eight** sessions:
+
+| wait_event_type | wait_event | state | backends |
+| --- | --- | --- | ---: |
+| Lock | transactionid | active | 10 |
+| Lock | tuple | active | 9 |
+| LWLock | WALWrite | active | 5 |
+| Lock | extend | active | 1 |
+| IO | WalSync | active | 1 |
+
+…with **32 of 32 pool connections on the same `UPDATE`.** Spreading over eight
+sessions removed most of the *tuple* contention (which is why `/auth/me` went 2.5×
+faster) and exposed the layer underneath: **WAL write and fsync**. That is why the
+collection reads did not gain throughput — they were never limited by the tuple
+lock alone.
+
+Container CPU during that sample: API **84 %** of one core-equivalent, PostgreSQL
+**175 %**. Neither is near the 24 cores available. The API process held steady at
+**~126 MiB** RSS and PostgreSQL at **~980 MiB**. **This system is not CPU-bound and
+not memory-bound at these rates; it is bound on WAL durability for a bookkeeping
+write.**
+
+### Is it worth fixing?
+
+The write exists for a real reason: `last_activity_at` is what makes the idle
+session TTL work, and idle timeout is a security control (ADR-005). It cannot
+simply be deleted.
+
+But the *frequency* is not load-bearing. The idle TTL default is **seven days**
+(`RB_SESSION_IDLE_TTL_SECONDS=604800`). Writing the timestamp on every single
+request buys precision that no policy consumes. Updating it at most once per N
+seconds per session — a conditional `AND last_activity_at < now() - interval 'N
+seconds'` — would enforce a seven-day idle timeout exactly as well while removing
+one WAL-flushing write from the great majority of authenticated requests. The
+headroom this would recover is large: the same instance serves 26 543 req/s on
+`/health/ready`, which does a pool checkout and a read round trip and nothing else.
+
+**No change was made, and no post-fix number is claimed.** This audit is not
+permitted to modify source, so the fix is recommended and quantified here rather
+than applied. A re-measurement belongs in the change that makes it.
+
+### DB pool behaviour
+
+Pool size is 32 (`(24 cores × 2).clamp(5, 32)`). Under every authenticated scenario
+the pool was **fully checked out and blocked on the session `UPDATE`**, not on the
+endpoint's own query. Raising `RB_DB_MAX_CONNECTIONS` would not help and would
+likely hurt: the contention is a row lock and a WAL flush, and more concurrent
+writers to the same rows make both worse. **The pool is correctly sized; it is
+simply being spent on the wrong statement.** No `acquire_timeout` errors and no
+`503`s were observed in any run — error rate was 0.00 % in every scenario.
 
 ---
 
-## 2. Password hashing — the decisive parameter
+## 6. A control that is configured but not enforced
 
-Argon2id at m=19 456 KiB, t=2, p=1 — the configured production defaults, measured
-as configured. This is the single most consequential performance decision in the
-system: too cheap and an offline attacker with the database grinds passwords; too
-expensive and a login flood turns our own KDF into an amplification weapon against
-us (TH-34).
+`RateLimitConfig::general_per_principal_per_minute` (default 600) and the key
+builders `keys::general_principal` / `keys::general_ip` exist, are documented, and
+are **referenced only from `#[cfg(test)]` code**. No production path calls them.
 
-| Operation | n | p50 | p95 | p99 | max | mean |
-| --- | --- | --- | --- | --- | --- | --- |
-| hash (sequential) | 30 | **19.13 ms** | 26.18 ms | 26.52 ms | 26.52 ms | 18.41 ms |
-| verify (sequential) | 30 | **19.74 ms** | 27.72 ms | 36.10 ms | 36.10 ms | 20.16 ms |
+This was confirmed by the load runs, not only by reading the source: 35 756
+requests to `GET /auth/me` from a single principal in 30 seconds — 3 575× the
+configured 600/minute budget — returned **zero** `429`s. Only the specific
+authentication flows (login, refresh, MFA, password reset, registration, invitation
+accept, bootstrap) are actually rate limited.
 
-### Under concurrency, with the bounding semaphore active (8 permits)
-
-| Concurrent verifications | Total | Per operation | Throughput |
-| --- | --- | --- | --- |
-| 1 | 28.07 ms | 28.07 ms | 35.6 /s |
-| 4 | 39.36 ms | 9.84 ms | 101.6 /s |
-| 8 | 58.06 ms | 7.26 ms | 137.8 /s |
-| 16 | 82.15 ms | 5.14 ms | 194.8 /s |
-| 32 | 148.99 ms | 4.66 ms | **214.8 /s** |
-
-**Reading these numbers.** Throughput keeps rising past the 8-permit bound because
-the permits gate *concurrent Argon2 work*, not queueing — waiting requests are
-cheap. It plateaus around 215/s, which is the machine's real ceiling for this cost
-factor. Latency per request degrades gracefully rather than collapsing: at 32
-concurrent the wall-clock is 149 ms, not a timeout.
-
-### The conclusion drawn
-
-- **~19 ms per verification is the right side of the trade-off.** It is expensive
-  enough to be meaningful against offline attack and cheap enough that a legitimate
-  login is not perceptibly slow.
-- **Worst-case resident memory devoted to hashing = permits × m_cost = 8 × 19 MiB
-  ≈ 152 MiB.** Size the container accordingly (`08-operations.md` §10). Without the
-  semaphore, 24 concurrent logins would be 456 MiB of memory doing nothing but
-  rejecting an attacker.
-- The bound plus the rate limiter (10 login attempts per IP per minute, 5 per
-  account) is what makes an intentionally memory-hard KDF safe on a public endpoint.
-- **No change to the cost factor is warranted by these numbers.** They meet current
-  OWASP guidance and the operational envelope is comfortable.
+It is recorded here because it materially affects how these numbers should be read:
+the throughput figures above are the server's real capacity precisely *because* no
+general limiter intervened. It is filed as a defect in
+`audit/SECTION_17_20_FINDINGS.md` (F-3).
 
 ---
 
-## 3. Per-request cryptographic primitives
+## 7. Reproducing this
 
-Everything on the authenticated request path that is not a database round trip.
+```bash
+# 1. A perf database on the dev PostgreSQL, migrated with the real command.
+docker run --rm --network roleblank_net \
+  -e DATABASE_URL="postgres://roleblank_migrator:dev_migrator_pw@roleblank-postgres:5432/roleblank_perf" \
+  -e RB_ENCRYPTION_KEY=... -e RB_AUDIT_CHAIN_KEY=... -e RB_BOOTSTRAP_SECRET=... \
+  -v roleblank_target:/work/target -w /work rust:1-bookworm \
+  /work/target/release/roleblank-api migrate
 
-| Operation | n | p50 | p95 | p99 | max |
-| --- | --- | --- | --- | --- | --- |
-| Token generation (32 CSPRNG bytes) | 10 000 | 432 ns | 441 ns | 481 ns | 25.57 µs |
-| Token hashing (SHA-256) | 100 000 | **53 ns** | 56 ns | 57 ns | 30.35 µs |
-| AEAD seal (XChaCha20-Poly1305) | 10 000 | 1.355 µs | 1.445 µs | 1.515 µs | 29.39 µs |
-| AEAD open | 10 000 | 1.160 µs | 1.197 µs | 1.273 µs | 51.70 µs |
-| TOTP verify (3-step window) | 10 000 | 480 ns | 491 ns | 518 ns | 8.43 µs |
+# 2. The release API against it.
+docker run -d --name rb-perf-api --network roleblank_net \
+  -e RB_ENV=development \
+  -e DATABASE_URL="postgres://roleblank_app:dev_app_pw@roleblank-postgres:5432/roleblank_perf" \
+  -e RB_BIND_ADDRESS=0.0.0.0:8080 -e RB_ENCRYPTION_KEY=... -e RB_AUDIT_CHAIN_KEY=... \
+  -e RB_BOOTSTRAP_SECRET=... -v roleblank_target:/t debian:bookworm-slim \
+  /t/release/roleblank-api serve
 
-**Token hashing at 53 ns validates a design decision.** SHA-256 rather than a KDF
-is correct here because the input is already 256 bits of uniform randomness — there
-is no low-entropy secret for a slow hash to protect. Had this used Argon2, every
-authenticated request would have paid ~19 ms instead of 53 ns, a factor of roughly
-**360 000**, for no security gain (ADR-002).
+# 3. Bootstrap, enrol TOTP, seed, and mint sessions through the public API,
+#    then drive the single-token scenarios.
+export RB_LOAD_TEST_TOKEN='rb_at_...'
+./scripts/load_test.sh
+```
 
-TOTP verification evaluates all three candidate steps unconditionally so the work
-does not depend on which step matched; 480 ns is that full three-step cost.
-
-The `max` column reflects occasional OS scheduling interruptions, not algorithmic
-variance — p99 sits within a few percent of p50 throughout.
-
----
-
-## 4. Authorisation evaluation
-
-The evaluator runs on every authorised request. It is pure and synchronous, so this
-is exactly the policy cost with no database noise. Measured against a realistic
-administrator: all 44 catalogued permissions at global scope, 5 resource-scoped
-denials, 3 department memberships.
-
-| Operation | n | p50 | p95 | p99 | max |
-| --- | --- | --- | --- | --- | --- |
-| `evaluate` — allow, 44 grants + 5 denials | 100 000 | **27 ns** | 29 ns | 42 ns | 35.38 µs |
-| `evaluate` — deny, out of scope | 100 000 | 22 ns | 23 ns | 23 ns | 8.42 µs |
-| `capability_list` — whole catalogue | 10 000 | 1.936 µs | 2.142 µs | 2.226 µs | 68.00 µs |
-
-**This settles the caching question.** `docs/backend/04-authorization.md` §11 states
-that no permission cache exists because correctness beats speed. These numbers show
-the choice costs essentially nothing: **27 nanoseconds** per decision. A cache would
-remove 27 ns and introduce an invalidation path whose failure mode is *preserving
-revoked privileges*. That trade is not worth making, and now there is a measurement
-saying so rather than an assertion.
-
-The denial path is *faster* than the allow path (22 ns vs 27 ns), which is expected
-— denials short-circuit — and is not a timing oracle: the difference is dominated by
-the database round trip that precedes and follows it, and the outcome is already
-visible in the response.
-
-`capability_list` at ~2 µs walks all 44 permissions and is called once per
-`GET /auth/me`, not per request.
+`scripts/load_test.sh` runs the single-token scenarios in §3.1–3.2. The
+**multi-session** comparison in §3.4, the concurrency sweep in §3.3 and the paced
+login sampler in §4 are not in that script; they were run ad hoc for this audit and
+are the runs that produced the §5 diagnosis.
 
 ---
 
-## 5. Audit chain
+## 8. What these numbers are not
 
-| Operation | n | p50 | p95 | p99 | max |
-| --- | --- | --- | --- | --- | --- |
-| `entry_hash` — HMAC-SHA256 over the canonical encoding | 100 000 | 532 ns | 597 ns | 1.129 µs | 352.97 µs |
-
-**The hash is not the cost.** At 532 ns it is irrelevant next to a database round
-trip. The real cost of the audit chain is that appends serialise on
-`SELECT … FROM audit_chain_head FOR UPDATE`, held until the writing transaction
-commits. That is a deliberate correctness-over-throughput decision (ADR-006): it is
-what makes the chain well-defined under concurrency, because without it two
-concurrent inserts could read the same `prev_hash` and produce a fork that
-verification could not distinguish from tampering.
-
-**This serialisation has not yet been measured end to end.** See §7.
+- **Not a capacity model.** One machine, one configuration, a 441-row dataset, no
+  TLS, no proxy, no network latency between client and server. Compare runs against
+  each other, not against an SLO taken from another environment.
+- **Not an index audit.** 40 projects and 400 tasks fit in shared buffers. Nothing
+  here would reveal a missing index.
+- **Not a multi-user profile.** All load came from one user's sessions. Real traffic
+  spreads across many users, which changes both the contention picture and the
+  authorisation resolution profile.
+- **Not tuned.** Every setting is a default. No number here was produced by
+  changing a configuration to make it look better.
 
 ---
 
-## 6. What the test suite tells us about throughput
+## 9. Final acceptance audit — re-measured
 
-Not a benchmark, but a real datapoint from an executed run:
+Re-measured on the final tree after all fixes, release profile, in a container on a
+shared 24-core development host. **Nothing was reconfigured to improve a number**,
+which is the whole point of re-recording them here.
 
-| Suite | Tests | Wall clock |
-| --- | --- | --- |
-| Unit (`--lib`) | 577 | 0.92 s |
-| Golden end-to-end scenario | 1 | 0.60 s |
-| OpenAPI contract | 5 | 0.01 s |
-| Race suite (incl. 100 concurrent bootstraps) | 7 | 0.57 s |
-| Security suite (adversarial + database) | 23 | 0.84 s |
-| **Total** | **613** | **~2.9 s** |
+### CPU-bound primitives
 
-The golden scenario alone performs a bootstrap (one Argon2 hash), two logins (two
-verifications), MFA enrolment and activation, a simulated process restart and a full
-audit-chain verification — in 0.60 s, of which roughly 60 ms is Argon2. Each of the
-23 security tests provisions its own PostgreSQL database by cloning a migrated
-template; 23 database clones plus their queries in 0.84 s indicates the schema and
-its indexes are not a bottleneck at this scale.
+| Operation | p50 | p95 | p99 |
+|---|---|---|---|
+| authorisation `evaluate` (44 grants, 5 denials) | 28 ns | 30 ns | 42 ns |
+| `evaluate` (deny, out of scope) | 21 ns | 23 ns | 32 ns |
+| `capability_list` (whole catalogue) | 1.94 µs | 2.15 µs | 3.62 µs |
+| audit `entry_hash` (HMAC-SHA256 + canonical encoding) | 518 ns | 587 ns | 783 ns |
+| token generation (32 CSPRNG bytes) | 329 ns | 354 ns | 390 ns |
+| token hashing (SHA-256) | 53 ns | 56 ns | 57 ns |
+| AEAD seal (XChaCha20-Poly1305) | 1.36 µs | 1.47 µs | 1.53 µs |
+| AEAD open | 1.17 µs | 1.21 µs | 1.28 µs |
+| TOTP verify (3-step window) | 479 ns | 490 ns | 500 ns |
 
-The race suite fires **100 simultaneous bootstrap attempts** and settles in 0.57 s,
-with exactly one succeeding.
+### End-to-end HTTP (50 samples each, real router, real database)
 
----
+| Endpoint | p50 | p95 | max |
+|---|---|---|---|
+| `GET /health/ready` | 1.3 ms | 1.8 ms | 6.7 ms |
+| `GET /api/v1/auth/me` | 2.6 ms | 3.1 ms | 6.3 ms |
+| `GET /api/v1/projects` | 3.2 ms | 12.3 ms | 19.8 ms |
+| `GET /api/v1/tasks` | 5.3 ms | 12.1 ms | 14.4 ms |
 
-## 7. Not measured — stated rather than estimated
+### `POST /auth/login`, and why it is reported separately
 
-| Measurement | Status | Command |
-| --- | --- | --- |
-| End-to-end HTTP throughput and latency percentiles under load | **NOT MEASURED** | `./scripts/load_test.sh` (needs `RB_LOAD_TEST_TOKEN` and a running API) |
-| Audit-chain append serialisation under concurrent writers | **NOT MEASURED** | The `FOR UPDATE` contention in §5 is reasoned about, not benchmarked |
-| Database connection-pool behaviour under sustained load | **NOT MEASURED** | Pool defaults are `min(cpu × 2, 32)`, chosen from PostgreSQL contention guidance, not from a measurement on this workload |
-| `EXPLAIN ANALYZE` on the session-lookup and effective-permission queries | **NOT RUN** | Indexes exist and are documented per access path in `05-data-model.md` §10, but no query plan has been captured |
-| Memory profile of the running server | **NOT MEASURED** | Only the hashing worst case (152 MiB) is derived, and that is arithmetic, not observation |
+A naive 50-sample run reported **p50 = 1.2 ms**. That number is wrong, and the way
+it is wrong is worth more than the measurement.
 
-These are the measurements that need a running server and a load generator. The
-scripts exist (`scripts/load_test.sh`, using `oha` in a container) but have not been
-executed, so no numbers are claimed for them.
+Only the first three requests were real logins. The remaining 17 were `429`s,
+refused by the per-account limiter *before* any password hashing, and they are
+fast precisely because the control works. Averaged together they produce a login
+latency that looks eight times better than reality.
 
----
+The honest figures, restricted to the requests that returned `200`:
 
-## 8. Bottleneck assessment
+| Sample | 1 | 2 | 3 |
+|---|---|---|---|
+| latency | 18.1 ms | 15.6 ms | 14.9 ms |
 
-Based on what *was* measured:
+That is the Argon2id cost (m = 19 456 KiB, t = 2, p = 1) behaving as designed.
 
-1. **Password hashing dominates the login path** — ~19 ms against ~53 ns for token
-   hashing and ~27 ns for authorisation. Deliberate, bounded, and the reason login
-   is rate limited separately from everything else.
-2. **Authorisation is free** at 27 ns and is not worth optimising or caching.
-3. **The remaining cost of a typical authenticated request is the database**, which
-   is precisely what has not been measured yet. Any tuning effort should start
-   there — with `EXPLAIN ANALYZE` on the session lookup, which runs once per
-   request and is the hottest query in the system.
-4. **The audit chain's global serialisation is the most likely first scaling
-   ceiling.** It is a known, documented trade with a known remedy (per-partition
-   chains, a schema change rather than a redesign). It should be measured before it
-   is believed to be a problem, and before it is "fixed".
+**The lesson for anyone re-running these:** a benchmark that does not record status
+codes will flatter any system that has a working rate limiter. Always separate the
+work from the refusals.
 
-No optimisation has been performed. Nothing here has been tuned on the basis of
-imagination.
+### The number that matters most
+
+The evaluator at **28 ns** is the cost that a permission cache would remove. It is
+the reason no cache exists, and the reason authorisation is re-derived on every
+request instead of being carried in the token — a decision this audit specifically
+attacked (a live session reflects a grant change on the very next request) and
+could not break.
+
+### The real audit-chain cost
+
+Not the 518 ns hash. Appends serialise on
+`SELECT … FROM audit_chain_head FOR UPDATE` — deliberate, ADR-006, RR-6. Audit
+finding **M-A** abuses exactly this: 100 refused requests from an unprivileged
+account produced 101 committed audit rows in 2 s with zero rate limiting, each one
+taking that global lock.

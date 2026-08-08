@@ -217,51 +217,90 @@ async fn two_concurrent_refreshes_rotate_once_and_revoke_the_family() {
     );
 }
 
-/// Eight at once, in case two is not enough contention to expose a lost lock.
+/// Fifty at once on one refresh token (§7).
+///
+/// **The property under test is "no second valid chain".** A refresh that rotated
+/// twice would mint two access tokens and two successor refresh tokens from a
+/// single credential — two independent session chains, each of which looks
+/// legitimate to every later request. That is precisely the state a thief wants,
+/// and it is invisible afterwards, so it has to be excluded here rather than
+/// detected later. Fifty simultaneous presentations is the cheapest way to find a
+/// rotation whose single-use gate is a check-then-act rather than a lock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn eight_concurrent_refreshes_still_rotate_at_most_once() {
-    const ATTEMPTS: usize = 8;
+async fn fifty_concurrent_refreshes_still_rotate_at_most_once() {
+    const ATTEMPTS: usize = 50;
 
     let app = Arc::new(TestApp::spawn().await);
     let actor = fixtures::actor(&app, SUBJECT, &[]).await;
+    let session_id = actor.session_id;
 
-    let barrier = Arc::new(tokio::sync::Barrier::new(ATTEMPTS));
-    let mut handles = Vec::with_capacity(ATTEMPTS);
-    for _ in 0..ATTEMPTS {
+    let tally = {
         let app = app.clone();
-        let barrier = barrier.clone();
         let token = actor.refresh_token.clone();
-        handles.push(tokio::spawn(async move {
-            barrier.wait().await;
-            app.post("/api/v1/auth/refresh", None, refresh_body(&token))
-                .await
-                .status
-        }));
-    }
+        fixtures::race(ATTEMPTS, move |_| {
+            let app = app.clone();
+            let token = token.clone();
+            async move {
+                app.post("/api/v1/auth/refresh", None, refresh_body(&token))
+                    .await
+            }
+        })
+        .await
+    };
+    tally.report("refresh_rotation x50");
 
-    let mut rotated = 0usize;
-    let mut other: Vec<StatusCode> = Vec::new();
-    for handle in handles {
-        match handle.await.expect("task must not panic") {
-            StatusCode::OK => rotated += 1,
-            // 401 is a loser; 429 is the per-IP refresh quota, which is a legitimate
-            // outcome for eight simultaneous refreshes from one address.
-            StatusCode::UNAUTHORIZED | StatusCode::TOO_MANY_REQUESTS => {}
-            s => other.push(s),
-        }
-    }
-
-    assert!(
-        other.is_empty(),
-        "every losing refresh must be a clean 401 or 429, got: {other:?}"
+    assert_eq!(
+        tally.server_errors(),
+        0,
+        "concurrent refresh produced server errors: {:?}",
+        tally.by_status
     );
+    assert!(
+        tally
+            .unexpected(&[
+                StatusCode::OK,
+                StatusCode::UNAUTHORIZED,
+                StatusCode::TOO_MANY_REQUESTS,
+            ])
+            .is_empty(),
+        "every losing refresh must be a clean 401 or 429, got: {:?}",
+        tally.by_status
+    );
+
+    let rotated = tally.status(StatusCode::OK);
     assert!(rotated <= 1, "{rotated} refreshes rotated; at most one may");
 
-    // However many lost, the family is gone and no token remains usable.
-    assert_eq!(live_refresh_tokens(&app, actor.session_id).await, 0);
+    // However many lost, the family is gone and no token remains usable — so no
+    // second chain can exist, whichever attempt won.
     assert_eq!(
-        session_is_revoked(&app, actor.session_id).await.as_deref(),
-        Some("REFRESH_REUSE_DETECTED")
+        live_refresh_tokens(&app, session_id).await,
+        0,
+        "a usable refresh token survived the race — a second chain is live"
+    );
+    assert_eq!(
+        session_is_revoked(&app, session_id).await.as_deref(),
+        Some("REFRESH_REUSE_DETECTED"),
+        "the family was not revoked, so reuse detection did not fire"
+    );
+
+    // Reuse detection must have fired, not merely "the losers were rejected".
+    // A loser that is quietly refused teaches an attacker that racing is free.
+    let reuse = fixtures::audit_count(&app, "AUTH.REFRESH_REUSE_DETECTED").await;
+    assert!(
+        reuse >= 1,
+        "no reuse was recorded, so a stolen token would have gone unnoticed"
+    );
+    println!("RACE-EVIDENCE refresh_rotation x50: reuse_events_audited={reuse}");
+
+    // Every token the race minted is dead, so no access token from it still works.
+    let live_sessions = fixtures::count(
+        &app,
+        "SELECT count(*) FROM sessions WHERE revoked_at IS NULL",
+    )
+    .await;
+    assert_eq!(
+        live_sessions, 0,
+        "{live_sessions} sessions remain live after the family was revoked"
     );
 }
 

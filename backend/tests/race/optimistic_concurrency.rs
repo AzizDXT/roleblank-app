@@ -169,59 +169,166 @@ async fn two_simultaneous_project_patches_at_the_same_version_lose_nothing() {
     assert_eq!(fixtures::audit_count(&app, "PROJECT.UPDATED").await, 1);
 }
 
-/// Ten writers at the same version. One lands; the other nine are told precisely
-/// what to re-read.
+/// What a losing PATCH reported, gathered during the race.
+///
+/// Collected rather than asserted inside the spawned task so that a failure is
+/// reported as "seventeen losers were told the wrong current version" rather than
+/// as an opaque panic inside a task the harness merely observes died.
+type ConflictReports = Arc<std::sync::Mutex<Vec<(Option<i64>, Option<i64>)>>>;
+
+/// Race `writers` PATCHes at the same version against one URL.
+///
+/// Returns the tally, which racer (if any) landed its write, and what every loser
+/// was told to re-read.
+async fn race_patches(
+    app: Arc<TestApp>,
+    token: String,
+    path: String,
+    field: &'static str,
+    writers: usize,
+) -> (fixtures::Tally, Vec<usize>, Vec<(Option<i64>, Option<i64>)>) {
+    let winners: Arc<std::sync::Mutex<Vec<usize>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let conflicts: ConflictReports = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let tally = {
+        let winners = winners.clone();
+        let conflicts = conflicts.clone();
+        fixtures::race(writers, move |n| {
+            let app = app.clone();
+            let token = token.clone();
+            let path = path.clone();
+            let winners = winners.clone();
+            let conflicts = conflicts.clone();
+            async move {
+                // Every writer sends the *same* expected version and a *different*
+                // value, so a lost update is visible in the surviving row.
+                let response = app
+                    .patch(
+                        &path,
+                        Some(&token),
+                        json!({ "version": 1, field: format!("Writer {n}") }),
+                    )
+                    .await;
+                if response.status == StatusCode::OK {
+                    winners.lock().expect("winners").push(n);
+                } else if response.status == StatusCode::CONFLICT {
+                    let expected = response
+                        .body
+                        .as_ref()
+                        .and_then(|b| b.pointer("/version_conflict/expected"))
+                        .and_then(serde_json::Value::as_i64);
+                    let actual = response
+                        .body
+                        .as_ref()
+                        .and_then(|b| b.pointer("/version_conflict/actual"))
+                        .and_then(serde_json::Value::as_i64);
+                    conflicts
+                        .lock()
+                        .expect("conflicts")
+                        .push((expected, actual));
+                }
+                response
+            }
+        })
+        .await
+    };
+
+    let winners = winners.lock().expect("winners").clone();
+    let conflicts = conflicts.lock().expect("conflicts").clone();
+    (tally, winners, conflicts)
+}
+
+/// Assert the shape every versioned-update race must have, whatever the resource.
+///
+/// Kept in one place because the project and task assertions are identical claims
+/// about different tables, and a divergence between them would be an accident
+/// rather than a decision.
+fn assert_exactly_one_write(
+    label: &str,
+    tally: &fixtures::Tally,
+    winners: &[usize],
+    conflicts: &[(Option<i64>, Option<i64>)],
+    writers: usize,
+) {
+    tally.report(label);
+
+    assert_eq!(
+        tally.server_errors(),
+        0,
+        "{label}: concurrent PATCH produced server errors: {:?}",
+        tally.by_status
+    );
+    assert!(
+        tally
+            .unexpected(&[StatusCode::OK, StatusCode::CONFLICT])
+            .is_empty(),
+        "{label}: every loser must be a clean 409, got: {:?}",
+        tally.by_status
+    );
+    assert_eq!(
+        winners.len(),
+        1,
+        "{label}: {} of {writers} patches landed — a lost update",
+        winners.len()
+    );
+    assert_eq!(
+        tally.code("VERSION_CONFLICT"),
+        writers - 1,
+        "{label}: a loser was refused for some reason other than the version: {:?}",
+        tally.by_code
+    );
+    // Every loser must be told the *same* current version. A loser told a stale
+    // "actual" would re-read, re-send, and lose again — a livelock that looks like
+    // a flaky client.
+    for (expected, actual) in conflicts {
+        assert_eq!(
+            *expected,
+            Some(1),
+            "{label}: a loser was told the wrong expected version"
+        );
+        assert_eq!(
+            *actual,
+            Some(2),
+            "{label}: every loser must be told the same current version"
+        );
+    }
+}
+
+/// Fifty writers at the same version on a **project**. One lands; the other
+/// forty-nine are told precisely what to re-read, and `version` moves exactly once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn ten_simultaneous_project_patches_produce_exactly_one_write() {
-    const WRITERS: usize = 10;
+async fn fifty_simultaneous_project_patches_produce_exactly_one_write() {
+    const WRITERS: usize = 50;
 
     let app = Arc::new(TestApp::spawn().await);
     let actor = editor(&app).await;
-    let project_id = fixtures::create_project(&app, &actor, "race-proj-10").await;
+    let project_id = fixtures::create_project(&app, &actor, "race-proj-50").await;
 
-    let barrier = Arc::new(tokio::sync::Barrier::new(WRITERS));
-    let mut handles = Vec::with_capacity(WRITERS);
-    for n in 0..WRITERS {
-        let app = app.clone();
-        let barrier = barrier.clone();
-        let token = actor.access_token.clone();
-        handles.push(tokio::spawn(async move {
-            barrier.wait().await;
-            patch(
-                &app,
-                &token,
-                &format!("/api/v1/projects/{project_id}"),
-                json!({ "version": 1, "name": format!("Writer {n}") }),
-            )
-            .await
-        }));
-    }
+    let (_, original_version) = project_state(&app, project_id).await;
+    assert_eq!(original_version, 1);
 
-    let mut succeeded = 0usize;
-    for handle in handles {
-        let outcome = handle.await.expect("task must not panic");
-        match outcome.status {
-            StatusCode::OK => succeeded += 1,
-            StatusCode::CONFLICT => {
-                assert_eq!(outcome.code.as_deref(), Some("VERSION_CONFLICT"));
-                assert_eq!(outcome.expected, Some(1));
-                assert_eq!(
-                    outcome.actual,
-                    Some(2),
-                    "every loser must be told the same current version"
-                );
-            }
-            other => panic!("a patch returned {other} with code {:?}", outcome.code),
-        }
-    }
+    let (tally, winners, conflicts) = race_patches(
+        app.clone(),
+        actor.access_token.clone(),
+        format!("/api/v1/projects/{project_id}"),
+        "name",
+        WRITERS,
+    )
+    .await;
+    assert_exactly_one_write("project_patch x50", &tally, &winners, &conflicts, WRITERS);
 
-    assert_eq!(succeeded, 1, "{succeeded} of {WRITERS} patches landed");
-    let (_, version) = project_state(&app, project_id).await;
+    // Re-read the row: exactly one change landed, and it is the winner's.
+    let (name, version) = project_state(&app, project_id).await;
+    assert_eq!(
+        name,
+        format!("Writer {}", winners[0]),
+        "the surviving name is not the winner's — a losing write landed on top"
+    );
     assert_eq!(
         version,
-        2,
-        "the version moved {} times for one accepted write",
-        version - 1
+        original_version + 1,
+        "the version moved by {} — it must move exactly once per landed write",
+        version - original_version
     );
     assert_eq!(fixtures::audit_count(&app, "PROJECT.UPDATED").await, 1);
 }
@@ -329,6 +436,48 @@ async fn two_simultaneous_task_patches_at_the_same_version_lose_nothing() {
     let (title, version) = task_state(&app, task_id).await;
     assert_eq!(title, winner, "the surviving title is not the winner's");
     assert_eq!(version, 2);
+    assert_eq!(fixtures::audit_count(&app, "TASK.UPDATED").await, 1);
+}
+
+/// Fifty writers at the same version on a **task**.
+///
+/// Tasks carry their own `version` column and their own update path, so the
+/// project result above says nothing about them. A guard that exists on one
+/// resource and not the other is the ordinary way this defect ships.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn fifty_simultaneous_task_patches_produce_exactly_one_write() {
+    const WRITERS: usize = 50;
+
+    let app = Arc::new(TestApp::spawn().await);
+    let actor = editor(&app).await;
+    let project_id = fixtures::create_project(&app, &actor, "race-task-proj-50").await;
+    let task_id = fixtures::create_task(&app, &actor, project_id, "Original title").await;
+
+    let (_, original_version) = task_state(&app, task_id).await;
+    assert_eq!(original_version, 1);
+
+    let (tally, winners, conflicts) = race_patches(
+        app.clone(),
+        actor.access_token.clone(),
+        format!("/api/v1/tasks/{task_id}"),
+        "title",
+        WRITERS,
+    )
+    .await;
+    assert_exactly_one_write("task_patch x50", &tally, &winners, &conflicts, WRITERS);
+
+    let (title, version) = task_state(&app, task_id).await;
+    assert_eq!(
+        title,
+        format!("Writer {}", winners[0]),
+        "the surviving title is not the winner's — a losing write landed on top"
+    );
+    assert_eq!(
+        version,
+        original_version + 1,
+        "the version moved by {} — it must move exactly once per landed write",
+        version - original_version
+    );
     assert_eq!(fixtures::audit_count(&app, "TASK.UPDATED").await, 1);
 }
 

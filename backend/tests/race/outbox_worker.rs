@@ -627,3 +627,267 @@ async fn every_event_the_application_enqueues_is_deliverable() {
         .expect("the worker must stop when cancelled")
         .expect("the worker task must not panic");
 }
+
+// ===========================================================================
+// The transactional guarantee itself (§15)
+//
+// The tests above are about the *worker*: who claims what, how often it retries,
+// when it gives up. These are about the property the whole pattern exists to
+// provide — that the side effect and the state change share a fate, and that a
+// provider outage delays delivery rather than losing it.
+// ===========================================================================
+
+/// The row and the state change roll back together.
+///
+/// **Why this is the load-bearing test for the pattern.** If the outbox row were
+/// written outside the caller's transaction — on the pool, or in a `tokio::spawn`
+/// after commit — then a transaction that failed *after* enqueuing would still
+/// send the mail. For a password reset that means a user receives a working reset
+/// link for a reset the database rolled back: a live credential for a state change
+/// that never happened. `enqueue` takes `&mut Transaction` precisely so that this
+/// cannot be expressed, and this test is what proves the signature is honoured.
+#[tokio::test]
+async fn an_outbox_row_shares_the_fate_of_its_transaction() {
+    let app = TestApp::spawn().await;
+
+    // ---- rolled back: the queued side effect must vanish with it -----------
+    let mut tx = app.db.begin().await.expect("begin");
+    outbox::enqueue(&mut tx, "mail.invitation", deliverable_payload(1))
+        .await
+        .expect("enqueue inside the transaction");
+    tx.rollback().await.expect("roll back");
+
+    let after_rollback: (i64,) = sqlx::query_as("SELECT count(*) FROM outbox_events")
+        .fetch_one(&app.db)
+        .await
+        .expect("count");
+    assert_eq!(
+        after_rollback.0, 0,
+        "a rolled-back transaction left a deliverable side effect queued — the mail \
+         would be sent for a state change that never happened"
+    );
+
+    // ---- committed: it must survive, with no in-memory step in between -----
+    let mut tx = app.db.begin().await.expect("begin");
+    let id = outbox::enqueue(&mut tx, "mail.invitation", deliverable_payload(2))
+        .await
+        .expect("enqueue");
+    tx.commit().await.expect("commit");
+
+    let state = state_of(&app, id).await;
+    assert_eq!(state.status, "PENDING");
+    assert_eq!(state.attempts, 0);
+    assert!(
+        state.completed_at.is_none(),
+        "a freshly committed event must not be marked complete"
+    );
+}
+
+/// A provider outage delays the work; it never loses it.
+///
+/// **The scenario.** The database commit succeeds — the reset token exists, the
+/// user's request genuinely happened — and the mail provider is then unavailable.
+/// The naive implementations lose the message here: an in-process send fails and
+/// the task is gone, and nothing anywhere records that a reset was owed. What must
+/// happen instead is that the row stays queued, records its failure, and is
+/// delivered once the provider returns.
+///
+/// This is also the test that makes the delivery guarantee legible: the row is
+/// re-attempted after a failure with no way to know whether the *previous* attempt
+/// reached the provider, which is exactly why the guarantee is at-least-once and
+/// never exactly-once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mail_provider_outage_does_not_lose_the_work() {
+    let app = TestApp::spawn().await;
+
+    // The state change and its side effect, committed together.
+    let mut tx = app.db.begin().await.expect("begin");
+    let id = outbox::enqueue(&mut tx, "mail.invitation", deliverable_payload(7))
+        .await
+        .expect("enqueue");
+    tx.commit().await.expect("commit");
+
+    // ---- the provider is down -------------------------------------------
+    // `DisabledProvider` reports `ProviderNotConfigured`, which is deliberately
+    // classified retryable: the provider is chosen by configuration, so a redeploy
+    // can make it succeed, and dead-lettering loudly beats discarding a reset.
+    let shutdown = CancellationToken::new();
+    let failing = tokio::spawn(
+        worker(&app, Arc::new(mail::DisabledProvider), "outage").run(shutdown.clone()),
+    );
+    let after_failure = wait_for_attempts(&app, id, 1).await;
+    shutdown.cancel();
+    failing.await.expect("the worker must not panic");
+
+    assert_ne!(
+        after_failure.status, "SENT",
+        "the event was marked delivered although the provider failed"
+    );
+    assert_ne!(
+        after_failure.status, "DEAD",
+        "one transient failure must not exhaust an eight-attempt budget"
+    );
+    assert!(
+        after_failure.completed_at.is_none(),
+        "a failed attempt must not stamp a completion time"
+    );
+    assert!(
+        after_failure.last_error.is_some(),
+        "the failure must be recorded so an operator can triage it"
+    );
+    // Still on the books: the work is queued, not lost.
+    let queued: (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM outbox_events WHERE id = $1 AND status IN ('PENDING','FAILED')",
+    )
+    .bind(id)
+    .fetch_one(&app.db)
+    .await
+    .expect("count");
+    assert_eq!(queued.0, 1, "the event was lost when the provider failed");
+    println!(
+        "OUTBOX-EVIDENCE after provider outage: status={} attempts={} last_error={:?}",
+        after_failure.status, after_failure.attempts, after_failure.last_error
+    );
+
+    // ---- the provider comes back ----------------------------------------
+    // The row carries `available_at` in the future after a failure, so the backoff
+    // is cleared to make the recovery observable without waiting out the delay.
+    sqlx::query("UPDATE outbox_events SET available_at = now() WHERE id = $1")
+        .bind(id)
+        .execute(&app.db)
+        .await
+        .expect("clear the backoff");
+
+    let shutdown = CancellationToken::new();
+    let recovering = tokio::spawn(
+        worker(&app, Arc::new(mail::LogSinkProvider), "recovered").run(shutdown.clone()),
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let delivered = loop {
+        let state = state_of(&app, id).await;
+        if state.status == "SENT" {
+            break state;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the event was never delivered after the provider recovered (status {}, \
+             attempts {})",
+            state.status,
+            state.attempts
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    shutdown.cancel();
+    recovering.await.expect("the worker must not panic");
+
+    assert!(
+        delivered.completed_at.is_some(),
+        "a delivered event must record when it completed"
+    );
+    // The attempt that failed is still counted. `mark_sent` deliberately does not
+    // touch `attempts` — only failures increment it — so the outage stays visible in
+    // the row after recovery rather than being tidied away by the success.
+    assert_eq!(
+        delivered.attempts, 1,
+        "the failed attempt was erased from the record by the eventual success"
+    );
+    println!(
+        "OUTBOX-EVIDENCE after recovery: status={} attempts={}",
+        delivered.status, delivered.attempts
+    );
+}
+
+/// A handler must be idempotent, because the worker cannot promise it will not
+/// re-deliver.
+///
+/// **What this test pins down is a limitation, not a defence.** A row is claimed,
+/// the provider is called, and only then is the row marked `SENT`. A crash in that
+/// window leaves a row that was delivered but is still claimable, and the next
+/// worker will deliver it again — there is no way to avoid this without a
+/// distributed transaction across PostgreSQL and a third-party mail API, which
+/// neither side offers. The test simulates precisely that crash window by
+/// resetting a delivered row to the state a killed worker would have left, and
+/// asserts the second delivery happens.
+///
+/// The consequence is the contract every handler must be written against: **the
+/// same event may be dispatched more than once**, so a handler must be safe to run
+/// twice. It is asserted here rather than only documented, so that a future change
+/// which quietly assumed exactly-once would have to delete a test to ship.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delivery_is_at_least_once_so_a_redelivery_is_possible() {
+    let app = TestApp::spawn().await;
+
+    let mut tx = app.db.begin().await.expect("begin");
+    let id = outbox::enqueue(&mut tx, "mail.invitation", deliverable_payload(9))
+        .await
+        .expect("enqueue");
+    tx.commit().await.expect("commit");
+
+    let shutdown = CancellationToken::new();
+    let first =
+        tokio::spawn(worker(&app, Arc::new(mail::LogSinkProvider), "once").run(shutdown.clone()));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if state_of(&app, id).await.status == "SENT" {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "never delivered");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    shutdown.cancel();
+    first.await.expect("the worker must not panic");
+
+    let after_first = state_of(&app, id).await;
+    assert_eq!(after_first.status, "SENT");
+
+    // Exactly the state a worker killed between "provider accepted" and "row marked
+    // SENT" leaves behind: the mail is gone out, the row still looks deliverable.
+    sqlx::query(
+        "UPDATE outbox_events
+            SET status = 'PENDING', completed_at = NULL, claimed_at = NULL,
+                claimed_by = NULL, available_at = now()
+          WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&app.db)
+    .await
+    .expect("simulate a crash between delivery and the status write");
+
+    let shutdown = CancellationToken::new();
+    let second =
+        tokio::spawn(worker(&app, Arc::new(mail::LogSinkProvider), "twice").run(shutdown.clone()));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let redelivered = loop {
+        let state = state_of(&app, id).await;
+        if state.status == "SENT" {
+            break state;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the crash-window row was never re-delivered, which would mean a message \
+             the provider never confirmed is silently dropped"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    shutdown.cancel();
+    second.await.expect("the worker must not panic");
+
+    // Two dispatches of one event. `attempts` cannot show this — only failures
+    // increment it — so the evidence is `claimed_by`, which `mark_sent` leaves in
+    // place precisely so the row records which instance delivered it. Two different
+    // worker identities across two terminal deliveries is two dispatches.
+    assert!(
+        after_first.claimed_by.is_some() && redelivered.claimed_by.is_some(),
+        "a delivered row must record which worker delivered it"
+    );
+    assert_ne!(
+        after_first.claimed_by, redelivered.claimed_by,
+        "the event was dispatched only once across a simulated crash — a message the \
+         provider never confirmed would be silently dropped"
+    );
+    println!(
+        "OUTBOX-EVIDENCE at-least-once: one event delivered twice, by {:?} then {:?}",
+        after_first.claimed_by, redelivered.claimed_by
+    );
+}

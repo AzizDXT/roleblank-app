@@ -35,45 +35,51 @@ async fn one_hundred_concurrent_bootstraps_produce_exactly_one_owner() {
     // A barrier so the requests are genuinely simultaneous rather than merely
     // spawned in a loop — without it the first would usually finish before the
     // last starts, and the test would pass without ever exercising the race.
-    let barrier = Arc::new(tokio::sync::Barrier::new(ATTEMPTS));
-
-    let mut handles = Vec::with_capacity(ATTEMPTS);
-    for n in 0..ATTEMPTS {
+    let tally = {
         let app = app.clone();
-        let barrier = barrier.clone();
-        handles.push(tokio::spawn(async move {
-            barrier.wait().await;
-            app.post("/api/v1/bootstrap/root", None, body(n))
-                .await
-                .status
-        }));
-    }
+        crate::fixtures::race(ATTEMPTS, move |n| {
+            let app = app.clone();
+            async move { app.post("/api/v1/bootstrap/root", None, body(n)).await }
+        })
+        .await
+    };
+    tally.report("bootstrap_root x100");
 
-    let mut created = 0usize;
-    let mut refused = 0usize;
-    let mut other: Vec<StatusCode> = Vec::new();
+    // A hundred simultaneous bootstrap attempts must never produce a server error:
+    // the endpoint is anonymous internet-facing surface, and a 5xx here is the
+    // system telling an attacker it reached a state it did not anticipate.
+    assert_eq!(
+        tally.server_errors(),
+        0,
+        "concurrent bootstrap produced server errors: {:?}",
+        tally.by_status
+    );
 
-    for handle in handles {
-        match handle.await.expect("task must not panic") {
-            StatusCode::CREATED | StatusCode::OK => created += 1,
-            // Two legitimate ways to lose, and both are correct behaviour:
-            //   409 — another attempt got there first
-            //   429 — the per-IP bootstrap limit (5/hour) refused it before it
-            //         even reached the transaction. A hundred simultaneous
-            //         bootstrap attempts from one address *is* an attack, and the
-            //         limiter treating it as one is the point.
-            StatusCode::CONFLICT | StatusCode::TOO_MANY_REQUESTS => refused += 1,
-            s => other.push(s),
-        }
-    }
+    let created = tally.status(StatusCode::CREATED) + tally.status(StatusCode::OK);
+    // Two legitimate ways to lose, and both are correct behaviour:
+    //   409 — another attempt got there first
+    //   429 — the per-IP bootstrap limit (5/hour) refused it before it even
+    //         reached the transaction. A hundred simultaneous bootstrap attempts
+    //         from one address *is* an attack, and the limiter treating it as one
+    //         is the point.
+    let refused = tally.status(StatusCode::CONFLICT) + tally.status(StatusCode::TOO_MANY_REQUESTS);
 
     assert_eq!(
         created, 1,
-        "exactly one bootstrap must succeed (got {created})"
+        "exactly one bootstrap must succeed (got {created}) — {:?}",
+        tally.by_status
     );
     assert!(
-        other.is_empty(),
-        "every losing attempt must be a clean 409 or 429, got: {other:?}"
+        tally
+            .unexpected(&[
+                StatusCode::CREATED,
+                StatusCode::OK,
+                StatusCode::CONFLICT,
+                StatusCode::TOO_MANY_REQUESTS,
+            ])
+            .is_empty(),
+        "every losing attempt must be a clean 409 or 429, got: {:?}",
+        tally.by_status
     );
     assert_eq!(refused, ATTEMPTS - 1);
 

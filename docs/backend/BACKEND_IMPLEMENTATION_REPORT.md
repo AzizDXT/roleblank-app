@@ -597,3 +597,59 @@ Ordered: each item assumes the ones above it are done. Items 1–4 are blocking,
 
 15. **Resolve the documentation drifts in section 14** — the missing `PERFORMANCE_REPORT.md`, the non-existent `platform::security::step_up` path, the two empty directories, the "~70 endpoints" figure, and the threat-model test names no grep resolves. Either write the code the documents describe or correct the documents.
 16. **Run the benchmarks once and write the numbers down** (section 13). The Argon2 cost factor is the single most consequential performance decision in the system, and it is currently defaulted rather than measured: `cargo test --release --test benchmarks -- --ignored --nocapture`.
+
+---
+
+## 22. Final acceptance audit — outcome
+
+Full record: `FINAL_ACCEPTANCE_REPORT.md`. Summary for anyone picking this up.
+
+### Verdict
+
+**BACKEND FOUNDATION READY FOR FRONTEND** — 0 CRITICAL and 0 HIGH open, after
+7 HIGH findings were fixed and re-verified.
+
+### State of the tree
+
+| | Value |
+|---|---|
+| Tests | **1 009 passed, 0 failed** (10 suites) + 4 benchmarks run separately |
+| Coverage | 91.31% region / 93.18% function / **93.66% line** |
+| Gates | `fmt`, `clippy -D warnings`, `cargo audit`, `cargo deny` — **all PASS** |
+| Clean-room | phase 1 and phase 2 (post-restart), **0 failures**, fresh database and secrets |
+| Backup/restore drill | all 10 checkpoints PASS; restored state byte-identical including the audit chain head hash |
+| Migrations | 10 (0010 added during the audit: the runtime-role grants that made the system bootable) |
+
+### What changed in `src/` during the audit
+
+| Area | Change |
+|---|---|
+| `migrations/0010` | `GRANT SELECT ON permissions` and `GRANT UPDATE ON audit_events_seq_seq` to the runtime role — **without these the application could not start, and no write could be audited** |
+| `identity/invitations.rs` | placement now authorised; inviter's actor loaded before `begin()` to end a pool self-deadlock |
+| `departments/service.rs`, `clients/service.rs` | `authorize_placement`; ROOT guard moved after authorisation |
+| `departments/repo.rs`, `clients/repo.rs`, `identity/repo.rs` | listings subtract explicit denials from the SQL predicate |
+| `platform/http/extract.rs` | shared validated-query extractor (stops six endpoints reflecting caller input) |
+| `platform/errors/mod.rs` | `Io`/`Tls`/pool errors → `503`; NUL/invalid-text SQLSTATEs → `400` |
+| `platform/observability/sanitize.rs` | truncation marker no longer pushes a value past its length bound |
+| `platform/http/rate_limit.rs`, `platform/config/mod.rs` | invitation acceptance no longer shares the registration limiter bucket |
+| `tests/common/mod.rs` | template database guarded by a PostgreSQL advisory lock and recreated only when stale |
+
+### The one thing to do first
+
+Wire the general per-principal rate limiter. It is already configured
+(`general_per_principal_per_minute`, default 600) and both key builders exist; no
+middleware installs it. Until then, any authenticated account can drive unbounded
+growth of an append-only table while holding the global audit-chain lock — measured
+at 101 rows in 2 seconds with zero `429`s.
+
+**Enabling public self-registration should be gated on that fix.** It is disabled
+by default today, and that default is the only thing keeping the issue at MEDIUM
+rather than HIGH.
+
+### The lesson worth carrying into the frontend work
+
+622 tests passed against a system that could not boot. The tests connected as the
+schema owner; the application runs as a restricted role. Every layer of this
+backend was designed correctly and the tests exercised a configuration the product
+never uses. When the frontend gets its own test suite, make the first test the one
+that runs the real thing, in the real configuration, as the real principal.

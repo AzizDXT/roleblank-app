@@ -20,7 +20,7 @@ use axum::http::{header, Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use tokio::sync::OnceCell;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -93,31 +93,117 @@ async fn exec_ddl(pool: &PgPool, sql: String) -> Result<(), sqlx::Error> {
         .map(|_| ())
 }
 
-/// Build the migrated template database exactly once per test binary.
+/// Same, but on a caller-held connection.
+///
+/// `small_pool` is `max_connections(1)`. Anything that holds the pool's only
+/// connection — an advisory lock, for instance — and then calls [`exec_ddl`] on the
+/// same pool deadlocks against itself until the acquire timeout. Every statement
+/// issued while a lock is held must therefore go through the connection that holds
+/// it, not through the pool.
+async fn exec_ddl_on(conn: &mut PgConnection, sql: String) -> Result<(), sqlx::Error> {
+    sqlx::query(sqlx::AssertSqlSafe(sql))
+        .execute(&mut *conn)
+        .await
+        .map(|_| ())
+}
+
+/// Guards the template database across *processes*, not just across tasks.
+///
+/// The template is server-global but `TEMPLATE` is a per-binary `OnceCell`, so the
+/// cell alone cannot coordinate anything. While each binary unconditionally dropped
+/// and recreated the template on startup, two concurrent `cargo test` processes
+/// destroyed each other's template mid-clone: the victim failed with
+/// `3D000: template database "roleblank_test_template" does not exist`, or worse
+/// reported a whole suite as failed without executing a single assertion.
+///
+/// That is not a product defect, but it is a defect in the machinery that produces
+/// the evidence — it can manufacture failures *and* cast doubt on green runs, which
+/// makes it dangerous in exactly the place where trustworthy results matter most.
+///
+/// A PostgreSQL advisory lock is the right primitive because it lives in the server
+/// the processes already share. Recreation takes it **exclusively**; cloning takes
+/// it **shared**, so any number of clones may proceed together but never while a
+/// recreation is in flight.
+const TEMPLATE_LOCK_KEY: i64 = 0x524F_4C45_0000_0001_u64 as i64;
+
+/// Is the template present and built from exactly the current migration set?
+///
+/// Recreating unconditionally was what made the race destructive. Recreating only
+/// when the template is missing or stale means the common case — a template another
+/// process already built from the same migrations — touches nothing at all.
+async fn template_is_current(conn: &mut PgConnection) -> bool {
+    let exists: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM pg_database WHERE datname = $1")
+        .bind(TEMPLATE_DB)
+        .fetch_optional(&mut *conn)
+        .await
+        .unwrap_or(None);
+    if exists.is_none() {
+        return false;
+    }
+
+    let Ok(pool) = small_pool(&base_url_for(TEMPLATE_DB)).await else {
+        return false;
+    };
+    let applied: Result<(i64, Option<i64>), _> =
+        sqlx::query_as("SELECT count(*), max(version) FROM _sqlx_migrations WHERE success")
+            .fetch_one(&pool)
+            .await;
+    pool.close().await;
+
+    let expected_count = database::MIGRATOR.migrations.len() as i64;
+    let expected_max = database::MIGRATOR
+        .migrations
+        .iter()
+        .map(|m| m.version)
+        .max();
+    matches!(applied, Ok((count, max)) if count == expected_count && max == expected_max)
+}
+
+/// Build the migrated template database exactly once per test binary, and at most
+/// once per migration set across every binary sharing the server.
 async fn ensure_template() {
     TEMPLATE
         .get_or_init(|| async {
             let admin = small_pool(&admin_url()).await.expect("connect as superuser");
-
-            // Recreate from scratch so a schema change never leaves a stale template.
-            let _ = exec_ddl(
-                &admin,
-                format!(
-                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{TEMPLATE_DB}'"
-                ),
-            )
-            .await;
-            let _ = exec_ddl(&admin, format!("DROP DATABASE IF EXISTS {TEMPLATE_DB}")).await;
-            exec_ddl(&admin, format!("CREATE DATABASE {TEMPLATE_DB} OWNER roleblank_migrator"))
+            // Everything below runs on this one connection — see `exec_ddl_on`.
+            let mut conn = admin
+                .acquire()
                 .await
-                .expect("create the template database");
+                .expect("take a connection for the template lock");
+            sqlx::query("SELECT pg_advisory_lock($1)")
+                .bind(TEMPLATE_LOCK_KEY)
+                .execute(&mut *conn)
+                .await
+                .expect("take the template lock exclusively");
+
+            if !template_is_current(&mut conn).await {
+                // Recreate from scratch so a schema change never leaves a stale
+                // template. Safe under the exclusive lock: no clone can be running.
+                let _ = exec_ddl_on(
+                    &mut conn,
+                    format!(
+                        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{TEMPLATE_DB}'"
+                    ),
+                )
+                .await;
+                let _ = exec_ddl_on(&mut conn, format!("DROP DATABASE IF EXISTS {TEMPLATE_DB}")).await;
+                exec_ddl_on(&mut conn, format!("CREATE DATABASE {TEMPLATE_DB} OWNER roleblank_migrator"))
+                    .await
+                    .expect("create the template database");
+
+                let pool = small_pool(&base_url_for(TEMPLATE_DB))
+                    .await
+                    .expect("connect to the template as migrator");
+                database::MIGRATOR.run(&pool).await.expect("migrations must apply from empty");
+                pool.close().await;
+            }
+
+            let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+                .bind(TEMPLATE_LOCK_KEY)
+                .execute(&mut *conn)
+                .await;
+            drop(conn);
             admin.close().await;
-
-            let pool = small_pool(&base_url_for(TEMPLATE_DB))
-                .await
-                .expect("connect to the template as migrator");
-            database::MIGRATOR.run(&pool).await.expect("migrations must apply from empty");
-            pool.close().await;
         })
         .await;
 }
@@ -139,14 +225,30 @@ impl TestApp {
         let admin = small_pool(&admin_url())
             .await
             .expect("connect as superuser");
-        exec_ddl(
-            &admin,
+        // Shared: many clones may run at once, but none may overlap a recreation.
+        // The lock and the CREATE share one connection — the pool holds only one.
+        let mut conn = admin
+            .acquire()
+            .await
+            .expect("take a connection for the template lock");
+        sqlx::query("SELECT pg_advisory_lock_shared($1)")
+            .bind(TEMPLATE_LOCK_KEY)
+            .execute(&mut *conn)
+            .await
+            .expect("take the template lock for reading");
+        let cloned = exec_ddl_on(
+            &mut conn,
             format!(
                 "CREATE DATABASE {database_name} TEMPLATE {TEMPLATE_DB} OWNER roleblank_migrator"
             ),
         )
-        .await
-        .expect("clone the template");
+        .await;
+        let _ = sqlx::query("SELECT pg_advisory_unlock_shared($1)")
+            .bind(TEMPLATE_LOCK_KEY)
+            .execute(&mut *conn)
+            .await;
+        drop(conn);
+        cloned.expect("clone the template");
         admin.close().await;
 
         let config = test_config(&database_name);

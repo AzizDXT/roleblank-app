@@ -29,14 +29,34 @@ mod attack_probes;
 #[path = "security/client_escape.rs"]
 mod client_escape;
 
+/// §5 — the same boundary as `client_escape`, judged on byte-level
+/// indistinguishability rather than on the refusal alone.
+#[path = "security/client_isolation.rs"]
+mod client_isolation;
+
 #[path = "security/root_attack.rs"]
 mod root_attack;
 
+/// §3 — the same objective as `root_attack`, aimed at the service, the runtime
+/// database role and the triggers rather than at the route surface.
+#[path = "security/root_destruction.rs"]
+mod root_destruction;
+
 #[path = "security/delegation_matrix.rs"]
 mod delegation_matrix;
+
+/// §4 — the same boundary as `delegation_matrix`, attacked from an administrator
+/// built to look like one a real organisation would create.
+#[path = "security/escalation_matrix.rs"]
+mod escalation_matrix;
 
 #[path = "security/bola_matrix.rs"]
 mod bola_matrix;
 
 #[path = "security/session_attacks.rs"]
 mod session_attacks;
+
+/// §6 — passwords, second factors, and the freshness of authority on a live
+/// session. Complements `session_attacks`, which covers the session lifecycle.
+#[path = "security/auth_attacks.rs"]
+mod auth_attacks;

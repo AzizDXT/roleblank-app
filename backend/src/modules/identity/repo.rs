@@ -214,6 +214,16 @@ pub struct UserListFilters {
     pub search: Option<String>,
     pub only_ids: Option<Vec<Uuid>>,
     pub department_ids: Option<Vec<Uuid>>,
+    /// Ids the actor is explicitly **denied**, and the departments whose members
+    /// they are denied.
+    ///
+    /// `effective_scopes` strips only GLOBAL denials and documents the rest as
+    /// "handled per-object at `evaluate` time" — which a listing does not do. These
+    /// two fields are what stop the collection route returning rows that
+    /// `GET /users/{id}` refuses (audit finding M-B / TH-49). Like the fields above,
+    /// they are derived from the actor, never from request input.
+    pub excluded_ids: Option<Vec<Uuid>>,
+    pub excluded_department_ids: Option<Vec<Uuid>>,
 }
 
 pub async fn list_users(
@@ -244,6 +254,13 @@ pub async fn list_users(
                               AND dm.removed_at IS NULL
                               AND dm.department_id = ANY($5)))
            AND ($6::timestamptz IS NULL OR ({sort}, u.id) {operator} ($6, $7))
+           AND ($9::uuid[] IS NULL OR u.id <> ALL($9))
+           AND ($10::uuid[] IS NULL
+                OR NOT EXISTS (SELECT 1
+                                 FROM department_memberships dm
+                                WHERE dm.user_id = u.id
+                                  AND dm.removed_at IS NULL
+                                  AND dm.department_id = ANY($10)))
          ORDER BY {sort} {direction}, u.id {direction}
          LIMIT $8
         "#
@@ -263,6 +280,8 @@ pub async fn list_users(
         .bind(cursor_at)
         .bind(cursor_id)
         .bind(request.fetch_limit())
+        .bind(filters.excluded_ids.as_deref())
+        .bind(filters.excluded_department_ids.as_deref())
         .fetch_all(pool)
         .await
         .map_err(AppError::from)
@@ -355,7 +374,18 @@ pub async fn current_version(
 }
 
 /// The facts needed to rebuild an absent principal's actor context.
-pub async fn actor_basics(pool: &PgPool, user_id: Uuid) -> AppResult<Option<ActorBasics>> {
+///
+/// Generic over the executor so a caller that already holds a transaction can run
+/// this on the transaction's **own** connection. That is not a stylistic
+/// convenience: a caller inside an open transaction that reaches back to the pool
+/// for a second connection deadlocks the pool as soon as the number of simultaneous
+/// callers reaches the pool size — every task holds one connection and waits for
+/// another that only a peer can release. `accept_invitation` did exactly that, and
+/// fifty concurrent acceptances of one valid token produced zero successes.
+pub async fn actor_basics<'e, E>(executor: E, user_id: Uuid) -> AppResult<Option<ActorBasics>>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
     sqlx::query_as::<_, ActorBasics>(
         r#"
         SELECT u.principal_type AS principal_type,
@@ -367,7 +397,7 @@ pub async fn actor_basics(pool: &PgPool, user_id: Uuid) -> AppResult<Option<Acto
         "#,
     )
     .bind(user_id)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
     .map_err(AppError::from)
 }

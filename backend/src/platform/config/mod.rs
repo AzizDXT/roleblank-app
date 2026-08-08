@@ -96,6 +96,15 @@ pub struct RateLimitConfig {
     pub refresh_per_ip_per_minute: u32,
     pub password_reset_per_ip_per_hour: u32,
     pub registration_per_ip_per_hour: u32,
+    /// Deliberately separate from `registration_per_ip_per_hour`, and higher.
+    ///
+    /// Accepting an invitation requires a high-entropy token that an authorised
+    /// internal principal issued to a specific address, so it is a far lower-risk
+    /// flow than anonymous self-registration. Sharing one budget let an attacker
+    /// hammering `/api/v1/registration` block invitation acceptance for everyone
+    /// behind the same address — a corporate NAT — and capped onboarding at three
+    /// people per hour per office.
+    pub invitation_accept_per_ip_per_hour: u32,
     pub bootstrap_per_ip_per_hour: u32,
     pub general_per_principal_per_minute: u32,
 }
@@ -109,6 +118,7 @@ impl Default for RateLimitConfig {
             refresh_per_ip_per_minute: 60,
             password_reset_per_ip_per_hour: 5,
             registration_per_ip_per_hour: 3,
+            invitation_accept_per_ip_per_hour: 20,
             bootstrap_per_ip_per_hour: 5,
             general_per_principal_per_minute: 600,
         }

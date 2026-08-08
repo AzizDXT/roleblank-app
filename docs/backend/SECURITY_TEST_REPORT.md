@@ -500,3 +500,60 @@ number is supposed to carry.
 | --- | --- | --- | --- |
 | `cargo fuzz` targets | **BLOCKED** | Requires a nightly toolchain and `cargo install`, which the host's Application Control policy prevents; the container can install it but nightly is not present in `rust:1-bookworm` | `docker run --rm -v ...:/work -w /work rustlang/rust:nightly bash -c "cargo install cargo-fuzz && cargo fuzz run <target>"` |
 | OWASP ZAP baseline scan | **BLOCKED** | Not attempted; would require running the API and a ZAP container. Recorded rather than skipped silently. Note that a passing ZAP baseline would say very little here — the interesting surface is authenticated authorisation logic, which ZAP does not exercise | `docker run --rm -t ghcr.io/zaproxy/zaproxy zap-baseline.py -t http://host:8090/api/v1` |
+
+---
+
+## 14. Final acceptance audit — what changed in this report
+
+The full record is in `FINAL_ACCEPTANCE_REPORT.md`; this section exists so that
+nobody reads the sections above and believes they are still the whole picture.
+
+**The headline correction.** Everything above this line was written against a suite
+that reported 622 passing tests and zero failures. That suite connected to
+PostgreSQL as the **schema owner**, never as the runtime role the application uses.
+Under the runtime role the application could not start at all (no `SELECT` on
+`permissions`) and every audited mutation returned `500` (`setval` needs `UPDATE`
+on the sequence, which `USAGE` does not imply). Both are HIGH, both are fixed, and
+neither was reachable by any test in this document as it then stood.
+
+### Final numbers
+
+| | Before the audit | After |
+|---|---|---|
+| Tests executed | 622 | **1 009** |
+| Failures | 0 (see above) | **0** |
+| Suites | 6 | 10 |
+| Coverage (line) | not measured | **93.66%** |
+| `fmt` / `clippy -D warnings` / `audit` / `deny` | not all green | **all PASS** |
+
+### Findings, by severity
+
+7 HIGH, 5 MEDIUM, 8 LOW, 13 INFO. **All 7 HIGH and 4 of 5 MEDIUM are fixed and
+re-verified**; the open MEDIUM is the rate-limiter/audit-growth chain (M-A).
+
+### New attack coverage added
+
+* **Escalation by proxy** — `scripts/exploit_department_placement.sh` proves the
+  whole chain against a live server: a principal refused a department directly
+  reached it through an invitation body and read a project it was denied.
+  Regression tests include a **positive** case, so the guard cannot degrade into a
+  blanket refusal without failing.
+* **Authorisation parity** — three tests assert that a targeted `DENY` which hides
+  a row from `GET /x/{id}` also hides it from `GET /x`. All three were written to
+  fail, and did, on `users`, `departments` and `clients`.
+* **Owner-identity oracle** — an external CLIENT now receives `404` for the owner's
+  id and `404` for an unknown id, indistinguishable.
+* **Concurrency** — 58 barrier-synchronised race tests; every single-winner path
+  produces exactly one winner with zero 5xx.
+* **Runtime-role tests** — the whole audit append is now replayed as
+  `roleblank_app`, which is what H1 and H2 would have caught.
+
+### A caveat about this document's own trustworthiness
+
+The test harness rebuilt a **server-global** template database under a
+**per-binary** `OnceCell`. Two `cargo test` processes against one PostgreSQL
+destroyed each other's template mid-run. This produced, during the audit, both a
+false 65-failure report and a suite that reported an entire file as failed without
+executing a single assertion. It is fixed (advisory lock, plus recreate-only-if-
+stale), but the lesson stands: **a test result is only evidence if nothing else was
+touching the database at the time.**

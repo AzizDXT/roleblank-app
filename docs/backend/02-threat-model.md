@@ -139,3 +139,25 @@ Stated explicitly so their absence is a decision, not an oversight.
 | RR-4 | ROOT is a single point of failure | Deliberate, per the ownership invariant | Ownership replacement is an offline, documented, audited procedure (ADR-004); ROOT cannot be locked out by attacker-driven failures |
 | RR-5 | No production email provider | Deferred scope | Reset/invite flows create outbox events and are fully testable; production refuses to start if a real provider is required but absent — no silent fake success |
 | RR-6 | Audit-chain appends are globally serialised | Correctness chosen over throughput | Measured; see `PERFORMANCE_REPORT.md` |
+
+---
+
+## 7. Threats added by the final acceptance audit
+
+These were found by adversarial testing against a running clean-room instance, not
+by review. Each is stated with what actually happened, because a threat model that
+records only the intent is the thing this audit kept catching.
+
+| ID | Threat | Boundary | Control now | Evidence |
+|---|---|---|---|---|
+| TH-46 | **Placement through an invitation as escalation by proxy** — `department_id`/`client_account_id` in the request body became real memberships on acceptance without ever being authorised against the target they named, so a principal could mint a second account, at an address they control, holding access they are themselves refused | T3/T4 (and T2 for the client variant) | Placement is authorised inside the creating transaction against the locked row, by the module that owns the target: same permission, same target construction, same step-up as the direct membership route | `scripts/exploit_department_placement.sh`; 3 regression tests incl. a positive case |
+| TH-47 | **Owner identified by error-code differential** — an operation that refuses the owner with `403 ROOT_PROTECTED` while refusing everything else with `404` tells an external principal which id is the owner, and that internal users exist at all | T2 | The root guard runs **after** authorisation on the department membership routes, so the differential is never reachable by a caller who may not ask. `require` judges the actor, `guard_root` the subject; the subject is still refused | before/after measured on a live instance: `403`→`404`, indistinguishable from an unknown id |
+| TH-48 | **Denial recording as an amplification vector** — routes that deliberately commit an `AUTHORIZATION.DENIED` row on refusal, on a table that is append-only and whose every write takes the global chain lock, with no limiter in front | T1/T3 | **Partial.** Authorisation itself holds (every request refused correctly). No quota exists: 100 denied requests produced 101 unremovable audit rows in 2 s with zero `429`s. Mitigated in practice by invitation-only accounts (public registration is disabled by default) and by the attack being self-evidencing | measured; see `FINAL_ACCEPTANCE_REPORT.md` §7 M-A |
+| TH-49 | **Authorisation decided twice, differently** — the object route resolves a narrow `DENY` per object, while the listing builds its SQL predicate from `effective_scopes`, which strips only GLOBAL denials, so a denied row still appears in the collection | T3/T4 | **Open.** `projects` carries `denied_resource_ids` into its predicate; `users`, `departments` and `clients` do not. The durable control is a parity property test asserting the listing and the object decision never disagree | source-confirmed; end-to-end test written, run BLOCKED — see `FINAL_ACCEPTANCE_REPORT.md` §9 |
+
+### Residual risks added
+
+| ID | Risk | Why it is carried | Compensating control |
+|---|---|---|---|
+| RR-7 | The general per-principal rate limiter is configured and keyed but not installed, so only eight endpoints are limited | Wiring a global limiter at the end of a freeze would change every route's behaviour and would itself need certifying | Documented as the top post-freeze action. **Enabling public registration should be gated on fixing this**, because cheap accounts turn TH-48 from MEDIUM into HIGH |
+| RR-8 | A control existing in configuration but not in code misleads a reviewer | `RateLimitConfig` is built with `::default()` and reads no environment variables, so none of the eight enforced limits is tunable either | Recorded here and in `08-operations.md`; either wire it or delete the config field — a half-present control is worse than an acknowledged gap |

@@ -165,6 +165,50 @@ pub async fn list_users(
         }
     }
 
+    // Explicit denials narrow the listing whatever the caller's breadth. They are
+    // invisible to a `Collection` evaluation — `effective_scopes` strips only GLOBAL
+    // denials — so without this a holder of `iam.users.read@GLOBAL` sees users that
+    // `GET /users/{id}` refuses them (TH-49). Applied before the branch below so it
+    // covers both the broad and the scope-derived path.
+    {
+        let mut denied_ids: Vec<Uuid> = Vec::new();
+        let mut denied_departments: Vec<Uuid> = Vec::new();
+        for denial in principal
+            .actor
+            .denies
+            .iter()
+            .filter(|d| d.permission_code == PERM_USERS_READ && d.scope.is_coherent())
+        {
+            match denial.scope.scope_type {
+                ScopeType::Own => denied_ids.push(principal.user_id()),
+                ScopeType::Resource => {
+                    if let (
+                        Some(crate::modules::authorization::domain::ResourceType::User),
+                        Some(id),
+                    ) = (denial.scope.resource_type, denial.scope.resource_id)
+                    {
+                        denied_ids.push(id);
+                    }
+                }
+                ScopeType::Department => {
+                    denied_departments.extend(principal.actor.department_ids.iter().copied());
+                }
+                // GLOBAL is already total; ASSIGNED names no user record.
+                ScopeType::Global | ScopeType::Assigned => {}
+            }
+        }
+        denied_ids.sort_unstable();
+        denied_ids.dedup();
+        denied_departments.sort_unstable();
+        denied_departments.dedup();
+        if !denied_ids.is_empty() {
+            filters.excluded_ids = Some(denied_ids);
+        }
+        if !denied_departments.is_empty() {
+            filters.excluded_department_ids = Some(denied_departments);
+        }
+    }
+
     // `Target::Collection` is covered only by GLOBAL. Anything narrower falls
     // through to the scope-derived predicate below.
     if !state

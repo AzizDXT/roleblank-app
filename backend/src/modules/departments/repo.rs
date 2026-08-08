@@ -90,6 +90,9 @@ pub enum ScopePredicate {
     /// `DEPARTMENT`, `ASSIGNED` and `RESOURCE` all resolve to a set of ids that is
     /// computed in Rust and then *bound*, never interpolated.
     IdSet,
+    /// Every department **except** a bound set: the actor holds the permission
+    /// broadly but has explicit denials that must be subtracted.
+    ExcludedIdSet,
     /// `SELF` names the actor's own user record. A department is not a user, so a
     /// `SELF` grant reaches no department at all. Treating it as anything wider
     /// would silently promote a self-service grant into an organisation-wide one.
@@ -101,8 +104,67 @@ impl ScopePredicate {
         match self {
             ScopePredicate::Everything => "TRUE",
             ScopePredicate::IdSet => "d.id = ANY($4::uuid[])",
+            ScopePredicate::ExcludedIdSet => "d.id <> ALL($4::uuid[])",
             ScopePredicate::Nothing => "FALSE",
         }
+    }
+}
+
+/// The permission whose scopes decide what a department listing may return.
+///
+/// Lives here rather than in the service because `visibility_for` has to consult
+/// the actor's *denials* for it, and the rule that a denial narrows the SQL
+/// predicate belongs with the code that builds the predicate.
+pub const READ_PERMISSION: &str = "departments.read";
+
+/// Department ids this actor is explicitly denied, for `READ_PERMISSION`.
+///
+/// A `GLOBAL` denial is handled earlier — `effective_scopes` removes the permission
+/// outright — so it is deliberately not repeated here. What this covers is the
+/// narrow denials that `effective_scopes` documents as "handled per-object at
+/// `evaluate` time": true for an object route, and untrue for a listing, which has
+/// no per-object step. Without this the object decision and the collection
+/// decision disagree, and the row an administrator explicitly denied is returned by
+/// the listing (audit finding M-B / TH-49).
+fn denied_ids(actor: &ActorContext) -> Vec<Uuid> {
+    let mut denied = Vec::new();
+    for denial in actor
+        .denies
+        .iter()
+        .filter(|d| d.permission_code == READ_PERMISSION)
+    {
+        if !denial.scope.is_coherent() {
+            continue; // corrupt authorisation data fails closed, never open
+        }
+        match denial.scope.scope_type {
+            // A DEPARTMENT-scoped denial covers the departments the actor belongs to.
+            ScopeType::Department => denied.extend(actor.department_ids.iter().copied()),
+            ScopeType::Resource => {
+                if denial.scope.resource_type == Some(ResourceType::Department) {
+                    if let Some(id) = denial.scope.resource_id {
+                        denied.push(id);
+                    }
+                }
+            }
+            // GLOBAL is already total; ASSIGNED and SELF name no department.
+            ScopeType::Global | ScopeType::Assigned | ScopeType::Own => {}
+        }
+    }
+    denied.sort_unstable();
+    denied.dedup();
+    denied
+}
+
+/// "Every department, except the ones explicitly denied."
+///
+/// Used when the caller holds the permission at `Target::Collection`; the denials
+/// still have to be subtracted, which is exactly the step that was missing.
+pub fn everything_minus_denials(actor: &ActorContext) -> Visibility {
+    let denied = denied_ids(actor);
+    if denied.is_empty() {
+        Visibility::Everything
+    } else {
+        Visibility::AllExcept(denied)
     }
 }
 
@@ -120,6 +182,8 @@ pub const fn predicate_for(scope_type: ScopeType) -> ScopePredicate {
 pub enum Visibility {
     Everything,
     Only(Vec<Uuid>),
+    /// Everything the caller could otherwise see, minus an explicit denial set.
+    AllExcept(Vec<Uuid>),
     /// Nothing at all — the caller must not run a query, and must not be handed an
     /// empty page silently either; it is a denial.
     Nothing,
@@ -130,6 +194,7 @@ impl Visibility {
         match self {
             Visibility::Everything => ScopePredicate::Everything,
             Visibility::Only(_) => ScopePredicate::IdSet,
+            Visibility::AllExcept(_) => ScopePredicate::ExcludedIdSet,
             Visibility::Nothing => ScopePredicate::Nothing,
         }
     }
@@ -165,11 +230,23 @@ pub fn visibility_for(scopes: &[Scope], actor: &ActorContext) -> Visibility {
                 }
             }
             ScopePredicate::Nothing => {}
+            // Unreachable by construction: `predicate_for` maps a *scope type*, and
+            // an exclusion never comes from a scope type — it comes from the actor's
+            // denials, which are applied below. Matched explicitly rather than with a
+            // wildcard so that adding a `ScopeType` stays a compile error here.
+            ScopePredicate::ExcludedIdSet => {}
         }
     }
 
     ids.sort_unstable();
     ids.dedup();
+
+    // An explicit denial removes an id the grants would otherwise have allowed.
+    // Subtracted here rather than in SQL so that "everything I could see is denied"
+    // becomes a refusal, not an empty page that looks like an empty organisation.
+    let denied = denied_ids(actor);
+    ids.retain(|id| !denied.contains(id));
+
     if !had_usable_scope || ids.is_empty() {
         Visibility::Nothing
     } else {
@@ -239,7 +316,7 @@ pub async fn list(
         .bind(cursor_at)
         .bind(cursor_id)
         .bind(request.fetch_limit());
-    if let Visibility::Only(ids) = visibility {
+    if let Visibility::Only(ids) | Visibility::AllExcept(ids) = visibility {
         query = query.bind(ids.clone());
     }
 

@@ -11,6 +11,7 @@
 //!    act.** `PENDING` grants nothing at all — that is the whole point of the
 //!    self-registration flow — and `activate` is the one operation that changes it.
 
+use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::app::AppState;
@@ -61,6 +62,46 @@ fn target_for(row: &ClientAccountRow, actor_id: Uuid) -> Target {
             .with_department(None)
             .with_membership(row.account_manager_user_id == Some(actor_id)),
     )
+}
+
+/// Authorise attaching *some* user to this client account, for callers outside
+/// this module.
+///
+/// An invitation carrying `client_account_id` produces, on acceptance, an
+/// **ACTIVE** membership — the state `activate_member` below calls "the moment
+/// company data becomes visible to someone outside the company". The direct route
+/// to that state costs two authorisation decisions (`add_member`, then
+/// `activate_member`), both demanding `clients.members.manage` on this account plus
+/// step-up. Authorising the invitation with only `iam.users.invite` would make the
+/// deferred path strictly cheaper than the immediate one, which is the definition
+/// of a bypass.
+///
+/// One check is demanded here rather than two because both direct gates demand the
+/// same authority; splitting them separates *add* from *make-visible* in time, not
+/// in privilege. What must never happen is reaching ACTIVE for less.
+pub(crate) async fn authorize_placement(
+    state: &AppState,
+    principal: &Principal,
+    tx: &mut Transaction<'_, Postgres>,
+    client_account_id: Uuid,
+) -> AppResult<()> {
+    let row = repo::find_for_update(tx, client_account_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::field(
+                "client_account_id",
+                "UNKNOWN",
+                "That client account does not exist.",
+            )
+        })?;
+    state.require(
+        principal,
+        MEMBERS_MANAGE,
+        &target_for(&row, principal.user_id()),
+    )?;
+    state.require_step_up_for(principal, MEMBERS_MANAGE)?;
+    check_account_mutable(account_status_of(&row)?)?;
+    Ok(())
 }
 
 fn account_status_of(row: &ClientAccountRow) -> AppResult<ClientAccountStatus> {
@@ -224,7 +265,11 @@ pub async fn list(
         return Ok(Page::empty());
     }
 
-    let rows = repo::list(&state.db, &visibility, &request).await?;
+    // Narrow denials are not visible to a `Collection` evaluation, so they are
+    // subtracted from the SQL predicate here — otherwise this listing returns rows
+    // that `GET /clients/{id}` refuses (TH-49).
+    let denied = repo::denied_ids(&principal.actor);
+    let rows = repo::list(&state.db, &visibility, &denied, &request).await?;
     let page = Page::build(rows, &request, |row| Cursor {
         timestamp_micros: repo::cursor_micros(row.created_at),
         id: row.id,

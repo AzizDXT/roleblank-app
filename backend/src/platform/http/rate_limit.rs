@@ -251,6 +251,23 @@ pub mod keys {
     pub fn registration_ip(ip: IpAddr) -> String {
         format!("register:ip:{ip}")
     }
+    /// Accepting an invitation is deliberately **not** keyed on
+    /// `registration_ip`, even though both create an account.
+    ///
+    /// Sharing one budget coupled two flows with very different risk. Anonymous
+    /// self-registration is unsolicited and must be tightly bounded; accepting an
+    /// invitation requires a high-entropy token that an authorised internal
+    /// principal issued to a specific address. Sharing the quota meant an attacker
+    /// hammering `/api/v1/registration` from an address could exhaust it and block
+    /// invitation acceptance for every legitimate user behind the same address —
+    /// a corporate NAT, which is the normal case. It also capped onboarding at
+    /// three people per hour per office.
+    ///
+    /// Found by the clean-room acceptance walk, which could not onboard its fourth
+    /// account.
+    pub fn invitation_accept_ip(ip: IpAddr) -> String {
+        format!("invite-accept:ip:{ip}")
+    }
     pub fn bootstrap_ip(ip: IpAddr) -> String {
         format!("bootstrap:ip:{ip}")
     }

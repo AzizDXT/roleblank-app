@@ -6,6 +6,7 @@
 //! opens leaves a window in which the row changes between the decision and the
 //! write (TH-43); auditing outside it leaves a state change with no record.
 
+use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::app::AppState;
@@ -43,6 +44,47 @@ fn target_for(row: &DepartmentRow, actor_is_member: bool) -> Target {
             .with_department(Some(row.id))
             .with_membership(actor_is_member),
     )
+}
+
+/// Authorise placing *some* user into this department, for callers outside this
+/// module.
+///
+/// Invitations name a `department_id` in the request body, and on acceptance that
+/// becomes a real membership — which resolves DEPARTMENT scope and is therefore an
+/// authorisation operation no less than `add_member` is. Without this, a principal
+/// holding only `iam.users.invite` could mint an account inside a department they
+/// cannot manage and read, through an address they control, data their own account
+/// is refused (the "escalation by proxy" case in
+/// `scripts/exploit_department_placement.sh`).
+///
+/// The demand is deliberately identical to `add_member`'s — same permission, same
+/// target construction, same step-up — because the outcome is identical. It is
+/// exposed as a function rather than as public constants so that the scope
+/// semantics of a department stay owned by this module.
+pub(crate) async fn authorize_placement(
+    state: &AppState,
+    principal: &Principal,
+    tx: &mut Transaction<'_, Postgres>,
+    department_id: Uuid,
+) -> AppResult<()> {
+    let row = repo::find_for_update(tx, department_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::field(
+                "department_id",
+                "UNKNOWN",
+                "That department does not exist.",
+            )
+        })?;
+    let actor_is_member = repo::is_active_member(&mut **tx, row.id, principal.user_id()).await?;
+    state.require(
+        principal,
+        MEMBERS_MANAGE,
+        &target_for(&row, actor_is_member),
+    )?;
+    state.require_step_up_for(principal, MEMBERS_MANAGE)?;
+    check_mutable(status_of(&row)?)?;
+    Ok(())
 }
 
 fn status_of(row: &DepartmentRow) -> AppResult<DepartmentStatus> {
@@ -153,7 +195,11 @@ pub async fn list(
         .decide(principal, READ, &Target::Collection)
         .is_allowed()
     {
-        Visibility::Everything
+        // Holding the permission at `Collection` is not the end of the decision: a
+        // narrow DENY does not appear in a `Collection` evaluation, but it still has
+        // to be subtracted, or this listing returns rows that `GET /departments/{id}`
+        // refuses (TH-49).
+        repo::everything_minus_denials(&principal.actor)
     } else {
         let scopes = evaluator::effective_scopes(&principal.actor, READ);
         repo::visibility_for(&scopes, &principal.actor)
@@ -458,11 +504,6 @@ pub async fn add_member(
         )?,
     };
 
-    // Department membership resolves DEPARTMENT scope, so it is an authorisation
-    // operation, and no authorisation operation may target the system owner
-    // (`docs/backend/04-authorization.md` §6).
-    state.guard_root(state.is_root_user(request.user_id).await?)?;
-
     let mut tx = state.begin().await?;
     let row = repo::find_for_update(&mut tx, id)
         .await?
@@ -474,6 +515,20 @@ pub async fn add_member(
         &target_for(&row, actor_is_member),
     )?;
     state.require_step_up_for(principal, MEMBERS_MANAGE)?;
+
+    // Department membership resolves DEPARTMENT scope, so it is an authorisation
+    // operation, and no authorisation operation may target the system owner
+    // (`docs/backend/04-authorization.md` §6).
+    //
+    // Checked *after* authorisation, not before. `guard_root` answers
+    // `403 ROOT_PROTECTED` while every other subject id on this route answers `404`
+    // to an external principal — so running it first turned the endpoint into an
+    // oracle that confirmed the owner's user id, and the existence of internal
+    // users at all, to a CLIENT that may not know either (threat model boundary 2).
+    // Order does not weaken the protection: `require` judges the *actor*, this
+    // judges the *subject*, and the subject is still refused. It only stops the
+    // system answering a question the caller was never allowed to ask.
+    state.guard_root(state.is_root_user(request.user_id).await?)?;
 
     check_mutable(status_of(&row)?)?;
 
@@ -545,8 +600,6 @@ pub async fn remove_member(
     id: Uuid,
     user_id: Uuid,
 ) -> AppResult<()> {
-    state.guard_root(state.is_root_user(user_id).await?)?;
-
     let mut tx = state.begin().await?;
     let row = repo::find_for_update(&mut tx, id)
         .await?
@@ -558,6 +611,10 @@ pub async fn remove_member(
         &target_for(&row, actor_is_member),
     )?;
     state.require_step_up_for(principal, MEMBERS_MANAGE)?;
+
+    // After authorisation, for the reason spelled out in `add_member`: run first, it
+    // identifies the system owner to a caller who may not enumerate users at all.
+    state.guard_root(state.is_root_user(user_id).await?)?;
 
     // Removal stays available on an archived department: taking someone out of a
     // department is only ever a reduction of authority, and blocking it would strand

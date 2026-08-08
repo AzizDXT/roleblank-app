@@ -161,66 +161,94 @@ async fn two_simultaneous_acceptances_create_exactly_one_user() {
     assert_eq!(fixtures::audit_count(&app, "INVITATION.ACCEPTED").await, 1);
 }
 
-/// Twenty at once, in case two is not enough to lose the race.
+/// Fifty at once on one token (§7). Exactly one account, and no server errors.
+///
+/// **Why fifty and not two.** Two acceptances contend for the invitation row and
+/// nothing else. Fifty also contend for the *connection pool*, and that is a
+/// second, independent way for this endpoint to fail: any request that holds an
+/// open transaction while reaching back to the pool for another connection can
+/// starve the pool it is itself waiting on. Raising the count is what turns that
+/// latent deadlock into an observable one — it produced three `500`s at twenty.
+///
+/// The per-IP acceptance budget (20/hour) is deliberately *not* cleared: fifty
+/// simultaneous account creations from one address is an attack, and the limiter
+/// refusing most of them is correct. What is asserted is therefore the shape of the
+/// distribution — at most one success, every loser a *clean* refusal — rather than
+/// an exact split between the two defences.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn twenty_simultaneous_acceptances_still_create_exactly_one_user() {
-    const ATTEMPTS: usize = 20;
+async fn fifty_simultaneous_acceptances_still_create_exactly_one_user() {
+    const ATTEMPTS: usize = 50;
 
     let app = Arc::new(TestApp::spawn().await);
     let (_inviter, _invitation_id, token) = pending_invitation(&app).await;
 
-    // The per-IP account-creation budget is 3/hour and is deliberately *not*
-    // cleared: twenty simultaneous account creations from one address is an attack,
-    // and the limiter refusing most of them is correct behaviour. The assertion
-    // below is therefore "at most one succeeded", which holds whichever defence —
-    // the row lock or the quota — stopped any particular attempt.
-    let barrier = Arc::new(tokio::sync::Barrier::new(ATTEMPTS));
-    let mut handles = Vec::with_capacity(ATTEMPTS);
-    for n in 0..ATTEMPTS {
+    let tally = {
         let app = app.clone();
-        let barrier = barrier.clone();
-        let token = token.clone();
-        handles.push(tokio::spawn(async move {
-            barrier.wait().await;
-            app.post(
-                "/api/v1/invitations/accept",
-                None,
-                accept_body(&token, &format!("Racer {n}")),
-            )
-            .await
-            .status
-        }));
-    }
+        fixtures::race(ATTEMPTS, move |n| {
+            let app = app.clone();
+            let token = token.clone();
+            async move {
+                app.post(
+                    "/api/v1/invitations/accept",
+                    None,
+                    accept_body(&token, &format!("Racer {n}")),
+                )
+                .await
+            }
+        })
+        .await
+    };
+    tally.report("invitation_accept x50");
 
-    let mut accepted = 0usize;
-    let mut other: Vec<StatusCode> = Vec::new();
-    for handle in handles {
-        match handle.await.expect("task must not panic") {
-            StatusCode::CREATED => accepted += 1,
-            // Both are correct ways to lose: the invitation was already consumed, or
-            // the account-creation quota refused the attempt before it got that far.
-            StatusCode::UNAUTHORIZED | StatusCode::TOO_MANY_REQUESTS => {}
-            s => other.push(s),
-        }
-    }
-
-    assert!(
-        other.is_empty(),
-        "every losing acceptance must be a clean 401 or 429, got: {other:?}"
+    // A race may produce refusals. It may never produce a server error: a 5xx here
+    // means the application drove itself into a state it did not anticipate, and an
+    // anonymous caller is the one who observed it.
+    assert_eq!(
+        tally.server_errors(),
+        0,
+        "concurrent acceptance produced server errors: {:?}",
+        tally.by_status
     );
+
+    // Two legitimate ways to lose, both refusals rather than failures:
+    //   401 — the invitation was already consumed
+    //   429 — the per-IP acceptance quota refused the attempt first
+    assert!(
+        tally
+            .unexpected(&[
+                StatusCode::CREATED,
+                StatusCode::UNAUTHORIZED,
+                StatusCode::TOO_MANY_REQUESTS,
+            ])
+            .is_empty(),
+        "every losing acceptance must be a clean 401 or 429, got: {:?}",
+        tally.by_status
+    );
+
+    let accepted = tally.status(StatusCode::CREATED);
     assert!(
         accepted <= 1,
         "{accepted} acceptances succeeded; at most one may"
     );
 
-    assert!(
+    // The database is the arbiter, not the response count.
+    assert_eq!(
         fixtures::count(
             &app,
             "SELECT count(*) FROM users WHERE email_normalized = 'invitee@race.test'",
         )
-        .await
-            <= 1,
-        "more than one account was created from one invitation"
+        .await,
+        accepted as i64,
+        "the number of accounts does not match the number of successful acceptances"
+    );
+    assert_eq!(
+        fixtures::count(
+            &app,
+            "SELECT count(*) FROM invitations WHERE status = 'ACCEPTED'",
+        )
+        .await,
+        accepted as i64,
+        "the invitation was consumed a different number of times than it succeeded"
     );
 }
 

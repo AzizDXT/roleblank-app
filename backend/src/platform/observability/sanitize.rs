@@ -28,15 +28,35 @@ pub fn log_value(input: impl AsRef<str>) -> String {
     sanitize_bounded(input.as_ref(), MAX_LOGGED_LEN)
 }
 
+/// Sanitise `input` to **at most `max_chars` characters**, marker included.
+///
+/// The marker counting against the budget is not cosmetic. `header_hint` is called
+/// with the width of a database column — `sessions.user_agent_hint` is
+/// `CHECK (length(...) <= 200)` — so a function that returned `max_chars + 1`
+/// characters produced a row the schema refused. That surfaced as SQLSTATE 23514,
+/// which nothing maps, so it became a `500` on `POST /api/v1/auth/login` for any
+/// client whose `User-Agent` was longer than 200 characters. Found by
+/// `tests/hardening/log_injection.rs`; see
+/// `docs/backend/audit/SECTION_9_13_FINDINGS.md` §11 finding H-2.
 pub fn sanitize_bounded(input: &str, max_chars: usize) -> String {
-    let mut out = String::with_capacity(input.len().min(max_chars * 4));
-    let mut truncated = false;
+    if max_chars == 0 {
+        return String::new();
+    }
 
-    for (taken, ch) in input.chars().enumerate() {
-        if taken >= max_chars {
-            truncated = true;
+    let mut out = String::with_capacity(input.len().min(max_chars * 4));
+    let mut chars = input.chars();
+
+    for taken in 0..max_chars {
+        let Some(ch) = chars.next() else { break };
+
+        // On the last slot we may write, spend it on the marker rather than on a
+        // character — but only if there is genuinely more input after `ch`.
+        // Cloning `Chars` is a pointer copy, so the lookahead costs nothing.
+        if taken == max_chars - 1 && chars.clone().next().is_some() {
+            out.push('…');
             break;
         }
+
         // `is_control` covers C0 (including \n, \r, \t, NUL) and C1.
         // U+2028/U+2029 are line separators that some log viewers honour, so they
         // are folded too even though Rust does not class them as control chars.
@@ -47,9 +67,6 @@ pub fn sanitize_bounded(input: &str, max_chars: usize) -> String {
         }
     }
 
-    if truncated {
-        out.push('…');
-    }
     out
 }
 
@@ -95,10 +112,51 @@ mod tests {
     fn truncates_on_a_character_boundary() {
         let long = "é".repeat(500);
         let out = sanitize_bounded(&long, 10);
-        // 10 chars plus the ellipsis marker.
-        assert_eq!(out.chars().count(), 11);
+        // Ten characters *including* the marker: callers pass the width of a
+        // database column, so returning `max_chars + 1` produced a row the schema
+        // refused and a `500` in its place.
+        assert_eq!(out.chars().count(), 10);
         assert!(out.ends_with('…'));
         assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+    }
+
+    /// The boundary, from both sides. Exactly `max_chars` characters of input must
+    /// survive whole — appending a marker to a value that was not truncated would
+    /// be both a lie and, at a column's exact width, an error.
+    #[test]
+    fn the_bound_is_never_exceeded_at_any_input_length() {
+        for max in [1usize, 2, 10, 45, 200] {
+            for length in [0usize, 1, max.saturating_sub(1), max, max + 1, max * 10] {
+                let out = sanitize_bounded(&"a".repeat(length), max);
+                assert!(
+                    out.chars().count() <= max,
+                    "max={max} length={length} produced {} characters",
+                    out.chars().count()
+                );
+                if length <= max {
+                    assert_eq!(out, "a".repeat(length), "max={max} length={length}");
+                } else {
+                    assert!(out.ends_with('…'), "max={max} length={length}");
+                }
+            }
+        }
+        assert_eq!(sanitize_bounded("anything", 0), "");
+    }
+
+    /// The width every session hint is stored at. `sessions.user_agent_hint` is
+    /// `CHECK (length(user_agent_hint) <= 200)`, so this is the assertion that the
+    /// row is insertable.
+    #[test]
+    fn a_header_hint_always_fits_the_column_it_is_stored_in() {
+        for length in [199usize, 200, 201, 1_000, 100_000] {
+            let hint = header_hint(Some(&"u".repeat(length)), MAX_LOGGED_LEN)
+                .expect("non-empty input yields a hint");
+            assert!(
+                hint.chars().count() <= MAX_LOGGED_LEN,
+                "a {length}-character header produced a {}-character hint",
+                hint.chars().count()
+            );
+        }
     }
 
     #[test]

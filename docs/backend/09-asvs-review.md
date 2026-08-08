@@ -213,3 +213,28 @@ presumes it.
 
 None of these are claimed to be solved. Each is either a deployment obligation with
 a named owner, or an explicitly deferred piece of work with a recorded consequence.
+
+---
+
+## Final acceptance audit — ASVS deltas
+
+Re-checked by execution during the final audit. Only the controls whose *status
+changed* are listed; everything else stands as recorded above.
+
+| ASVS area | Control | Change |
+|---|---|---|
+| V1.2 / V4.1 — Access control architecture | Authorisation must be enforced at a trusted layer for **every** parameter that grants access | **Was failing.** `POST /invitations` authorised the verb but not the `department_id` / `client_account_id` it acted on, so a request body could place an account where the caller had no authority. Now authorised inside the transaction against the locked row, by the module that owns the target. |
+| V4.1.3 — Least privilege | The listing decision must agree with the object decision | **Was failing** on `users`, `departments` and `clients`: a narrow `DENY` that blocked `GET /x/{id}` did not remove the row from `GET /x`. Now subtracted from the SQL predicate in all three, including on the broad-permission branch that previously skipped the check. |
+| V4.3 — Other access-control considerations | Administrative interfaces must not disclose privileged identities | **Was failing.** The department membership routes ran the ROOT guard before authorisation, so an external CLIENT received `403 ROOT_PROTECTED` for the owner and `404` for everyone else. Now indistinguishable. |
+| V7.1 — Log content | Errors must not reflect caller input | **Was failing** on six listing endpoints, which echoed the rejected query parameter — and the DTO's field list — in `text/plain`. Now a shared validated-query extractor returning `application/problem+json` with a stable code. |
+| V7.4.1 — Generic error handling | Unexpected input must not produce `500` | **Was failing** for a `User-Agent` over 200 characters (a truncation marker pushed the value past a `CHECK` constraint) and for a NUL byte in an email on an anonymous route. Both now mapped and refused cleanly. Ordinary browsers were affected by the first. |
+| V10.4.1 — Availability | Authenticated principals must not be able to exhaust shared resources | **Still failing — the one open MEDIUM.** The general per-principal limiter is configured and keyed but never installed; committed denial-audit rows are append-only and take a global lock. Measured: 100 refused requests → 101 unremovable rows in 2 s, zero `429`s. Mitigated only by invitation-only accounts. See `FINAL_ACCEPTANCE_REPORT.md` §7 M-A. |
+| V14.2 — Dependency | No known-vulnerable dependencies | **Confirmed by execution:** `cargo audit` — 1 190 advisories, 256 crates, 0 vulnerabilities. `cargo deny` — advisories, bans, licenses and sources all ok. |
+
+### On the value of this document
+
+Every item marked "was failing" above had already been reviewed and recorded as
+satisfied. They were not found by reading the code again; they were found by
+running the system as its own runtime role, against a database nobody had prepared
+for it, and attacking it. An ASVS review is a checklist of questions — it is not
+evidence that the answers are still true.

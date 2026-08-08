@@ -135,17 +135,60 @@ pub enum Visibility {
 }
 
 impl Visibility {
+    /// `$4` is **always** the explicit denial set, whatever the variant.
+    ///
+    /// Binding it at a fixed position, unconditionally, is deliberate: an exclusion
+    /// that is only appended "when there is something to exclude" is an exclusion
+    /// somebody eventually forgets to append. An empty array makes
+    /// `c.id <> ALL('{}')` simply true, so the uniform shape costs nothing. The
+    /// variant's own parameters therefore start at `$5`.
     pub fn sql(&self) -> &'static str {
         match self {
-            Visibility::Everything => "TRUE",
-            Visibility::Ids(_) => "c.id = ANY($4::uuid[])",
-            Visibility::ManagedByActor(_) => "c.account_manager_user_id = $4",
+            Visibility::Everything => "c.id <> ALL($4::uuid[])",
+            Visibility::Ids(_) => "c.id = ANY($5::uuid[]) AND c.id <> ALL($4::uuid[])",
+            Visibility::ManagedByActor(_) => {
+                "c.account_manager_user_id = $5 AND c.id <> ALL($4::uuid[])"
+            }
             Visibility::IdsOrManagedByActor(_, _) => {
-                "(c.id = ANY($4::uuid[]) OR c.account_manager_user_id = $5)"
+                "(c.id = ANY($5::uuid[]) OR c.account_manager_user_id = $6)                  AND c.id <> ALL($4::uuid[])"
             }
             Visibility::Nothing => "FALSE",
         }
     }
+}
+
+/// The permission whose scopes decide what a client listing may return.
+pub const READ_PERMISSION: &str = "clients.read";
+
+/// Client-account ids this actor is explicitly denied, for `READ_PERMISSION`.
+///
+/// `effective_scopes` strips only GLOBAL denials and documents the rest as
+/// "handled per-object at `evaluate` time" — which a listing does not do. Without
+/// this the collection route returns rows that `GET /clients/{id}` refuses
+/// (audit finding M-B / TH-49).
+pub fn denied_ids(actor: &ActorContext) -> Vec<Uuid> {
+    let mut denied = Vec::new();
+    for denial in actor
+        .denies
+        .iter()
+        .filter(|d| d.permission_code == READ_PERMISSION)
+    {
+        if !denial.scope.is_coherent() {
+            continue; // corrupt authorisation data fails closed, never open
+        }
+        // A client account belongs to no department, so only a RESOURCE denial
+        // naming a client account can reach one. GLOBAL is already total.
+        if denial.scope.scope_type == ScopeType::Resource
+            && denial.scope.resource_type == Some(ResourceType::ClientAccount)
+        {
+            if let Some(id) = denial.scope.resource_id {
+                denied.push(id);
+            }
+        }
+    }
+    denied.sort_unstable();
+    denied.dedup();
+    denied
 }
 
 /// Turn the scopes an actor effectively holds into a filter.
@@ -218,6 +261,7 @@ const fn keyset_comparator(direction: SortDirection) -> &'static str {
 pub async fn list(
     pool: &PgPool,
     visibility: &Visibility,
+    denied: &[Uuid],
     request: &PageRequest,
 ) -> AppResult<Vec<ClientAccountRow>> {
     let (cursor_at, cursor_id) = cursor_bounds(request)?;
@@ -238,7 +282,9 @@ pub async fn list(
     let mut query = sqlx::query_as::<_, ClientAccountRow>(sqlx::AssertSqlSafe(sql))
         .bind(cursor_at)
         .bind(cursor_id)
-        .bind(request.fetch_limit());
+        .bind(request.fetch_limit())
+        // $4 — always, see `Visibility::sql`.
+        .bind(denied.to_vec());
     query = match visibility {
         Visibility::Everything | Visibility::Nothing => query,
         Visibility::Ids(ids) => query.bind(ids.clone()),
@@ -529,20 +575,41 @@ mod tests {
         assert_eq!(contribution_for(ScopeType::Own), ScopeContribution::Nothing);
     }
 
+    /// Every variant carries the denial exclusion at `$4`, unconditionally.
+    ///
+    /// The uniform shape is the point: an exclusion appended only "when there is
+    /// something to exclude" is one somebody eventually forgets. `Nothing` is the
+    /// single exception, and only because it already returns no rows at all.
     #[test]
     fn every_filter_variant_has_its_predicate() {
         let id = Uuid::now_v7();
-        assert_eq!(Visibility::Everything.sql(), "TRUE");
-        assert_eq!(Visibility::Ids(vec![id]).sql(), "c.id = ANY($4::uuid[])");
+        assert_eq!(Visibility::Everything.sql(), "c.id <> ALL($4::uuid[])");
+        assert_eq!(
+            Visibility::Ids(vec![id]).sql(),
+            "c.id = ANY($5::uuid[]) AND c.id <> ALL($4::uuid[])"
+        );
         assert_eq!(
             Visibility::ManagedByActor(id).sql(),
-            "c.account_manager_user_id = $4"
+            "c.account_manager_user_id = $5 AND c.id <> ALL($4::uuid[])"
         );
         assert_eq!(
             Visibility::IdsOrManagedByActor(vec![id], id).sql(),
-            "(c.id = ANY($4::uuid[]) OR c.account_manager_user_id = $5)"
+            "(c.id = ANY($5::uuid[]) OR c.account_manager_user_id = $6)                  AND c.id <> ALL($4::uuid[])"
         );
         assert_eq!(Visibility::Nothing.sql(), "FALSE");
+
+        // Not one of them mentions a denial set it does not also bind.
+        for sql in [
+            Visibility::Everything.sql(),
+            Visibility::Ids(vec![id]).sql(),
+            Visibility::ManagedByActor(id).sql(),
+            Visibility::IdsOrManagedByActor(vec![id], id).sql(),
+        ] {
+            assert!(
+                sql.contains("$4::uuid[]"),
+                "a variant lost its denial exclusion: {sql}"
+            );
+        }
     }
 
     /// The predicate text is a function of the *scope kinds* only. Nothing a caller

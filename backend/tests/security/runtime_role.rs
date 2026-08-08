@@ -283,6 +283,174 @@ async fn delete_is_granted_on_exactly_the_expected_tables() {
     );
 }
 
+/// The inverse invariant to everything above: what the runtime role **must be able
+/// to do**.
+///
+/// Every other test in this file asserts a refusal. That asymmetry hid a
+/// deployment-blocking defect for the whole of the build: `0009_runtime_grants.sql`
+/// enumerated the tables the application touches and omitted `permissions`, so
+/// `serve` could not read the catalogue it verifies at startup and **the
+/// application could not boot at all** as its intended identity. 903 tests passed
+/// throughout, because the integration harness connects as the migrator role and
+/// no test ever ran the startup path.
+///
+/// A table the runtime role cannot read is a startup failure or a runtime 500
+/// waiting for the code path that reads it. There is no table in this schema the
+/// application legitimately must be blind to — the restrictions that matter are all
+/// on *writing*, and those are asserted above.
+#[tokio::test]
+async fn the_runtime_role_can_read_every_table_in_the_schema() {
+    let app = TestApp::spawn().await;
+    let runtime = app.runtime_role_pool().await;
+
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename",
+    )
+    .fetch_all(&app.db)
+    .await
+    .expect("list tables");
+
+    assert!(
+        tables.len() > 25,
+        "expected the full schema, found {}",
+        tables.len()
+    );
+
+    let mut unreadable = Vec::new();
+    for table in &tables {
+        // Identifier interpolated from `pg_tables`, not from input; bounded by the
+        // schema itself.
+        let sql = format!("SELECT 1 FROM {table} LIMIT 1");
+        if sqlx::query(sqlx::AssertSqlSafe(sql))
+            .fetch_optional(&runtime)
+            .await
+            .is_err()
+        {
+            unreadable.push(table.clone());
+        }
+    }
+
+    assert!(
+        unreadable.is_empty(),
+        "the runtime role cannot SELECT from: {unreadable:?}\n\
+         Add a GRANT in a new migration. Every table the application cannot read is a \
+         startup failure or a runtime 500 waiting to happen — `permissions` was exactly \
+         this, and it prevented the application from booting."
+    );
+}
+
+/// The startup path itself, executed as the identity that actually runs it.
+///
+/// `serve` performs these two reads before it binds a port. Neither had ever been
+/// executed as `roleblank_app` by any test.
+#[tokio::test]
+async fn the_runtime_role_can_execute_the_startup_queries() {
+    let app = TestApp::spawn().await;
+    let runtime = app.runtime_role_pool().await;
+
+    // 1. Schema-currency check — `database::migrations_are_current`.
+    let applied: Vec<(i64,)> = sqlx::query_as(
+        "SELECT version FROM _sqlx_migrations WHERE success = true ORDER BY version",
+    )
+    .fetch_all(&runtime)
+    .await
+    .expect("the runtime role must be able to read migration history");
+    assert!(!applied.is_empty(), "no migrations recorded");
+
+    // 2. Permission-catalogue verification — `cli::verify_permission_catalog`.
+    //    This is the exact statement, and it is the one that failed.
+    let catalogue: Vec<(String, String, String, bool)> = sqlx::query_as(
+        "SELECT code, module, max_principal_type, is_dangerous FROM permissions ORDER BY code",
+    )
+    .fetch_all(&runtime)
+    .await
+    .expect(
+        "the runtime role must be able to read the permission catalogue — without this \
+         the application refuses to start",
+    );
+
+    assert_eq!(
+        catalogue.len(),
+        roleblank_backend::modules::authorization::catalog::PERMISSIONS.len(),
+        "the seeded catalogue and the compiled catalogue disagree in size"
+    );
+
+    // And the check the startup path then performs must pass.
+    assert!(
+        roleblank_backend::modules::authorization::catalog::diff_against(&catalogue).is_none(),
+        "the catalogue read as the runtime role does not match the compiled one"
+    );
+}
+
+/// The audit append path, executed statement-for-statement as the runtime role.
+///
+/// Reading a table is not the same as being able to write the way the application
+/// writes. `0009` granted `USAGE, SELECT` on the audit sequence, which covers
+/// `nextval` and `currval` — but **`setval()` requires `UPDATE`**. `audit::append`
+/// calls `setval` on every write, and `append` runs inside *every audited
+/// mutation*, so bootstrap, login and every create returned `500` with
+/// `SQLSTATE 42501` while the application otherwise looked healthy.
+///
+/// A grant test that only asserts `SELECT` would not have caught it. This one
+/// performs the same four statements `append` performs, in the same order, as
+/// `roleblank_app`.
+#[tokio::test]
+async fn the_runtime_role_can_perform_the_whole_audit_append() {
+    let app = TestApp::spawn().await;
+    let runtime = app.runtime_role_pool().await;
+
+    let mut tx = runtime.begin().await.expect("begin as the runtime role");
+
+    // 1. Lock the chain head.
+    let (last_seq, _last_hash): (i64, Option<Vec<u8>>) =
+        sqlx::query_as("SELECT last_seq, last_hash FROM audit_chain_head WHERE id FOR UPDATE")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("the runtime role must be able to lock the audit chain head");
+
+    let next = last_seq + 1;
+    let id = Uuid::now_v7();
+
+    // 2. Insert the event with an explicit seq.
+    sqlx::query(
+        "INSERT INTO audit_events (seq, id, action_code, outcome, entry_hash)
+         VALUES ($1, $2, 'USER.CREATED', 'SUCCESS', decode(repeat('61',32),'hex'))",
+    )
+    .bind(next)
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .expect("the runtime role must be able to append an audit event");
+
+    // 3. Advance the sequence — the statement that was actually failing.
+    sqlx::query("SELECT setval('audit_events_seq_seq', $1, true)")
+        .bind(next)
+        .execute(&mut *tx)
+        .await
+        .expect(
+            "the runtime role must be able to setval the audit sequence — this requires \
+             UPDATE on the sequence, which USAGE does not imply, and without it every \
+             audited mutation in the system fails with SQLSTATE 42501",
+        );
+
+    // 4. Move the chain head forward.
+    sqlx::query("UPDATE audit_chain_head SET last_seq = $1, last_hash = $2 WHERE id")
+        .bind(next)
+        .bind(vec![0x61u8; 32])
+        .execute(&mut *tx)
+        .await
+        .expect("the runtime role must be able to advance the audit chain head");
+
+    tx.commit().await.expect("commit the audit append");
+
+    let stored: (i64,) = sqlx::query_as("SELECT seq FROM audit_events WHERE id = $1")
+        .bind(id)
+        .fetch_one(&app.db)
+        .await
+        .expect("the event must be readable afterwards");
+    assert_eq!(stored.0, next);
+}
+
 /// Nothing in the schema may be reachable by `PUBLIC`, or every role in the
 /// cluster would inherit access.
 #[tokio::test]

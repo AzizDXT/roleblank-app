@@ -11,6 +11,7 @@
 
 use axum::http::StatusCode;
 use serde_json::json;
+use uuid::Uuid;
 
 use crate::common::TestApp;
 use crate::fixtures::{login, reset_login_limits, World, ROLE_EMPLOYEE, ROOT_EMAIL};
@@ -444,4 +445,57 @@ async fn every_attempt_on_the_owner_is_recorded_and_the_record_cannot_be_erased(
         updated.is_err(),
         "the runtime database role rewrote audit rows"
     );
+}
+
+/// Regression: the department membership routes must not identify the owner to an
+/// external principal.
+///
+/// `guard_root` answers `403 ROOT_PROTECTED`; every other subject id on this route
+/// answers `404` to a CLIENT, because `departments.*` is INTERNAL-only and
+/// `require` masks the refusal. While the guard ran *before* authorisation, the
+/// difference between those two answers was a usable oracle: it confirmed the
+/// system owner's user id — and that internal users exist at all — to a principal
+/// outside the company, which is the client envelope (threat-model boundary 2)
+/// losing to a diagnostic nicety.
+///
+/// Both answers must now be indistinguishable. The owner is of course still
+/// refused; that is asserted from an internal principal below.
+#[tokio::test]
+async fn the_department_routes_do_not_identify_the_owner_to_a_client() {
+    let w = World::build().await;
+    let stranger = Uuid::now_v7();
+
+    for (label, subject) in [("the owner", w.root.id), ("an unknown user", stranger)] {
+        let response = w
+            .app
+            .post(
+                &format!("/api/v1/departments/{}/members", w.department),
+                w.client_a.bearer(),
+                json!({"user_id": subject}),
+            )
+            .await;
+        response.assert_error(StatusCode::NOT_FOUND, "RESOURCE_NOT_FOUND");
+        let _ = label;
+
+        let removed = w
+            .app
+            .delete(
+                &format!("/api/v1/departments/{}/members/{subject}", w.department),
+                w.client_a.bearer(),
+            )
+            .await;
+        removed.assert_error(StatusCode::NOT_FOUND, "RESOURCE_NOT_FOUND");
+    }
+
+    // The protection itself is intact: an internal principal that *is* allowed to
+    // manage members still cannot touch the owner, and still gets the unmistakable
+    // refusal the documentation promises internal callers.
+    w.app
+        .post(
+            &format!("/api/v1/departments/{}/members", w.department),
+            w.admin.bearer(),
+            json!({"user_id": w.root.id}),
+        )
+        .await
+        .assert_error(StatusCode::FORBIDDEN, "ROOT_PROTECTED");
 }

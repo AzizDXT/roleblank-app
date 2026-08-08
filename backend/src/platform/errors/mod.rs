@@ -486,6 +486,22 @@ impl From<sqlx::Error> for AppError {
                         "INVARIANT_VIOLATION",
                         "The operation violates a system invariant and was refused.",
                     ),
+                    // 22021 character_not_in_repertoire, 22P05
+                    // untranslatable_character. Both mean the caller sent a byte
+                    // the database encoding cannot represent — in practice a NUL
+                    // inside a string, which PostgreSQL's `text` type cannot hold.
+                    //
+                    // Mapping these is not cosmetic. Without it, `{"email":"a b"}`
+                    // on the anonymous login endpoint produced a `500 INTERNAL_ERROR`
+                    // and an `error!` log line, so any unauthenticated caller could
+                    // manufacture error-severity records at will and no client could
+                    // learn that its own input was at fault. It is a bad request:
+                    // the value is unrepresentable, not the system broken. Found by
+                    // `tests/hardening/sql_injection.rs`; see
+                    // `docs/backend/audit/SECTION_9_13_FINDINGS.md` §12 finding M-3.
+                    "22021" | "22P05" => AppError::BadRequest(
+                        "The request contains a character that cannot be stored, such as a NUL byte.",
+                    ),
                     "42501" => {
                         // Insufficient privilege for the runtime database role. This
                         // is either an attack that got further than it should have,
@@ -496,7 +512,20 @@ impl From<sqlx::Error> for AppError {
                     _ => AppError::Internal(format!("database error {code}")),
                 }
             }
-            sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed => AppError::ServiceUnavailable,
+            // A dependency being unreachable is `503`, not `500`.
+            //
+            // `Io` and `Tls` mean the database could not be talked to at all — the
+            // request was well-formed and may well succeed on retry. Reporting
+            // `500` told the client "our bug, do not retry" and told the operator's
+            // alerting the same thing, so a PostgreSQL restart paged someone about
+            // an application defect. Found by the acceptance drill: with the
+            // database stopped, `/health/ready` correctly returned `503` while
+            // authenticated requests returned `500`, which is two different answers
+            // to the same question.
+            sqlx::Error::PoolTimedOut
+            | sqlx::Error::PoolClosed
+            | sqlx::Error::Io(_)
+            | sqlx::Error::Tls(_) => AppError::ServiceUnavailable,
             // A coarse, fixed classification. The driver's own message can contain
             // the connection string, the failing SQL and column names, so it is
             // never interpolated — not even into the internal variant, which is

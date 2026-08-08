@@ -4,7 +4,7 @@
 //! authorisation, no validation and no invariant here on purpose: a rule that lives
 //! in a handler is a rule that a second caller of the same service silently skips.
 
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::{delete, get, post};
@@ -12,7 +12,9 @@ use axum::{Json as JsonResponse, Router};
 
 use crate::app::AppState;
 use crate::platform::errors::AppResult;
-use crate::platform::http::extract::{Authenticated, ClientIp, Json, PathId, PathIds};
+use crate::platform::http::extract::{
+    Authenticated, ClientIp, Json, PathId, PathIds, ValidatedQuery,
+};
 use crate::platform::http::idempotency::{self, Idempotent};
 use crate::shared::pagination::{Page, PageQuery};
 
@@ -42,7 +44,7 @@ pub fn router() -> Router<AppState> {
 async fn list(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
-    Query(query): Query<PageQuery>,
+    ValidatedQuery(query): ValidatedQuery<PageQuery>,
 ) -> AppResult<JsonResponse<Page<DepartmentResponse>>> {
     service::list(&state, &principal, &query)
         .await
@@ -106,7 +108,7 @@ async fn list_members(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
     PathId(id): PathId,
-    Query(query): Query<PageQuery>,
+    ValidatedQuery(query): ValidatedQuery<PageQuery>,
 ) -> AppResult<JsonResponse<Page<DepartmentMemberResponse>>> {
     service::list_members(&state, &principal, id, &query)
         .await

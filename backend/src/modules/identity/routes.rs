@@ -8,7 +8,7 @@
 //! rejects an MFA-pending session automatically. A handler cannot forget to think
 //! about MFA, because the safe extractor is the default one.
 
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::{delete, get, post};
@@ -16,7 +16,7 @@ use axum::Router;
 
 use crate::app::AppState;
 use crate::platform::errors::AppResult;
-use crate::platform::http::extract::{Authenticated, ClientIp, Json, PathId};
+use crate::platform::http::extract::{Authenticated, ClientIp, Json, PathId, ValidatedQuery};
 use crate::platform::http::idempotency::{self, Idempotent};
 use crate::shared::pagination::Page;
 
@@ -58,7 +58,7 @@ pub fn router() -> Router<AppState> {
 async fn list_users(
     State(state): State<AppState>,
     principal: Authenticated,
-    Query(query): Query<ListUsersQuery>,
+    ValidatedQuery(query): ValidatedQuery<ListUsersQuery>,
 ) -> AppResult<axum::Json<Page<UserResponse>>> {
     Ok(axum::Json(
         service::list_users(&state, &principal, &query).await?,
@@ -145,7 +145,7 @@ async fn create_invitation(
 async fn list_invitations(
     State(state): State<AppState>,
     principal: Authenticated,
-    Query(query): Query<ListInvitationsQuery>,
+    ValidatedQuery(query): ValidatedQuery<ListInvitationsQuery>,
 ) -> AppResult<axum::Json<Page<InvitationResponse>>> {
     Ok(axum::Json(
         invitations::list_invitations(&state, &principal, &query).await?,

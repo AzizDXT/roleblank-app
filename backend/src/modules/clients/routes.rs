@@ -5,7 +5,7 @@
 //! catalogue, so the evaluator refuses an external principal at the envelope and
 //! `state.require` renders it as `404`. One rule, one implementation.
 
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::{delete, get, post};
@@ -13,7 +13,9 @@ use axum::{Json as JsonResponse, Router};
 
 use crate::app::AppState;
 use crate::platform::errors::AppResult;
-use crate::platform::http::extract::{Authenticated, ClientIp, Json, PathId, PathIds};
+use crate::platform::http::extract::{
+    Authenticated, ClientIp, Json, PathId, PathIds, ValidatedQuery,
+};
 use crate::platform::http::idempotency::{self, Idempotent};
 use crate::shared::pagination::{Page, PageQuery};
 
@@ -45,7 +47,7 @@ pub fn router() -> Router<AppState> {
 async fn list(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
-    Query(query): Query<PageQuery>,
+    ValidatedQuery(query): ValidatedQuery<PageQuery>,
 ) -> AppResult<JsonResponse<Page<ClientAccountResponse>>> {
     service::list(&state, &principal, &query)
         .await
@@ -109,7 +111,7 @@ async fn list_members(
     State(state): State<AppState>,
     Authenticated(principal): Authenticated,
     PathId(id): PathId,
-    Query(query): Query<PageQuery>,
+    ValidatedQuery(query): ValidatedQuery<PageQuery>,
 ) -> AppResult<JsonResponse<Page<ClientMemberResponse>>> {
     service::list_members(&state, &principal, id, &query)
         .await

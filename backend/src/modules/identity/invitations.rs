@@ -121,6 +121,35 @@ pub async fn create_invitation(
         ));
     }
 
+    // Placement is an authorisation decision, not a data field.
+    //
+    // `department_id` and `client_account_id` arrive in the request body and become
+    // real memberships on acceptance — a department membership resolves DEPARTMENT
+    // scope, and a client membership becomes ACTIVE, the state that makes company
+    // data visible outside the company. Authorising only `iam.users.invite` here
+    // would let a principal reach through an invitation what they are refused
+    // directly, using an address they control as a proxy. Each module authorises
+    // its own placement, inside this transaction and against the locked row, so the
+    // demand cannot go stale between the decision and the write.
+    if let Some(department_id) = request.department_id {
+        crate::modules::departments::service::authorize_placement(
+            state,
+            &principal.0,
+            &mut tx,
+            department_id,
+        )
+        .await?;
+    }
+    if let Some(client_account_id) = request.client_account_id {
+        crate::modules::clients::service::authorize_placement(
+            state,
+            &principal.0,
+            &mut tx,
+            client_account_id,
+        )
+        .await?;
+    }
+
     // Load every role and its permissions, then decide. Nothing is written until
     // all of them pass.
     let mut summaries = Vec::with_capacity(role_ids.len());
@@ -357,13 +386,20 @@ pub async fn accept_invitation(
     client_ip: ClientIp,
     mut request: AcceptInvitationRequest,
 ) -> AppResult<AcceptInvitationResponse> {
-    // Accepting an invitation creates an account, so it draws on the same per-IP
-    // account-creation budget as self-registration rather than getting its own.
+    // Accepting an invitation creates an account, but it draws on its **own**
+    // per-IP budget rather than self-registration's.
+    //
+    // Sharing the registration budget coupled two flows with different risk: an
+    // attacker hammering `/api/v1/registration` from an address could exhaust it
+    // and block invitation acceptance for every legitimate user behind that same
+    // address — a corporate NAT, which is the normal case. It also capped
+    // onboarding at three people per hour per office. Acceptance still needs a
+    // limit (the token is guessable in principle), just not a shared one.
     let decision = state
         .limiter
         .check(
-            &keys::registration_ip(client_ip.0),
-            state.config.rate_limits.registration_per_ip_per_hour,
+            &keys::invitation_accept_ip(client_ip.0),
+            state.config.rate_limits.invitation_accept_per_ip_per_hour,
             ACCEPT_RATE_WINDOW,
         )
         .await;
@@ -406,6 +442,38 @@ pub async fn accept_invitation(
     let password_hash = state.hasher.hash(&supplied).await?;
     drop(supplied);
 
+    // ---- the inviter's delegation context, built BEFORE the transaction opens ---
+    //
+    // **Why this must not happen inside the transaction.** `load_actor` issues three
+    // queries and `actor_basics` a fourth. Run from inside an open transaction they
+    // ask the pool for a *second* connection while this task already holds one. Once
+    // the number of simultaneous acceptances reaches the pool size, every task holds
+    // a connection and every task waits for one that only a peer could release: the
+    // pool deadlocks until `acquire_timeout`, and the attempts queued behind the
+    // invitation's row lock are killed by `statement_timeout` first. Measured at
+    // fifty concurrent acceptances of a single valid token, that yielded 17×503,
+    // 3×500 and — the part that actually matters — *zero* successful acceptances.
+    // The invitee simply could not create their account, and the exhausted pool is
+    // shared with every other endpoint, so the blast radius was the whole service.
+    //
+    // Hoisting these reads costs nothing in correctness. They were already issued on
+    // a *different* connection with its own snapshot, so sitting inside the
+    // transaction never made them consistent with the invitation row. The freshness
+    // that genuinely matters — "is the inviter still active *now*" — is re-checked
+    // below on the transaction's own connection, which needs no second pool slot.
+    let inviter_preview = repo::actor_basics(&state.db, preview.invited_by)
+        .await?
+        .ok_or(AppError::AuthenticationFailed)?;
+    let inviter_type = PrincipalType::parse(&inviter_preview.principal_type)
+        .ok_or_else(|| AppError::internal("inviter has an unrecognised principal_type"))?;
+    let inviter_actor = principal::load_actor(
+        &state.db,
+        preview.invited_by,
+        inviter_type,
+        inviter_preview.is_root,
+    )
+    .await?;
+
     let mut tx = state.begin().await?;
 
     // The authoritative read. `FOR UPDATE` is what makes two simultaneous
@@ -429,8 +497,21 @@ pub async fn accept_invitation(
     let subject_type = PrincipalType::parse(&invitation.principal_type)
         .ok_or_else(|| AppError::internal("invitation has an unrecognised principal_type"))?;
 
+    // The delegation context above was computed from the non-locking preview. If the
+    // locked row names a different author, that context belongs to the wrong
+    // principal and every authority check below would be validating the wrong
+    // person. `invited_by` is immutable so this cannot happen — it is asserted
+    // rather than assumed, because the cost of being wrong is an unauthorised grant.
+    if invitation.invited_by != preview.invited_by {
+        return Err(AppError::AuthenticationFailed);
+    }
+
     // ---- re-validate against the inviter's authority as it stands NOW ----------
-    let inviter = repo::actor_basics(&state.db, invitation.invited_by)
+    //
+    // On the transaction's own connection, so it costs no second pool slot. This is
+    // the authoritative freshness check: a suspension that landed while this request
+    // was queued behind the row lock is observed here, not by the hoisted read.
+    let inviter = repo::actor_basics(&mut *tx, invitation.invited_by)
         .await?
         .ok_or(AppError::AuthenticationFailed)?;
     if inviter.status != "ACTIVE" {
@@ -443,15 +524,6 @@ pub async fn accept_invitation(
         );
         return Err(AppError::AuthenticationFailed);
     }
-    let inviter_type = PrincipalType::parse(&inviter.principal_type)
-        .ok_or_else(|| AppError::internal("inviter has an unrecognised principal_type"))?;
-    let inviter_actor = principal::load_actor(
-        &state.db,
-        invitation.invited_by,
-        inviter_type,
-        inviter.is_root,
-    )
-    .await?;
 
     let new_user_id = Uuid::now_v7();
     let role_ids = repo::invitation_role_ids(&mut tx, invitation.id).await?;
