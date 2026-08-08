@@ -144,8 +144,12 @@ pub fn effective_scopes(actor: &ActorContext, permission_code: &str) -> Vec<Scop
     scopes
 }
 
-/// Convenience for the common "does the actor hold this at all" question, used to
-/// build the capability list returned by `GET /api/v1/auth/me`.
+/// Convenience for the common "does the actor hold this at all" question.
+///
+/// It does **not** build the capability list for `GET /api/v1/auth/me` — that is
+/// `capability_list` below, which returns the scopes as well. The claim was in this
+/// doc comment and was untrue; a reader trusting it would look for the `/auth/me`
+/// behaviour in the wrong function.
 pub fn holds_any(actor: &ActorContext, permission_code: &str) -> bool {
     !effective_scopes(actor, permission_code).is_empty()
 }

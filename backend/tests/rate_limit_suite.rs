@@ -364,11 +364,34 @@ async fn a_throttled_request_returns_the_documented_contract() {
     );
 
     // The refusal must not describe the limiter's internals.
-    let body = response.json().to_string();
-    assert!(
-        !body.contains("general:user:") && !body.contains(&TINY.to_string()),
-        "the throttle response leaked limiter internals: {body}"
+    //
+    // Checked by field name and by key prefix, deliberately **not** by looking for
+    // the quota as a substring. The first version of this assertion did exactly
+    // that and was a lottery: `TINY` is 10, `request_id` is a UUIDv7 rendered in
+    // hex, and `019fe101-…` contains "10". It passed for a while and then failed on
+    // a request id that happened to contain the digits — a flaky assertion in a
+    // security test, which is worse than no assertion, because the next person to
+    // see it fail will assume the test is wrong and delete it.
+    let body = response.json().clone();
+    let object = body.as_object().expect("problem+json object");
+
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec!["code", "detail", "request_id", "status", "title", "type"],
+        "the throttle response carries a field the error contract does not define"
     );
+
+    for (key, value) in object {
+        let text = value.as_str().unwrap_or_default().to_ascii_lowercase();
+        for forbidden in ["general:user:", "general:ip:", "bucket", "quota"] {
+            assert!(
+                !text.contains(forbidden) && !key.to_ascii_lowercase().contains(forbidden),
+                "the throttle response mentions `{forbidden}` in `{key}`: {value}"
+            );
+        }
+    }
 }
 
 /// **The finding itself.** A principal repeating a request that produces a

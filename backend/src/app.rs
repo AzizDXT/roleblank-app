@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::modules::audit;
 use crate::modules::authentication::principal::Principal;
-use crate::modules::authorization::domain::{Decision, PrincipalType, Target};
+use crate::modules::authorization::domain::{Decision, Target};
 use crate::modules::authorization::{catalog, evaluator};
 use crate::platform::config::Config;
 use crate::platform::crypto::{aead, password};
@@ -182,13 +182,14 @@ impl AppState {
             .map_err(AppError::from)?;
         Ok(())
     }
-
-    /// Convert a "not visible" outcome into the right status for this principal.
-    pub fn not_found_or_denied(&self, principal_type: PrincipalType) -> AppError {
-        if principal_type.is_external() {
-            AppError::NotFound
-        } else {
-            AppError::AuthorizationDenied
-        }
-    }
 }
+
+// `not_found_or_denied` used to live here: a second expression of the rule that an
+// external principal sees `404` where an internal one sees `403`. It had no callers
+// at all, while `AppError::hide_from_external` — the same rule — has seven.
+//
+// Deleted rather than kept "in case it is useful", because the risk is specific:
+// two implementations of one security rule drift the moment somebody teaches one of
+// them about a new error variant and not the other, and the dead one is the one
+// nobody re-reads. There is now exactly one place that decides how a refusal is
+// shaped for an outsider.
