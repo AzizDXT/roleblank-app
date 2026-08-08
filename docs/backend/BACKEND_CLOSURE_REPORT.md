@@ -299,7 +299,9 @@ Listed in full in `BACKEND_FREEZE_MANIFEST.md`. The three that matter most:
 
 ## 21. Freeze commit
 
-Recorded at commit time; see the terminal summary and `git log`.
+**`1165eb6`** on branch `audit/final-acceptance` — 54 files changed, 5 921
+insertions, 486 deletions. Every result in this report was produced against the
+tree that commit contains. Nothing was pushed; `main` is untouched.
 
 ## 22. Verdict
 

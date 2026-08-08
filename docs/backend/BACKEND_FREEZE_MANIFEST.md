@@ -5,10 +5,15 @@ by a command run against this tree, not carried forward from an earlier report.
 
 ## Freeze point
 
+Every verification in this manifest was run against the tree contained in commit
+`1165eb6`. This document and the closure report are committed immediately after it,
+because a manifest cannot contain its own hash; nothing executable differs between
+the two commits.
+
 | | |
 |---|---|
 | Branch | `audit/final-acceptance` |
-| Freeze commit | *(recorded at commit; see `BACKEND_CLOSURE_REPORT.md` §21)* |
+| Freeze commit | **`1165eb6`** — "Backend closure: rate limiting, mail transport, and every LOW closed" |
 | Backend version | `0.1.0-foundation` |
 | Migration head | `0011_envelope_and_consumption_guards.sql` (11 migrations) |
 | Working tree at freeze | clean |
