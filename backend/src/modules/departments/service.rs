@@ -517,7 +517,23 @@ pub async fn add_member(
     state.require_step_up_for(principal, MEMBERS_MANAGE)?;
 
     // Department membership resolves DEPARTMENT scope, so it is an authorisation
-    // operation, and no authorisation operation may target the system owner
+    // operation — and the delegation guard already refuses one actor to grant
+    // *themselves* a role for exactly that reason ("You cannot assign roles to
+    // yourself", `delegation.rs`). The same rule has to hold here, or a holder of
+    // `departments.members.manage` can walk into any department and self-grant
+    // whatever DEPARTMENT-scoped visibility their other permissions imply —
+    // `projects.read@DEPARTMENT` over a department they were never placed in.
+    //
+    // The membership takes effect immediately: `principal` reloads `department_ids`
+    // from live rows on every request, so there is no window in which this is
+    // pending review.
+    if request.user_id == principal.user_id() {
+        return Err(AppError::delegation(
+            "You cannot add yourself to a department. Ask another administrator.",
+        ));
+    }
+
+    // ...and no authorisation operation may target the system owner
     // (`docs/backend/04-authorization.md` §6).
     //
     // Checked *after* authorisation, not before. `guard_root` answers

@@ -328,6 +328,38 @@ Listed in full in `BACKEND_FREEZE_MANIFEST.md`. The three that matter most:
 insertions, 486 deletions. Every result in this report was produced against the
 tree that commit contains. Nothing was pushed; `main` is untouched.
 
+## 21a. The final adversarial sweep
+
+After the closure work was complete and committed, a 32-agent sweep re-attacked the
+frozen tree from four independent lenses — the newly added code, the authorisation
+edges, the data layer, and "claims the documentation makes that are not true". Each
+of the 26 candidate findings went to a separate reviewer whose only job was to
+refute it. **Twenty survived, three of them MEDIUM**, which falsified the 0-MEDIUM
+claim this report had already made.
+
+That is the most useful result in the whole closure, and it is worth being blunt
+about why: two of the three MEDIUMs were **my own defect, reported as shipped**. The
+closure commit added an SMTP transport — enum variant, config struct, provider,
+production validation, factory arm, tests — and never added the parser arm that
+selects it. My edit to that `match` silently matched nothing, I printed "config
+patched", and I did not check. `RB_MAIL_PROVIDER=smtp` was refused as "not
+implemented" in every environment, the six `RB_SMTP_*` variables were read nowhere,
+and the manifest said the transport shipped.
+
+The third was a missing `DELETE` grant on `roles`, making `DELETE /roles/{id}`
+return `500` for every caller — the **third** defect of exactly that shape, after
+the missing `SELECT` on `permissions` and the missing `UPDATE` on the audit
+sequence. The runtime-role test passed because it asserted the deletable set equalled
+a list it already knew. Pinning the current answer cannot discover that the answer
+is wrong.
+
+All three are fixed, with regressions, and re-verified end to end. The seventeen
+LOW/INFO survivors were triaged: the actionable ones are closed (ASSIGNED-scoped
+denials in two listings, four metric counters with no callers, the idempotency
+sweep that three documents claimed existed and did not, self-targeted department
+membership), and the documentation claims the sweep caught as false have been
+corrected rather than left.
+
 ## 22. Verdict
 
 Applied against §37: 0 CRITICAL, 0 HIGH, 0 MEDIUM, 0 unresolved actionable LOW;

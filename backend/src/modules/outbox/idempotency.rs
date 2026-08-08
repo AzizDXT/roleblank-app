@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPool;
 use uuid::Uuid;
 
-use crate::platform::errors::AppError;
+use crate::platform::errors::{AppError, AppResult};
 use crate::platform::observability::sanitize;
 
 /// Mirrors `idempotency_records.idempotency_key`'s
@@ -36,8 +36,9 @@ pub const FINGERPRINT_LEN: usize = 32;
 /// How long a key stays reserved.
 ///
 /// Long enough to cover any realistic client retry (including a human retrying the
-/// next morning), short enough that the table does not grow without bound. A
-/// scheduled sweep deletes on `expires_at`.
+/// next morning), short enough that the table does not grow without bound.
+/// [`sweep_expired`] is what actually deletes on `expires_at`; the outbox worker
+/// calls it on its own poll loop.
 pub const RETENTION_HOURS: i64 = 24;
 
 /// Cap on a stored replay body. The API's own request limit is 256 KiB and
@@ -371,6 +372,39 @@ pub async fn abandon(pool: &PgPool, record_id: Uuid) {
              the key stays reserved until it expires"
         );
     }
+}
+
+/// Delete idempotency records whose reservation has expired.
+///
+/// **This did not exist for the whole of the build.** `expires_at` was written on
+/// every insert and read by no predicate anywhere, three documents asserted that a
+/// sweep deleted on it, and the two-pass retry loop in `reserve` justified itself
+/// entirely by a race against a sweep that was never running. The table therefore
+/// grew forever: one row per mutating request that carried an `Idempotency-Key`,
+/// with no path that ever removed one.
+///
+/// Cheap by construction — `idempotency_records_expiry_idx` covers exactly this
+/// predicate — and bounded per call so a long-neglected table is drained over
+/// several polls rather than in one statement that locks a large range.
+///
+/// Best-effort by design: the caller logs and carries on. A sweep that fails is a
+/// table that stays large for another poll interval, which is not worth stopping
+/// mail delivery for.
+pub async fn sweep_expired(pool: &PgPool, limit: i64) -> AppResult<u64> {
+    let deleted = sqlx::query(
+        "DELETE FROM idempotency_records
+          WHERE id IN (
+              SELECT id FROM idempotency_records
+               WHERE expires_at < now()
+               ORDER BY expires_at
+               LIMIT $1
+          )",
+    )
+    .bind(limit)
+    .execute(pool)
+    .await
+    .map_err(AppError::from)?;
+    Ok(deleted.rows_affected())
 }
 
 #[cfg(test)]

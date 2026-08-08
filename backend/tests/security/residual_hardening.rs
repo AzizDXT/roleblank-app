@@ -540,3 +540,47 @@ async fn disabling_the_second_factor_is_rate_limited() {
         "`/auth/mfa/disable` accepted more than its per-minute quota"
     );
 }
+
+/// `expires_at` was written on every idempotency record and read by nothing, while
+/// three documents asserted that a scheduled sweep deleted on it. The table grew
+/// one row per mutating request forever. This pins the sweep that now exists.
+#[tokio::test]
+async fn expired_idempotency_records_are_swept() {
+    use roleblank_backend::modules::outbox::idempotency;
+
+    let app = TestApp::spawn().await;
+
+    // One already expired, one still live.
+    for (key, expires) in [("expired-key", "-1 hour"), ("live-key", "1 hour")] {
+        sqlx::query(
+            "INSERT INTO idempotency_records
+                 (id, principal_id, operation, idempotency_key, request_fingerprint,
+                  status, expires_at)
+             VALUES ($1, $2, 'test.op', $3, decode(repeat('ab', 32), 'hex'),
+                     'IN_PROGRESS', now() + $4::interval)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .bind(key)
+        .bind(expires)
+        .execute(&app.db)
+        .await
+        .expect("seed an idempotency record");
+    }
+
+    let removed = idempotency::sweep_expired(&app.db, 500)
+        .await
+        .expect("sweep must succeed");
+    assert_eq!(removed, 1, "the sweep removed the wrong number of rows");
+
+    let remaining: Vec<String> =
+        sqlx::query_scalar("SELECT idempotency_key FROM idempotency_records ORDER BY 1")
+            .fetch_all(&app.db)
+            .await
+            .expect("read remaining");
+    assert_eq!(
+        remaining,
+        vec!["live-key".to_string()],
+        "the sweep deleted a record that had not expired"
+    );
+}

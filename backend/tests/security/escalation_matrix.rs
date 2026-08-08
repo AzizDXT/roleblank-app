@@ -1390,3 +1390,57 @@ async fn an_assigned_scoped_denial_hides_the_department_from_the_listing() {
         );
     }
 }
+
+/// Department membership resolves DEPARTMENT scope, so adding someone to a
+/// department is a privilege operation — and the delegation guard already refuses
+/// an actor to hand *themselves* a role for exactly that reason. The same rule has
+/// to hold here, or a holder of `departments.members.manage` walks into any
+/// department and self-grants whatever DEPARTMENT-scoped visibility their other
+/// permissions imply.
+#[tokio::test]
+async fn an_administrator_cannot_add_themselves_to_a_department() {
+    let w = World::build().await;
+    let foreign = seed_department(&w.app, "finance-self", w.root.id).await;
+
+    let refused = w
+        .app
+        .post(
+            &format!("/api/v1/departments/{foreign}/members"),
+            w.admin.bearer(),
+            json!({"user_id": w.admin.id}),
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::FORBIDDEN,
+        "an administrator added themselves to a department: {}",
+        refused.json()
+    );
+
+    let members: (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM department_memberships
+          WHERE department_id = $1 AND user_id = $2 AND removed_at IS NULL",
+    )
+    .bind(foreign)
+    .bind(w.admin.id)
+    .fetch_one(&w.app.db)
+    .await
+    .expect("count memberships");
+    assert_eq!(members.0, 0, "the refusal still wrote a membership");
+
+    // The capability itself still works when it targets somebody else.
+    let allowed = w
+        .app
+        .post(
+            &format!("/api/v1/departments/{foreign}/members"),
+            w.admin.bearer(),
+            json!({"user_id": w.other_employee}),
+        )
+        .await;
+    assert_eq!(
+        allowed.status,
+        StatusCode::CREATED,
+        "the guard blocked a legitimate placement too: {}",
+        allowed.json()
+    );
+}

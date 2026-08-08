@@ -407,6 +407,10 @@ pub struct ClaimedEvent {
     pub attempts: i32,
 }
 
+/// Rows removed per sweep. Bounded so a long-neglected table drains over several
+/// polls instead of one statement locking a large range.
+const SWEEP_BATCH: i64 = 500;
+
 pub struct OutboxWorker {
     pool: PgPool,
     mail: Arc<dyn MailProvider>,
@@ -526,6 +530,23 @@ impl OutboxWorker {
         loop {
             if shutdown.is_cancelled() {
                 break;
+            }
+
+            // Idempotency records expire on their own schedule and belong to no
+            // other loop; the worker is the one background task this process runs,
+            // so it owns the sweep. Best-effort: a failure here must not stop mail.
+            match idempotency::sweep_expired(&self.pool, SWEEP_BATCH).await {
+                Ok(0) => {}
+                Ok(n) => tracing::debug!(
+                    worker_id = %self.worker_id,
+                    removed = n,
+                    "swept expired idempotency records"
+                ),
+                Err(e) => tracing::warn!(
+                    worker_id = %self.worker_id,
+                    error = %sanitize::log_value(e.to_string()),
+                    "idempotency sweep failed; retrying next poll"
+                ),
             }
 
             let processed = match self.process_batch(&shutdown).await {
