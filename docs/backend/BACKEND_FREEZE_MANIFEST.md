@@ -5,17 +5,16 @@ by a command run against this tree, not carried forward from an earlier report.
 
 ## Freeze point
 
-Every verification in this manifest was run against the tree contained in commit
-`1165eb6`. This document and the closure report are committed immediately after it,
-because a manifest cannot contain its own hash; nothing executable differs between
-the two commits.
+Every verification in this manifest was run against the executable content of
+commit `2c94bdf`. This document is committed immediately after it, because a manifest
+cannot contain its own hash; the following commit changes documentation only.
 
 | | |
 |---|---|
 | Branch | `audit/final-acceptance` |
-| Freeze commit | **`1165eb6`** — "Backend closure: rate limiting, mail transport, and every LOW closed" |
+| Freeze commit | **`2c94bdf`** |
 | Backend version | `0.1.0-foundation` |
-| Migration head | `0011_envelope_and_consumption_guards.sql` (11 migrations) |
+| Migration head | `0012_grant_role_deletion.sql` (12 migrations) |
 | Working tree at freeze | clean |
 
 ## Contract artifacts
@@ -39,15 +38,16 @@ eventually disagree.
 
 | Gate | Result |
 |---|---|
-| `cargo test --all-targets` | **1 046 passed, 0 failed**, 4 ignored (benchmarks, run separately) |
+| `cargo test --all-targets` | **1 051 passed, 0 failed**, 4 ignored (benchmarks, run separately) |
 | `cargo fmt --all --check` | PASS |
 | `cargo clippy --all-targets --all-features -D warnings` | PASS |
 | `cargo audit` | PASS — 263 crate dependencies, 0 vulnerabilities |
 | `cargo deny check` | PASS — advisories, bans, licenses, sources |
 | Coverage | **91.16% region / 92.95% function / 93.34% line** |
 | Clean-room phases 1 / 2 / 3 | 0 failures each (fresh database, fresh secrets, runtime role) |
+| Final adversarial sweep | 32 agents, 4 lenses, 26 candidates adversarially refuted; **3 MEDIUM found and fixed** |
 | Backup → destroy → restore | byte-identical state, chain intact, 0 `pg_restore` warnings |
-| Production config refusal | 9 of 9 unsafe configurations refused at startup |
+| Production config refusal | 10 of 10 unsafe configurations refused; a correct SMTP posture accepted |
 | Exploit reproducers | both blocked |
 | Two suites concurrently | 314 tests, 0 failures, no template destruction |
 
