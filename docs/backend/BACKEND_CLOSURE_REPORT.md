@@ -248,18 +248,33 @@ accumulated before.
 Release build, container, shared 24-core host. Nothing was tuned to produce a
 better number.
 
-| Endpoint | p50 | p95 | p99 | 5xx |
-|---|---|---|---|---|
-| `GET /health/ready` | 1.0 ms | 1.4 ms | 1.6 ms | 0 |
-| `GET /api/v1/auth/me` | 3.8 ms | 4.5 ms | 5.4 ms | 0 |
-| `GET /api/v1/projects` | 3.9 ms | 4.5 ms | 4.9 ms | 0 |
-| `GET /api/v1/tasks` | 4.0 ms | 4.6 ms | 5.6 ms | 0 |
-| denied endpoint (`403` + committed audit row) | 7.2 ms | 10.7 ms | 12.2 ms | 0 |
+| Endpoint (all `200`, ROOT) | p50 | p95 | p99 |
+|---|---|---|---|
+| `GET /health/ready` | 1.0 ms | 1.4 ms | 1.6 ms |
+| `GET /api/v1/auth/me` | 4.0 ms | 4.6 ms | 6.0 ms |
+| `GET /api/v1/users` | 4.9 ms | 6.0 ms | 6.3 ms |
+| `GET /api/v1/tasks` | 5.4 ms | 6.0 ms | 6.1 ms |
+| `GET /api/v1/projects` | 5.9 ms | 7.1 ms | 7.1 ms |
+| denied endpoint (`403` + committed audit row) | 7.2 ms | 10.7 ms | 12.2 ms |
 
-Against the pre-closure baseline (`auth/me` 2.6 ms p50, `projects` 3.2 ms,
-`tasks` 5.3 ms), the limiter and metrics layers cost on the order of **one
-millisecond or less**, and p95 on the list endpoints improved — the earlier
-measurement was noisier. No unacceptable regression.
+**A correction to an earlier measurement in this report.** The first pass drove
+`/projects` and `/tasks` with an *employee* token and recorded only the `5xx`
+count, which was zero — so the numbers looked fine. They were: every one of those
+requests was a `403`. The run was measuring the refusal path and calling it the
+data path. Re-measured with a principal that can actually read, asserting `200` on
+every sample, the figures above are ~2 ms higher and are the real ones.
+
+It is the same mistake this whole audit kept finding in the test suite — a green
+number that measured something other than the thing it claimed to measure — and it
+is recorded rather than quietly replaced.
+
+Under concurrency (16–32 in-flight, 400 requests) there were **zero 5xx** on every
+endpoint. Throughput is not reported as a capacity figure: the harness spawns one
+`curl` process per request, so it measures the harness, not the server.
+
+Against the pre-closure baseline the limiter and metrics layers cost on the order
+of **one to two milliseconds** on an authenticated request — one bucket check, one
+timer and one counter. No unacceptable regression, and no `5xx` under load.
 
 CPU-bound primitives are unchanged: authorisation `evaluate` 28 ns, audit
 `entry_hash` 518 ns, AEAD seal 1.36 µs, TOTP verify 479 ns.

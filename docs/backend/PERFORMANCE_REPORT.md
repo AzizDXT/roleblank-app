@@ -418,3 +418,32 @@ Not the 518 ns hash. Appends serialise on
 finding **M-A** abuses exactly this: 100 refused requests from an unprivileged
 account produced 101 committed audit rows in 2 s with zero rate limiting, each one
 taking that global lock.
+
+
+---
+
+## 10. Closure re-measurement, and a correction
+
+Re-measured after the rate limiter and metrics layers were installed. All samples
+asserted `200`; the endpoint list is the successful data path, not the refusal path.
+
+| Endpoint | p50 | p95 | p99 |
+|---|---|---|---|
+| `GET /health/ready` | 1.0 ms | 1.4 ms | 1.6 ms |
+| `GET /api/v1/auth/me` | 4.0 ms | 4.6 ms | 6.0 ms |
+| `GET /api/v1/users` | 4.9 ms | 6.0 ms | 6.3 ms |
+| `GET /api/v1/tasks` | 5.4 ms | 6.0 ms | 6.1 ms |
+| `GET /api/v1/projects` | 5.9 ms | 7.1 ms | 7.1 ms |
+| denied endpoint (`403` + audit row) | 7.2 ms | 10.7 ms | 12.2 ms |
+
+**The correction.** An earlier pass in this closure drove `/projects` and `/tasks`
+with an employee token and counted only `5xx`, which was zero. Every one of those
+requests was in fact a `403`: the measurement was of the refusal path, presented as
+the data path. Recorded here because it is exactly the failure this project keeps
+finding — a green number that measured the wrong thing — and because the honest
+figures are ~2 ms higher.
+
+The limiter and metrics layers cost **one to two milliseconds** on an authenticated
+request: one token-bucket check, one timer, one counter. Under 16–32 concurrent
+in-flight requests there were **zero 5xx**. Throughput is deliberately not quoted:
+the harness spawns a `curl` process per request and measures itself, not the server.
