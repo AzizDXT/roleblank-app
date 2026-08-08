@@ -46,6 +46,11 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
+    # `quoted_printable`, reached through `lettre` — the SMTP transport. 0BSD is the
+    # BSD Zero Clause License: OSI-approved, permissive, and unusually *weaker* than
+    # MIT rather than stronger, because it drops the attribution requirement
+    # entirely. It imposes no obligation of any kind on this codebase.
+    "0BSD",
     "Unicode-3.0",
     "Unicode-DFS-2016",
     "Zlib",

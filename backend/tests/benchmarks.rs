@@ -277,6 +277,7 @@ fn audit_chain_hashing() {
 
     let key = Secret::new(vec![0x42u8; 32]);
     let entry = chain::ChainedEntry {
+        chain_version: chain::CURRENT_CHAIN_VERSION,
         seq: 1,
         id: Uuid::now_v7(),
         occurred_at: OffsetDateTime::now_utc(),
@@ -288,6 +289,7 @@ fn audit_chain_hashing() {
         target_id: Some(Uuid::now_v7()),
         outcome: "SUCCESS".into(),
         request_id: Some("0192f5c1-7c3a-7e1b-9f2d-3a4b5c6d7e8f".into()),
+        source_ip_hint: Some("198.51.100.7".into()),
         metadata: serde_json::json!({"changed_fields": ["name", "status"], "version": 4}),
     };
 

@@ -94,6 +94,17 @@ pub mod action {
 
     pub const TASK_CREATED: &str = "TASK.CREATED";
     pub const TASK_UPDATED: &str = "TASK.UPDATED";
+    /// Cancellation is a terminal state change, not an edit.
+    ///
+    /// It was previously recorded as `TASK.UPDATED` with the status in the
+    /// metadata, because the tasks module correctly declined to extend a catalogue
+    /// it does not own. The metadata did answer "who cancelled this, and when" —
+    /// but only to a reader who already knew to look there. An auditor filtering
+    /// `action_code = TASK.CANCELLED` got an empty page and the reasonable
+    /// conclusion that nothing had been cancelled, which is exactly the failure
+    /// `service::validate_action_code` argues against when it refuses to validate
+    /// filters against a snapshot of this list.
+    pub const TASK_CANCELLED: &str = "TASK.CANCELLED";
     pub const TASK_ASSIGNED: &str = "TASK.ASSIGNED";
     pub const TASK_UNASSIGNED: &str = "TASK.UNASSIGNED";
     pub const TASK_CLIENT_VISIBILITY_CHANGED: &str = "TASK.CLIENT_VISIBILITY_CHANGED";
@@ -336,6 +347,7 @@ pub async fn append(
     let next_seq = last_seq + 1;
 
     let entry = chain::ChainedEntry {
+        chain_version: chain::CURRENT_CHAIN_VERSION,
         seq: next_seq,
         id,
         occurred_at,
@@ -350,6 +362,7 @@ pub async fn append(
         target_id: event.target_id,
         outcome: event.outcome.as_str().to_string(),
         request_id: event.request_id.clone(),
+        source_ip_hint: event.source_ip_hint.clone(),
         metadata: event.metadata.clone().into_value(),
     };
 
@@ -358,12 +371,16 @@ pub async fn append(
     // `seq` is supplied explicitly rather than left to the sequence default: the
     // hash covers `seq`, so the value that was hashed must be the value stored.
     // The advisory lock above guarantees no other writer can take it first.
+    // `chain_version` is stored, not inferred. A verifier that assumed the current
+    // layout would report every entry written under an earlier one as tampered, and
+    // the marker is inside the digest from v2 onwards so it cannot be edited to
+    // select a weaker layout — see `chain::canonical_bytes`.
     sqlx::query(
         "INSERT INTO audit_events (
              seq, id, occurred_at, actor_user_id, actor_principal_type, actor_session_id,
              action_code, target_type, target_id, outcome, request_id, source_ip_hint,
-             metadata, prev_hash, entry_hash
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
+             metadata, prev_hash, entry_hash, chain_version
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
     )
     .bind(next_seq)
     .bind(id)
@@ -376,10 +393,11 @@ pub async fn append(
     .bind(entry.target_id)
     .bind(&entry.outcome)
     .bind(&entry.request_id)
-    .bind(event.source_ip_hint.as_deref())
+    .bind(entry.source_ip_hint.as_deref())
     .bind(&entry.metadata)
     .bind(last_hash.as_deref())
     .bind(&entry_hash)
+    .bind(entry.chain_version)
     .execute(&mut **tx)
     .await
     .map_err(AppError::from)?;

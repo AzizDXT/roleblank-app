@@ -120,15 +120,17 @@ async fn verify_audit(
         target_id: Option<uuid::Uuid>,
         outcome: String,
         request_id: Option<String>,
+        source_ip_hint: Option<String>,
         metadata: serde_json::Value,
         prev_hash: Option<Vec<u8>>,
         entry_hash: Vec<u8>,
+        chain_version: i16,
     }
 
     let rows: Vec<Row> = sqlx::query_as(
         "SELECT seq, id, occurred_at, actor_user_id, actor_principal_type, actor_session_id,
-                action_code, target_type, target_id, outcome, request_id, metadata,
-                prev_hash, entry_hash
+                action_code, target_type, target_id, outcome, request_id, source_ip_hint,
+                metadata, prev_hash, entry_hash, chain_version
            FROM audit_events ORDER BY seq ASC",
     )
     .fetch_all(pool)
@@ -147,6 +149,9 @@ async fn verify_audit(
         .map(|r| {
             (
                 chain::ChainedEntry {
+                    // Read from the row, never assumed: the layout a digest was
+                    // computed under is a property of the entry, not of this build.
+                    chain_version: r.chain_version,
                     seq: r.seq,
                     id: r.id,
                     occurred_at: r.occurred_at,
@@ -158,6 +163,7 @@ async fn verify_audit(
                     target_id: r.target_id,
                     outcome: r.outcome,
                     request_id: r.request_id,
+                    source_ip_hint: r.source_ip_hint,
                     metadata: r.metadata,
                 },
                 r.entry_hash,

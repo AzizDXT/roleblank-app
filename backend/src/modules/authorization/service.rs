@@ -45,7 +45,7 @@ use crate::modules::audit::{action, AuditEvent, AuditMetadata, Outcome};
 use crate::modules::authentication::principal::{load_actor, Principal};
 use crate::modules::authorization::delegation::{self, DelegationRequest, RoleSummary};
 use crate::modules::authorization::domain::{
-    ActorContext, PrincipalType, ResourceType, Scope, ScopeType, Target, TargetContext,
+    ActorContext, Effect, PrincipalType, ResourceType, Scope, ScopeType, Target, TargetContext,
 };
 use crate::modules::authorization::{catalog, evaluator, repo};
 use crate::platform::errors::{AppError, AppResult};
@@ -513,12 +513,22 @@ pub async fn get_role(
     principal: &Principal,
     role_id: Uuid,
 ) -> AppResult<RoleDetailResponse> {
-    // Load first, decide second (MODULE_GUIDE §3.1). For an external principal
-    // `require` renders as 404, so authorising after the read discloses nothing.
+    // Decide first, load second — the opposite of the "load first" convention that
+    // `MODULE_GUIDE` §3.1 sets for *resource*-scoped decisions, and deliberately so.
+    //
+    // That convention exists because an object-level decision needs the row: you
+    // cannot ask "may this actor read *this* department" without knowing which
+    // department it is. A role is authorised against `Target::Collection`, which
+    // needs nothing from the row at all, so loading first buys no accuracy and
+    // costs an existence oracle: an unauthorised *internal* principal could tell a
+    // real role id (`403`) from an invented one (`404`). External principals were
+    // never affected — `require` renders as `404` for them either way — but
+    // `audit::get_event` already took this order for the same reason, and one of
+    // the two conventions has to win where the decision is collection-level.
+    state.require(principal, ROLES_READ, &Target::Collection)?;
     let role = repo::find_role(&state.db, role_id)
         .await?
         .ok_or(AppError::NotFound)?;
-    state.require(principal, ROLES_READ, &Target::Collection)?;
     let permissions = repo::role_permissions(&state.db, role.id).await?;
     Ok(detail_response(role, permissions))
 }
@@ -692,10 +702,13 @@ pub async fn update_role(
     let window = state.config.sessions.step_up_window;
 
     let mut tx = state.begin().await?;
-    let Some(role) = repo::find_role_for_update(&mut tx, role_id).await? else {
-        return Err(AppError::NotFound);
-    };
 
+    // Authorise before the row is loaded. The decision is `Target::Collection`, so
+    // it needs nothing from the role, and loading first told an unauthorised
+    // internal principal whether the id was real (`403` for a role that exists,
+    // `404` for one that does not). The refusal is audited against the id that was
+    // *asked for*, which is the thing an intrusion feed wants anyway — a probe for
+    // a role that does not exist is as interesting as a probe for one that does.
     if let Err(e) = state.require(principal, ROLES_UPDATE, &Target::Collection) {
         return Err(refuse(
             state,
@@ -703,7 +716,7 @@ pub async fn update_role(
             principal,
             ip,
             "role.update",
-            Some((TARGET_ROLE, role.id)),
+            Some((TARGET_ROLE, role_id)),
             e,
         )
         .await);
@@ -718,11 +731,15 @@ pub async fn update_role(
             principal,
             ip,
             "role.update",
-            Some((TARGET_ROLE, role.id)),
+            Some((TARGET_ROLE, role_id)),
             e,
         )
         .await);
     }
+
+    let Some(role) = repo::find_role_for_update(&mut tx, role_id).await? else {
+        return Err(AppError::NotFound);
+    };
 
     let (summary, existing_rows) = role_summary_for_delegation(&mut tx, &role).await?;
     // When the permission set is not being replaced, the authoring check still runs
@@ -843,10 +860,9 @@ pub async fn delete_role(
     let window = state.config.sessions.step_up_window;
 
     let mut tx = state.begin().await?;
-    let Some(role) = repo::find_role_for_update(&mut tx, role_id).await? else {
-        return Err(AppError::NotFound);
-    };
 
+    // Authorise before the row is loaded; see `update_role` for why a
+    // collection-level decision must not be taken after an existence check.
     if let Err(e) = state.require(principal, ROLES_DELETE, &Target::Collection) {
         return Err(refuse(
             state,
@@ -854,7 +870,7 @@ pub async fn delete_role(
             principal,
             ip,
             "role.delete",
-            Some((TARGET_ROLE, role.id)),
+            Some((TARGET_ROLE, role_id)),
             e,
         )
         .await);
@@ -867,11 +883,15 @@ pub async fn delete_role(
             principal,
             ip,
             "role.delete",
-            Some((TARGET_ROLE, role.id)),
+            Some((TARGET_ROLE, role_id)),
             e,
         )
         .await);
     }
+
+    let Some(role) = repo::find_role_for_update(&mut tx, role_id).await? else {
+        return Err(AppError::NotFound);
+    };
 
     let (summary, _) = role_summary_for_delegation(&mut tx, &role).await?;
     // Refuses `is_system` for everyone including ROOT, and refuses deleting a role
@@ -964,6 +984,56 @@ fn guard_grant_to_archived(subject: &SubjectFacts) -> AppResult<()> {
 /// The object-level target for an operation on a person.
 fn user_target(actor_id: Uuid, subject_id: Uuid) -> Target {
     Target::Resource(TargetContext::other_user(actor_id, subject_id))
+}
+
+/// Does this role carry anything the catalogue flags dangerous?
+///
+/// Mirrors `identity::invitations::role_is_dangerous`. The duplication is one
+/// three-line predicate over `catalog::is_dangerous`, and the alternative — one
+/// module reaching into the other's private helper — would couple the invitation
+/// flow to the delegation flow for no gain.
+fn role_is_dangerous(summary: &RoleSummary) -> bool {
+    summary
+        .permissions
+        .iter()
+        .any(|(code, _)| catalog::is_dangerous(code))
+}
+
+/// Bring the subject's `mfa_required` flag in line with the authority they now
+/// hold, and report whether this grant is what introduced the mandate.
+///
+/// # Why this is here and not only at invitation acceptance
+///
+/// `catalog::PermissionDef::is_dangerous` is documented as "granting or exercising
+/// it requires a recent step-up, **and mandates that the holder has MFA enrolled**"
+/// (`catalog.rs`). Until this call existed, that mandate was implemented on exactly
+/// one path — `invitations::accept`, which derives the flag from the invited roles
+/// — so dangerous authority added to an *existing* account imposed nothing.
+///
+/// The gap failed closed rather than open: step-up is derived from
+/// `sessions.mfa_verified_at`, which only the three real MFA endpoints write, so an
+/// unenrolled account could never satisfy it and every dangerous use answered
+/// `403 STEP_UP_REQUIRED`. Two things made that an unacceptable place to stop.
+/// First, the safety property rested entirely on "nothing but a real factor can set
+/// `mfa_verified_at`" — a future trusted-device flow, an SSO assertion or an
+/// administrative step-up override would turn a silent onboarding gap into a live
+/// privilege-escalation path, and nothing would have failed to announce it.
+/// Second, the operational symptom was poor: the grant was audited as a success and
+/// the grantee simply could not use it, with no signal to either party.
+///
+/// The flag is only ever raised, never lowered. Removing authority does not clear
+/// it, because we cannot know whether the account still holds a dangerous
+/// permission by some other route, and guessing wrong would silently downgrade an
+/// account's authentication requirement.
+async fn mandate_mfa_if_dangerous(
+    tx: &mut Transaction<'_, Postgres>,
+    subject: &SubjectFacts,
+    dangerous: bool,
+) -> AppResult<bool> {
+    if !dangerous {
+        return Ok(false);
+    }
+    repo::mandate_mfa(tx, subject.id).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1084,6 +1154,12 @@ pub async fn assign_role(
     .await?;
     state.bump_security_version(&mut tx, subject.id).await?;
 
+    // The role's contents, not the endpoint's own `is_dangerous`, decide this:
+    // `iam.roles.assign` is dangerous for the *actor*, which says nothing about
+    // whether the *subject* is now holding dangerous authority.
+    let mfa_mandated =
+        mandate_mfa_if_dangerous(&mut tx, &subject, role_is_dangerous(&summary)).await?;
+
     state
         .audit(
             &mut tx,
@@ -1093,7 +1169,10 @@ pub async fn assign_role(
                     AuditMetadata::new()
                         .id("role_id", role.id)
                         .str("role_code", &role.code)
-                        .str("subject_principal_type", subject.principal_type.as_str()),
+                        .str("subject_principal_type", subject.principal_type.as_str())
+                        // Recorded so the granter can see, in the log, that this
+                        // grant is what put the account into enrolment-required.
+                        .bool("mfa_mandated", mfa_mandated),
                 ),
         )
         .await?;
@@ -1293,12 +1372,7 @@ pub async fn create_override(
     request: CreateOverrideRequest,
 ) -> AppResult<OverrideResponse> {
     let permission_code = validate_permission_code("permission_code", &request.permission_code)?;
-    let effect = v::parse_enum(
-        "effect",
-        &request.effect,
-        crate::modules::authorization::domain::Effect::parse,
-        &["ALLOW", "DENY"],
-    )?;
+    let effect = v::parse_enum("effect", &request.effect, Effect::parse, &["ALLOW", "DENY"])?;
     let scope = parse_override_scope(
         &request.scope,
         request.resource_type.as_deref(),
@@ -1379,6 +1453,16 @@ pub async fn create_override(
     .await?;
 
     state.bump_security_version(&mut tx, subject.id).await?;
+
+    // Only an ALLOW confers authority. A DENY of a dangerous permission removes
+    // reach and must not impose an enrolment the subject did not earn.
+    let mfa_mandated = mandate_mfa_if_dangerous(
+        &mut tx,
+        &subject,
+        effect == Effect::Allow && catalog::is_dangerous(&permission_code),
+    )
+    .await?;
+
     state
         .audit(
             &mut tx,
@@ -1396,7 +1480,8 @@ pub async fn create_override(
                     .str("effect", effect.as_str())
                     .str("scope", scope.scope_type.as_str())
                     .opt_id("resource", scope.resource_id)
-                    .bool("expires", expires_at.is_some()),
+                    .bool("expires", expires_at.is_some())
+                    .bool("mfa_mandated", mfa_mandated),
             ),
         )
         .await?;
@@ -1431,6 +1516,39 @@ pub async fn delete_override(
         .await);
     }
     if let Err(e) = state.require_step_up_for(principal, PERMISSIONS_DELEGATE) {
+        return Err(refuse(
+            state,
+            tx,
+            principal,
+            ip,
+            "override.delete",
+            Some((TARGET_USER, subject.id)),
+            e,
+        )
+        .await);
+    }
+
+    // ROOT before the lookup, matching `assign_role`, `unassign_role` and
+    // `create_override`, and matching ADR-004 layer 4: the owner is refused as a
+    // *subject* before the operation examines anything about the request.
+    //
+    // Before this ordering the row lookup ran first and always returned `None` — the
+    // owner can hold no override, because `create_override` refuses them, they are
+    // the first user bootstrap creates, and ownership is immutable — so the refusal
+    // arrived as `404` rather than `403 ROOT_PROTECTED`. Nothing was exploitable,
+    // and two things were still wrong. The attempt was recorded as an ordinary
+    // `AUTHORIZATION.DENIED` instead of `ROOT.PROTECTION_TRIGGERED`, so probing the
+    // owner through this one route did not appear in the feed that
+    // `root_attack::every_attempt_on_the_owner_is_recorded_and_the_record_cannot_be_erased`
+    // watches; and the invariant rested on a three-step argument about bootstrap
+    // ordering rather than on a guard, which is exactly the reasoning that stops
+    // being true after an unrelated change.
+    //
+    // It runs *after* `require`, not before, for the reason F-06 established on the
+    // department routes: `require` judges the actor and `guard_root` the subject, so
+    // an external principal must be refused for not being allowed to ask before the
+    // system answers a question about who the owner is.
+    if let Err(e) = state.guard_root(subject.is_root) {
         return Err(refuse(
             state,
             tx,

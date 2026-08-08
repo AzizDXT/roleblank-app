@@ -334,11 +334,17 @@ pub async fn revoke_invitation(
     id: Uuid,
 ) -> AppResult<InvitationResponse> {
     let mut tx = state.begin().await?;
+
+    // Authorise before the row is loaded. The decision is `Target::Collection` —
+    // it needs nothing from the invitation — so loading first bought no accuracy
+    // and cost an existence oracle: an unauthorised internal principal received
+    // `403` for a real invitation id and `404` for an invented one, and could
+    // enumerate outstanding invitations without ever being allowed to read one.
+    state.require(principal, PERM_USERS_INVITE, &Target::Collection)?;
+
     let row = repo::find_invitation_for_update(&mut tx, id)
         .await?
         .ok_or(AppError::NotFound)?;
-
-    state.require(principal, PERM_USERS_INVITE, &Target::Collection)?;
 
     let affected = repo::mark_invitation_revoked(&mut tx, row.id).await?;
     if affected == 0 {

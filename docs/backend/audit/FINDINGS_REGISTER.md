@@ -23,7 +23,18 @@ Consolidated across all workstreams. The per-section detail lives in
 and `SECTION_23_26_FINDINGS.md`; the narrative and the verdict are in
 `../FINAL_ACCEPTANCE_REPORT.md`.
 
-The single open MEDIUM is the rate-limiter / audit-growth chain (M-A there).
+**Superseded by the closure phase.** The single MEDIUM recorded below (the
+rate-limiter / audit-growth chain) is now **CLOSED**, and every LOW and INFO item
+has a verdict. Current state:
+
+| Severity | Open after closure |
+|---|---|
+| CRITICAL / HIGH / MEDIUM | **0** |
+| LOW | **0 actionable** |
+| INFO | 7, classified and accepted |
+
+See `../BACKEND_CLOSURE_REPORT.md`, `LOW_INFO_DISPOSITION.md` and
+`../RATE_LIMIT_ARCHITECTURE.md`. This register is kept as the audit-phase record.
 
 ---
 

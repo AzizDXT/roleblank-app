@@ -181,6 +181,16 @@ pub async fn list(
     let project_id = project_id_from_path.or(query.project_id);
 
     let Some(filter) = ScopeFilter::build(&principal.actor, PERM_READ, ResourceType::Task) else {
+        // Routed back through `state.require` so the denial is counted by
+        // `metrics.authz_denial` and written to the `"authorization denied"` log
+        // line with the actor, permission and reason. Raising the error here made a
+        // refused listing invisible to both — and a refused listing is what an
+        // enumeration sweep looks like. See `departments::list` for the convention.
+        // `require` cannot succeed where `ScopeFilter::build` returned `None`: both
+        // read the same effective scopes, and `Target::Collection` asks the
+        // stricter question. The explicit refusal below is the fail-closed
+        // fallback, not an alternative outcome.
+        state.require(principal, PERM_READ, &Target::Collection)?;
         return Err(AppError::AuthorizationDenied.hide_from_external(principal.is_external()));
     };
     if filter.matches_nothing() {
@@ -535,14 +545,15 @@ pub async fn cancel(
         });
     }
 
-    // There is no dedicated `TASK.CANCELLED` action code in the audit catalogue,
-    // and `modules::audit` is not this module's to extend. The event is recorded as
-    // an update whose metadata names the terminal status, which keeps the action
-    // code set stable and still answers "who cancelled this, and when".
+    // Its own action code, not `TASK.UPDATED`. Cancellation is a terminal state
+    // change and an auditor looks for it by name; recording it as an edit meant a
+    // filter on `TASK.CANCELLED` returned an empty page. The metadata still names
+    // the transition, so a reader filtering on `TASK.UPDATED` loses nothing they
+    // could previously answer — the previous status is here as it always was.
     state
         .audit(
             &mut tx,
-            event(action::TASK_UPDATED, principal, ip)
+            event(action::TASK_CANCELLED, principal, ip)
                 .target(TARGET_TASK, row.id)
                 .meta(
                     AuditMetadata::new()
@@ -715,6 +726,8 @@ pub async fn client_list_for_project(
     )?;
 
     if ScopeFilter::build(&principal.actor, PERM_PORTAL_READ, ResourceType::Task).is_none() {
+        // Through `state.require` so the denial is metered and logged; see `list`.
+        state.require(principal, PERM_PORTAL_READ, &Target::Collection)?;
         return Err(AppError::AuthorizationDenied.hide_from_external(principal.is_external()));
     }
 

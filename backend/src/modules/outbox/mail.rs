@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::platform::config::MailProviderKind;
+use crate::platform::config::{MailProviderKind, SmtpConfig};
 use crate::platform::observability::sanitize;
 
 /// What a message is for. A closed enum rather than a string, so a provider can
@@ -296,6 +296,119 @@ impl MailProvider for DisabledProvider {
     }
 }
 
+/// The production transport: SMTP over TLS.
+///
+/// Two properties this type is responsible for, both of which are the sort of thing
+/// that fails silently if got wrong:
+///
+/// 1. **Credentials never cross the wire in clear text.** Either TLS is established
+///    before the first byte (implicit, port 465), or STARTTLS is *required* before
+///    authenticating (port 587). `lettre`'s `starttls_relay` builder rejects a
+///    server that does not offer STARTTLS rather than continuing unencrypted, which
+///    is the difference between required and opportunistic.
+/// 2. **A failure is reported as a failure.** Every error becomes a retryable
+///    `Transport` — except a malformed address, which no amount of retrying fixes —
+///    so the outbox retries and eventually dead-letters loudly. Nothing here can
+///    report success for a message that was not accepted by the server.
+///
+/// The connection pool lives in `AsyncSmtpTransport`, so one instance is shared by
+/// the whole worker rather than reconnecting per message.
+pub struct SmtpProvider {
+    transport: lettre::AsyncSmtpTransport<lettre::Tokio1Executor>,
+    from: lettre::message::Mailbox,
+}
+
+impl SmtpProvider {
+    /// Build the transport, or explain why it could not be built.
+    ///
+    /// Returns `Err` with a non-secret reason. The caller turns that into a startup
+    /// failure: a mail transport that cannot be constructed must stop the process,
+    /// not degrade into a sink that quietly drops invitations.
+    pub fn new(config: &SmtpConfig) -> Result<Self, String> {
+        let from: lettre::message::Mailbox = config
+            .from
+            .parse()
+            .map_err(|_| format!("RB_SMTP_FROM is not a valid address: {}", config.from))?;
+
+        let credentials = lettre::transport::smtp::authentication::Credentials::new(
+            config.username.clone(),
+            config.password.expose().clone(),
+        );
+
+        let builder = if config.implicit_tls {
+            lettre::AsyncSmtpTransport::<lettre::Tokio1Executor>::relay(&config.host)
+        } else {
+            lettre::AsyncSmtpTransport::<lettre::Tokio1Executor>::starttls_relay(&config.host)
+        }
+        .map_err(|e| format!("could not build the SMTP transport: {e}"))?;
+
+        Ok(Self {
+            transport: builder
+                .port(config.port)
+                .credentials(credentials)
+                .timeout(Some(std::time::Duration::from_secs(15)))
+                .build(),
+            from,
+        })
+    }
+}
+
+#[async_trait]
+impl MailProvider for SmtpProvider {
+    async fn send(&self, message: &OutboundMail) -> Result<(), MailError> {
+        use lettre::AsyncTransport;
+
+        let to: lettre::message::Mailbox = message
+            .to
+            .parse()
+            .map_err(|_| MailError::InvalidRecipient)?;
+
+        let email = lettre::Message::builder()
+            .from(self.from.clone())
+            .to(to)
+            .subject(message.subject.clone())
+            .header(lettre::message::header::ContentType::TEXT_PLAIN)
+            .body(message.body_text.clone())
+            .map_err(|_| MailError::InvalidRecipient)?;
+
+        match self.transport.send(email).await {
+            Ok(_) => {
+                // Domain only, never the local part — the local part is frequently
+                // the person's real name and is enough to enumerate accounts from a
+                // log export.
+                tracing::info!(
+                    mail.provider = "smtp",
+                    mail.kind = message.kind.as_str(),
+                    mail.recipient_domain = %sanitize::log_value(recipient_domain(&message.to)),
+                    "mail delivered"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                // The error text can carry the server's response, which may quote
+                // the recipient address. Only the coarse class is logged, and the
+                // error surfaced upward is a fixed string.
+                tracing::warn!(
+                    mail.provider = "smtp",
+                    mail.kind = message.kind.as_str(),
+                    mail.recipient_domain = %sanitize::log_value(recipient_domain(&message.to)),
+                    mail.permanent = e.is_permanent(),
+                    "SMTP delivery failed"
+                );
+                if e.is_permanent() {
+                    Err(MailError::InvalidRecipient)
+                } else {
+                    Err(MailError::Transport("smtp delivery failed"))
+                }
+            }
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "smtp"
+    }
+}
+
 /// Build the configured provider.
 ///
 /// Returns `Arc<dyn ...>` rather than a concrete type so the worker, the services
@@ -308,6 +421,20 @@ pub fn build(kind: &MailProviderKind) -> Arc<dyn MailProvider> {
             Arc::new(FileSinkProvider::new(directory.clone()))
         }
         MailProviderKind::Disabled => Arc::new(DisabledProvider),
+        MailProviderKind::Smtp(smtp) => match SmtpProvider::new(smtp) {
+            Ok(provider) => Arc::new(provider),
+            Err(reason) => {
+                // Reached only if configuration validation passed and the transport
+                // still could not be built. Falling back to `DisabledProvider` keeps
+                // the failure loud — every message errors and the outbox retries —
+                // rather than silently discarding mail.
+                tracing::error!(
+                    reason = %reason,
+                    "SMTP transport could not be constructed; mail will NOT be delivered"
+                );
+                Arc::new(DisabledProvider)
+            }
+        },
     }
 }
 
@@ -316,6 +443,50 @@ mod tests {
     use super::*;
 
     const TOKEN: &str = "rb_reset_7Qw9ZmK2pL5vR8tYnE4hJ6cD1sG0aB3x";
+
+    fn smtp() -> SmtpConfig {
+        SmtpConfig {
+            host: "smtp.example.com".into(),
+            port: 465,
+            implicit_tls: true,
+            username: "no-reply@example.com".into(),
+            password: crate::shared::secret::Secret::new("hunter2".into()),
+            from: "RoleBlank <no-reply@example.com>".into(),
+        }
+    }
+
+    /// A transport that cannot be constructed must say so, not degrade quietly.
+    #[test]
+    fn an_unusable_sender_address_is_refused_at_construction() {
+        let mut config = smtp();
+        config.from = "not an address".into();
+        let error = match SmtpProvider::new(&config) {
+            Err(e) => e,
+            Ok(_) => panic!("an invalid sender address was accepted"),
+        };
+        assert!(error.contains("RB_SMTP_FROM"), "{error}");
+    }
+
+    /// Both TLS modes must build. STARTTLS is the one that could silently degrade to
+    /// plaintext if the wrong builder were used, so it is named explicitly here.
+    #[test]
+    fn both_tls_modes_build_a_transport() {
+        assert!(SmtpProvider::new(&smtp()).is_ok());
+        let mut starttls = smtp();
+        starttls.implicit_tls = false;
+        starttls.port = 587;
+        assert!(SmtpProvider::new(&starttls).is_ok());
+    }
+
+    /// The SMTP configuration holds a password. It must never render it, and the
+    /// `Secret` wrapper must not be defeated by deriving `Debug` on the outer type.
+    #[test]
+    fn the_smtp_configuration_never_renders_its_credentials() {
+        let rendered = format!("{:?}", smtp());
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(!rendered.contains("no-reply@example.com") || rendered.contains("<redacted>"));
+        assert!(rendered.contains("smtp.example.com"));
+    }
 
     fn reset_mail(to: &str) -> OutboundMail {
         OutboundMail {
@@ -557,6 +728,10 @@ mod tests {
             "dev_file"
         );
         assert_eq!(build(&MailProviderKind::Disabled).name(), "disabled");
+        assert_eq!(
+            build(&MailProviderKind::Smtp(Box::new(smtp()))).name(),
+            "smtp"
+        );
     }
 
     #[test]

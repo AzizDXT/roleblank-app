@@ -44,9 +44,13 @@ impl HealthResponse {
 ///   development instance, and the value is one of three fixed words.
 /// * `initialized` — whether bootstrap has happened. Already observable, because
 ///   the bootstrap endpoint answers differently once it has.
-/// * `enabled_features` — the flag keys that are on, so a client knows which
-///   navigation to render. Keys only: never the description, never the sensitivity
-///   marker, never a value.
+/// * `enabled_features` — the **non-sensitive** flag keys that are on, so a client
+///   knows which navigation to render. Keys only: never the description, never the
+///   sensitivity marker, never a value — and never a key that carries the marker.
+///   Withholding the marker while publishing the key it marks was self-defeating:
+///   the marker's whole purpose is to say which toggle is worth attacking, and the
+///   key is the name of the thing to attack. The filter lives in
+///   `repo::enabled_feature_flag_keys`, in the query.
 ///
 /// What is deliberately absent: build/version identifiers, the schema version,
 /// hostnames, the database, the mail provider, pool statistics, uptime and the

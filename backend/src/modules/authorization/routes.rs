@@ -8,22 +8,29 @@
 //!
 //! Two extraction choices are deliberate:
 //!
-//! * path parameters arrive as `String` and are parsed here. axum's own
-//!   `Path<Uuid>` rejection renders `text/plain`, which would break the promise
-//!   that every error in this API is `application/problem+json`.
+//! * path identifiers use `PathId`/`PathIds` from `platform::http::extract`, not
+//!   axum's `Path<Uuid>`, whose rejection renders `text/plain` and echoes the
+//!   caller's input — see the essay at the top of that module. This file used to
+//!   carry its own `parse_id`, written before the shared extractors existed, and
+//!   the two had already diverged: the local one called `raw.trim()`, so
+//!   `/roles/%20{uuid}%20` was accepted here while `/departments/%20{uuid}%20` was
+//!   a `400`. Both sides pinned their own behaviour with a test, so neither would
+//!   ever have noticed the other. Nothing was exploitable — a UUID is a UUID once
+//!   parsed — but two implementations of one rule is the drift this codebase
+//!   argues against everywhere else, and the stricter of the two is the one to
+//!   keep.
 //! * the page query is read with `Query::try_from_uri` rather than as an extractor
 //!   argument, for the same reason.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Query, State};
 use axum::http::{StatusCode, Uri};
 use axum::response::Response;
 use axum::routing::{delete, get};
 use axum::Router;
-use uuid::Uuid;
 
 use crate::app::AppState;
 use crate::platform::errors::{AppError, AppResult};
-use crate::platform::http::extract::{Authenticated, ClientIp, Json};
+use crate::platform::http::extract::{Authenticated, ClientIp, Json, PathId, PathIds};
 use crate::platform::http::idempotency::{self, Idempotent};
 use crate::shared::pagination::{Page, PageQuery};
 
@@ -53,11 +60,6 @@ pub fn router() -> Router<AppState> {
             "/users/{user_id}/permission-overrides/{override_id}",
             delete(delete_override),
         )
-}
-
-fn parse_id(field: &'static str, raw: &str) -> AppResult<Uuid> {
-    Uuid::parse_str(raw.trim())
-        .map_err(|_| AppError::field(field, "INVALID_FORMAT", "Must be a UUID."))
 }
 
 /// `PageQuery` is `deny_unknown_fields`, so an unexpected query parameter is a
@@ -122,9 +124,8 @@ async fn create_role(
 async fn get_role(
     State(state): State<AppState>,
     principal: Authenticated,
-    Path(role_id): Path<String>,
+    PathId(role_id): PathId,
 ) -> AppResult<axum::Json<RoleDetailResponse>> {
-    let role_id = parse_id("role_id", &role_id)?;
     Ok(axum::Json(
         service::get_role(&state, &principal.0, role_id).await?,
     ))
@@ -134,10 +135,9 @@ async fn update_role(
     State(state): State<AppState>,
     principal: Authenticated,
     ip: ClientIp,
-    Path(role_id): Path<String>,
+    PathId(role_id): PathId,
     Json(body): Json<UpdateRoleRequest>,
 ) -> AppResult<axum::Json<RoleDetailResponse>> {
-    let role_id = parse_id("role_id", &role_id)?;
     Ok(axum::Json(
         service::update_role(&state, &principal.0, ip.hint(), role_id, body).await?,
     ))
@@ -147,9 +147,8 @@ async fn delete_role(
     State(state): State<AppState>,
     principal: Authenticated,
     ip: ClientIp,
-    Path(role_id): Path<String>,
+    PathId(role_id): PathId,
 ) -> AppResult<StatusCode> {
-    let role_id = parse_id("role_id", &role_id)?;
     service::delete_role(&state, &principal.0, ip.hint(), role_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -157,9 +156,8 @@ async fn delete_role(
 async fn list_user_roles(
     State(state): State<AppState>,
     principal: Authenticated,
-    Path(user_id): Path<String>,
+    PathId(user_id): PathId,
 ) -> AppResult<axum::Json<UserRolesResponse>> {
-    let user_id = parse_id("user_id", &user_id)?;
     Ok(axum::Json(
         service::list_user_roles(&state, &principal.0, user_id).await?,
     ))
@@ -169,10 +167,9 @@ async fn assign_role(
     State(state): State<AppState>,
     principal: Authenticated,
     ip: ClientIp,
-    Path(user_id): Path<String>,
+    PathId(user_id): PathId,
     Json(body): Json<AssignRoleRequest>,
 ) -> AppResult<(StatusCode, axum::Json<UserRolesResponse>)> {
-    let user_id = parse_id("user_id", &user_id)?;
     let roles = service::assign_role(&state, &principal.0, ip.hint(), user_id, body).await?;
     Ok((StatusCode::CREATED, axum::Json(roles)))
 }
@@ -181,10 +178,8 @@ async fn unassign_role(
     State(state): State<AppState>,
     principal: Authenticated,
     ip: ClientIp,
-    Path((user_id, role_id)): Path<(String, String)>,
+    PathIds(user_id, role_id): PathIds,
 ) -> AppResult<StatusCode> {
-    let user_id = parse_id("user_id", &user_id)?;
-    let role_id = parse_id("role_id", &role_id)?;
     service::unassign_role(&state, &principal.0, ip.hint(), user_id, role_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -192,9 +187,8 @@ async fn unassign_role(
 async fn effective_permissions(
     State(state): State<AppState>,
     principal: Authenticated,
-    Path(user_id): Path<String>,
+    PathId(user_id): PathId,
 ) -> AppResult<axum::Json<EffectivePermissionsResponse>> {
-    let user_id = parse_id("user_id", &user_id)?;
     Ok(axum::Json(
         service::effective_permissions(&state, &principal.0, user_id).await?,
     ))
@@ -203,9 +197,8 @@ async fn effective_permissions(
 async fn list_overrides(
     State(state): State<AppState>,
     principal: Authenticated,
-    Path(user_id): Path<String>,
+    PathId(user_id): PathId,
 ) -> AppResult<axum::Json<OverrideListResponse>> {
-    let user_id = parse_id("user_id", &user_id)?;
     Ok(axum::Json(
         service::list_overrides(&state, &principal.0, user_id).await?,
     ))
@@ -215,10 +208,9 @@ async fn create_override(
     State(state): State<AppState>,
     principal: Authenticated,
     ip: ClientIp,
-    Path(user_id): Path<String>,
+    PathId(user_id): PathId,
     Json(body): Json<CreateOverrideRequest>,
 ) -> AppResult<(StatusCode, axum::Json<OverrideResponse>)> {
-    let user_id = parse_id("user_id", &user_id)?;
     let created = service::create_override(&state, &principal.0, ip.hint(), user_id, body).await?;
     Ok((StatusCode::CREATED, axum::Json(created)))
 }
@@ -227,10 +219,8 @@ async fn delete_override(
     State(state): State<AppState>,
     principal: Authenticated,
     ip: ClientIp,
-    Path((user_id, override_id)): Path<(String, String)>,
+    PathIds(user_id, override_id): PathIds,
 ) -> AppResult<StatusCode> {
-    let user_id = parse_id("user_id", &user_id)?;
-    let override_id = parse_id("override_id", &override_id)?;
     service::delete_override(&state, &principal.0, ip.hint(), user_id, override_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -238,17 +228,6 @@ async fn delete_override(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn path_identifiers_are_uuids_and_a_bad_one_is_a_problem_json_error() {
-        let id = Uuid::now_v7();
-        assert_eq!(parse_id("role_id", &format!("  {id} ")).unwrap(), id);
-        for bad in ["", "1", "not-a-uuid", "../../etc/passwd", "' OR 1=1--"] {
-            let err = parse_id("role_id", bad).unwrap_err();
-            assert_eq!(err.code(), "VALIDATION_FAILED");
-            assert_eq!(err.status(), StatusCode::BAD_REQUEST);
-        }
-    }
 
     #[test]
     fn the_page_query_is_closed() {

@@ -508,15 +508,54 @@ async fn system_info_needs_authentication_and_exposes_three_members() {
     keys.sort_unstable();
     assert_eq!(keys, vec!["enabled_features", "environment", "initialized"]);
     assert_eq!(info.json()["initialized"], json!(true));
-    // Keys only — never the description, never the sensitivity marker.
-    assert_eq!(info.json()["enabled_features"], json!(["client_portal"]));
+    // Keys only — never the description, never the sensitivity marker, and never a
+    // key that *carries* the marker. `client_portal` is the one enabled flag in the
+    // seeded set and it is security-sensitive, so this endpoint reports nothing:
+    // the filter is applied in the query, which is why an unauthorised caller never
+    // has the key in memory. `GET /api/v1/feature-flags` is where a principal
+    // holding `settings.security.write` reads the sensitive rows.
+    assert_eq!(info.json()["enabled_features"], json!([]));
 
-    // The same body is served to an external principal: none of the three fields
-    // is an internal fact.
+    // Now enable a flag that is *not* security-sensitive, so the two audiences can
+    // actually be told apart. Without this the endpoint returns an empty list to
+    // everybody and the envelope below would pass for the wrong reason.
+    sqlx::query(
+        "INSERT INTO feature_flags (key, description, enabled, is_security_sensitive)
+         VALUES ('new_onboarding', 'rollout switch', true, false)",
+    )
+    .execute(&app.db)
+    .await
+    .expect("seed a non-sensitive flag");
+
+    let internal = app.get("/api/v1/system/info", Some(&root.token)).await;
+    internal.assert_status(StatusCode::OK);
+    assert_eq!(
+        internal.json()["enabled_features"],
+        json!(["new_onboarding"]),
+        "an internal principal should see ordinary rollout flags"
+    );
+
+    // The client envelope stops there. A flag does not have to be marked
+    // security-sensitive to be a company-internal fact — a rollout switch names
+    // work in progress — so an external principal gets the deployment identity and
+    // nothing else.
     let contact = create_client_user(&app, &root.token, "contact@acme.test", None).await;
     let as_client = app.get("/api/v1/system/info", Some(&contact.token)).await;
     as_client.assert_status(StatusCode::OK);
-    assert_eq!(as_client.json(), info.json());
+    assert_eq!(
+        as_client.json()["enabled_features"],
+        json!([]),
+        "an external principal was handed the internal capability list"
+    );
+    // The other two fields are deliberately identical for both audiences.
+    assert_eq!(
+        as_client.json()["environment"],
+        internal.json()["environment"]
+    );
+    assert_eq!(
+        as_client.json()["initialized"],
+        internal.json()["initialized"]
+    );
 }
 
 // ===========================================================================

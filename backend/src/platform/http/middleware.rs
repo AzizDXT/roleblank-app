@@ -139,8 +139,24 @@ fn panic_response(_err: Box<dyn std::any::Any + Send + 'static>) -> Response<Bod
 ///   5. method guard
 ///   6. CORS
 ///   7. security headers   — innermost, applied to whatever response emerged
-pub fn apply(router: Router<AppState>, config: &Config) -> Router<AppState> {
+pub fn apply(router: Router<AppState>, state: &AppState) -> Router<AppState> {
+    let config = &state.config;
     router
+        // Innermost, so it runs immediately before the handler's extractors — which
+        // is where the expensive work starts. Resolving a bearer token is a database
+        // query whether or not the token is real, so without this an attacker with
+        // a bag of invented tokens can force one query per request while never
+        // authenticating. Innermost also means its `429` still travels back out
+        // through the header and CORS layers, so a throttled response is shaped like
+        // every other response.
+        //
+        // This is the *coarse* ceiling. The budget that actually governs normal
+        // authenticated traffic is per-principal and lives in the extractors
+        // (`http::extract`), because only there is the principal known.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            general_ip_limit,
+        ))
         .layer(axum::middleware::from_fn(security_headers))
         .layer(cors_layer(config))
         .layer(axum::middleware::from_fn(method_guard))
@@ -163,6 +179,76 @@ pub fn apply(router: Router<AppState>, config: &Config) -> Router<AppState> {
             crate::platform::http::request_id::layer,
         ))
         .layer(CatchPanicLayer::custom(panic_response))
+        // Outermost of all, so it observes the status every other layer produces —
+        // including a panic that `CatchPanicLayer` has just turned into a `500`.
+        .layer(axum::middleware::from_fn_with_state(state.clone(), observe))
+}
+
+/// Record one HTTP request and its latency.
+///
+/// **The matched route pattern, never the URI.** `/api/v1/projects/{id}` is one
+/// series; the raw path would mint one per identifier, which is an
+/// attacker-controlled cardinality explosion in a process-resident map. The metrics
+/// module bounds its own series count, but the bound must not be the only defence —
+/// filling it with junk would evict the series an operator actually needs.
+///
+/// **Outermost on purpose.** A request refused by an inner layer — rate limit, body
+/// limit, authentication — is still a request, and an error rate that counts only
+/// the requests that got through is worse than no error rate, because it looks
+/// healthy exactly when the system is refusing everything.
+///
+/// This closes a gap of the same shape as the rate limiter: `/metrics` and the
+/// comment above it promised request-volume and error-rate telemetry that nothing
+/// recorded. Two series were being written in the entire process.
+async fn observe(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    matched: Option<axum::extract::MatchedPath>,
+    request: Request,
+    next: Next,
+) -> Response {
+    // Read before `next.run` consumes the request.
+    let method = request.method().clone();
+    let route = matched
+        .map(|m| m.as_str().to_string())
+        // No matched path means no route matched: a `404` on an unknown URI. One
+        // series, deliberately, or scanning the address space would be a way to
+        // fill this map.
+        .unwrap_or_else(|| "<unmatched>".to_string());
+
+    let started = std::time::Instant::now();
+    let response = next.run(request).await;
+    state.metrics.latency(started.elapsed());
+    state
+        .metrics
+        .http_request(method.as_str(), &route, response.status().as_u16());
+    response
+}
+
+/// The coarse per-address ceiling, applied before authentication.
+///
+/// Deliberately generous. It is not the control that governs normal traffic — that
+/// is the per-principal budget in `http::extract`, which can tell one user from
+/// another. This layer exists for the population that has no principal yet:
+/// anonymous callers, and callers presenting tokens that will turn out to be
+/// invalid. Both cost a database round trip to find out.
+///
+/// Because it cannot distinguish a busy office from an attacker sharing its
+/// address, its quota is set high enough that ordinary shared-NAT use never reaches
+/// it, and low enough that a single host cannot saturate the pool.
+async fn general_ip_limit(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    crate::platform::http::extract::ClientIp(ip): crate::platform::http::extract::ClientIp,
+    request: Request,
+    next: Next,
+) -> Result<Response, AppError> {
+    crate::platform::http::rate_limit::enforce(
+        state.limiter.as_ref(),
+        &crate::platform::http::rate_limit::keys::general_ip(ip),
+        state.config.rate_limits.general_per_ip_per_minute,
+        crate::platform::http::rate_limit::MINUTE,
+    )
+    .await?;
+    Ok(next.run(request).await)
 }
 
 /// Warn loudly about a development-only posture, once, at startup.

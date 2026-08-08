@@ -307,7 +307,15 @@ pub async fn get_event(
     // A malformed id cannot name a record, so it is `NotFound` rather than a
     // validation error: the two are indistinguishable to the caller and the former
     // does not reflect their input.
-    let Ok(id) = Uuid::parse_str(raw_id.trim()) else {
+    //
+    // The segment is **not** trimmed, matching `extract::parse_path_uuid` exactly.
+    // It used to be, which made this the third of three path parsers in the
+    // codebase with two different acceptance sets — `/audit/events/%20{uuid}%20`
+    // resolved while `/departments/%20{uuid}%20` was refused. `PathId` is not used
+    // directly here only because this route's contract is "a malformed id is a
+    // `404`", and `PathId` correctly raises a `400`; the acceptance set is now
+    // identical either way.
+    let Ok(id) = Uuid::parse_str(raw_id) else {
         return Err(AppError::NotFound);
     };
 

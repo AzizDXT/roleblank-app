@@ -72,7 +72,15 @@ pub const ROUTE_TABLE: &[RouteSpec] = &[
     // --- authentication -------------------------------------------------------
     r("POST", "/api/v1/auth/login", Anonymous, None, false),
     r("POST", "/api/v1/auth/refresh", Anonymous, None, false),
-    r("POST", "/api/v1/auth/logout", Authenticated, None, false),
+    // `MfaPending`, matching the handler, which uses `MfaPendingSession`.
+    //
+    // Declared `Authenticated` until the closure audit, which is the wrong way round
+    // for a contract: the table is what the security matrix and the OpenAPI document
+    // are generated from, so it promised a stricter posture than the code enforced.
+    // The *implementation* is the correct one — ending your own session only ever
+    // reduces access, and a user who cannot complete MFA must still be able to log
+    // out rather than be stranded with a live session they cannot use.
+    r("POST", "/api/v1/auth/logout", MfaPending, None, false),
     r(
         "POST",
         "/api/v1/auth/logout-all",
@@ -707,7 +715,7 @@ pub fn build(state: AppState) -> Router {
         .merge(crate::modules::tasks::router())
         .nest("/api/v1", v1);
 
-    middleware::apply(router, &state.config).with_state(state)
+    middleware::apply(router, &state).with_state(state)
 }
 
 #[cfg(test)]
@@ -866,12 +874,17 @@ mod tests {
             .collect();
         for path in &pending {
             assert!(
-                path.starts_with("/api/v1/auth/mfa/") || *path == "/api/v1/auth/me",
+                path.starts_with("/api/v1/auth/mfa/")
+                    || *path == "/api/v1/auth/me"
+                    // Ending your own session only reduces access, and a user who
+                    // cannot complete MFA must not be stranded holding a live session
+                    // they can neither use nor revoke.
+                    || *path == "/api/v1/auth/logout",
                 "`{path}` is reachable by a pending-MFA session but is not an MFA endpoint"
             );
         }
         assert!(
-            pending.len() <= 6,
+            pending.len() <= 7,
             "the pending-MFA surface grew to {}",
             pending.len()
         );

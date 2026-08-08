@@ -22,6 +22,7 @@ use crate::app::AppState;
 use crate::modules::authentication::principal::{self, Principal};
 use crate::modules::settings::validate_key;
 use crate::platform::errors::AppError;
+use crate::platform::http::rate_limit;
 use crate::platform::observability::sanitize;
 
 /// The effective client address, honouring proxy headers only from a trusted peer.
@@ -132,14 +133,72 @@ where
         let token = bearer_from(parts)?;
         let principal = principal::authenticate(&app.db, &token).await?;
 
+        // Charged **before** the MFA gate, not after.
+        //
+        // Ordering these the other way round left a hole that the live reproduction
+        // caught: a session that has proved a password but not a second factor is
+        // refused by the gate below, and if that refusal happens first the request
+        // never reaches the limiter. A principal in that state could then repeat the
+        // request indefinitely, paying nothing while the server paid a session
+        // lookup each time — which is the same "cheap for the attacker, expensive
+        // for the defender" shape the limiter exists to remove.
+        //
+        // The principal is fully known at this point, so charging here is honest:
+        // the budget belongs to the account, and being mid-MFA does not make the
+        // account someone else.
+        general_principal_limit(&app, &principal).await?;
+
         // The MFA gate. A password-only session belonging to a user who must use
         // MFA can reach nothing but the MFA endpoints, so there is no window in
         // which a privileged user operates without a second factor.
         if principal.session.pending_mfa {
             return Err(AppError::MfaRequired);
         }
+
         Ok(Authenticated(principal))
     }
+}
+
+/// Charge one unit of the general authenticated budget.
+///
+/// **Placement.** This runs after the principal is known and *before* the handler
+/// does any authorisation or resource work. That ordering is the point of the whole
+/// control: the defect it closes was that being refused cost the system a database
+/// authorisation query and a committed audit row, while costing the attacker one
+/// cheap HTTP request. A refusal that is expensive for the defender and free for
+/// the attacker is not a defence.
+///
+/// **It does not replace authorisation.** Every authorisation decision still runs
+/// exactly as before; this only bounds how often a principal may ask. A request
+/// that passes the limiter is no more authorised than it was.
+///
+/// **Keyed on the user, not the session.** Sessions are cheap to mint with stolen
+/// credentials, so a session key would let one compromised account multiply its
+/// budget at will. A user key also means an office behind a single NAT is many
+/// separate budgets rather than one shared one — the failure mode that made an
+/// address-keyed limiter unusable for this product.
+///
+/// **ROOT gets a larger budget, not an exemption.** An unbounded owner session is
+/// still a way to hurt the system, and the owner is the likeliest target of a
+/// stolen-token attack. But the owner is also the account that puts the company
+/// back together during an incident, so throttling it to an ordinary quota at
+/// exactly the wrong moment would be self-inflicted. The bucket refills
+/// continuously, so even an exhausted budget recovers on its own: there is no state
+/// in which the owner is locked out and must wait for an administrator who does not
+/// exist.
+async fn general_principal_limit(app: &AppState, principal: &Principal) -> Result<(), AppError> {
+    let quota = if principal.is_root() {
+        app.config.rate_limits.general_root_per_minute
+    } else {
+        app.config.rate_limits.general_per_principal_per_minute
+    };
+    rate_limit::enforce(
+        app.limiter.as_ref(),
+        &rate_limit::keys::general_principal(principal.user_id()),
+        quota,
+        rate_limit::MINUTE,
+    )
+    .await
 }
 
 /// A session that has authenticated with a password but not yet completed MFA.
@@ -168,9 +227,15 @@ where
         let token = bearer_from(parts)?;
         // Accepts both pending and completed sessions: an already-verified user
         // may still legitimately manage their factors.
-        Ok(MfaPendingSession(
-            principal::authenticate(&app.db, &token).await?,
-        ))
+        let principal = principal::authenticate(&app.db, &token).await?;
+        // Charged here too. The MFA routes carry their own, far stricter,
+        // per-session budget, so in practice that one binds first and this is not a
+        // meaningful second charge — but this extractor also serves routes that are
+        // *not* MFA verification, and leaving those uncharged would have left a
+        // gap in the coverage for exactly the population that has proved a password
+        // and nothing else.
+        general_principal_limit(&app, &principal).await?;
+        Ok(MfaPendingSession(principal))
     }
 }
 

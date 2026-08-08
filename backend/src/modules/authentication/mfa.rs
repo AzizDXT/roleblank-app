@@ -584,6 +584,12 @@ pub async fn disable(
     hints: &ClientHints,
 ) -> AppResult<dto::MfaDisabledResponse> {
     state.require_step_up(principal)?;
+    // Every other MFA endpoint meters itself; this one did not, and it is the one
+    // that turns the second factor off. Placed after `require_step_up` so a session
+    // that cannot pass the gate at all does not consume the account's quota — that
+    // would let an attacker with a stolen password-only token deny the real owner
+    // the ability to manage their own factor.
+    enforce_mfa_limits(state, principal).await?;
 
     if principal.session.mfa_required {
         return Err(AppError::conflict(

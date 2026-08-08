@@ -46,6 +46,7 @@ pub struct AuditEventRow {
 /// A row plus its chain material. Only the verifier ever sees this shape.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ChainRow {
+    pub chain_version: i16,
     pub seq: i64,
     pub id: Uuid,
     pub occurred_at: OffsetDateTime,
@@ -57,6 +58,7 @@ pub struct ChainRow {
     pub target_id: Option<Uuid>,
     pub outcome: String,
     pub request_id: Option<String>,
+    pub source_ip_hint: Option<String>,
     pub metadata: serde_json::Value,
     pub prev_hash: Option<Vec<u8>>,
     pub entry_hash: Vec<u8>,
@@ -65,11 +67,15 @@ pub struct ChainRow {
 impl ChainRow {
     /// Split into the shape `chain::verify_run` consumes.
     ///
-    /// `source_ip_hint` is absent from `ChainedEntry` and is therefore **not
-    /// covered by the chain**. That is a property of the chain's field list (see
-    /// `chain::ChainedEntry`), and this conversion must not paper over it.
+    /// Every column the chain covers is carried across verbatim, including
+    /// `chain_version`, which selects the layout the digest was computed under.
+    /// The version must come from the row and never from `CURRENT_CHAIN_VERSION`:
+    /// assuming the current layout would make every entry written under an earlier
+    /// one report as tampered, which is the failure mode that teaches an auditor to
+    /// ignore the verifier.
     pub fn into_verifiable(self) -> StoredEntry {
         let entry = ChainedEntry {
+            chain_version: self.chain_version,
             seq: self.seq,
             id: self.id,
             occurred_at: self.occurred_at,
@@ -81,6 +87,7 @@ impl ChainRow {
             target_id: self.target_id,
             outcome: self.outcome,
             request_id: self.request_id,
+            source_ip_hint: self.source_ip_hint,
             metadata: self.metadata,
         };
         (entry, self.entry_hash, self.prev_hash)
@@ -143,9 +150,10 @@ const FIND_EVENT: &str = "\
 
 /// The only statement that reads chain material.
 const CHAIN_RUN: &str = "\
-    SELECT a.seq, a.id, a.occurred_at, a.actor_user_id, a.actor_principal_type, \
-           a.actor_session_id, a.action_code, a.target_type, a.target_id, a.outcome, \
-           a.request_id, a.metadata, a.prev_hash, a.entry_hash \
+    SELECT a.chain_version, a.seq, a.id, a.occurred_at, a.actor_user_id, \
+           a.actor_principal_type, a.actor_session_id, a.action_code, a.target_type, \
+           a.target_id, a.outcome, a.request_id, a.source_ip_hint, a.metadata, \
+           a.prev_hash, a.entry_hash \
       FROM audit_events a \
      WHERE a.seq >= $1 \
      ORDER BY a.seq ASC \
@@ -289,6 +297,13 @@ mod tests {
             "a.target_id",
             "a.outcome",
             "a.request_id",
+            // Covered from chain version 2. `chain_version` itself is covered too:
+            // it selects the layout, so a verifier that did not fetch it would
+            // either assume the current one — reporting every older entry as
+            // tampered — or leave the marker outside the digest, where an attacker
+            // could edit it to select the weaker layout.
+            "a.source_ip_hint",
+            "a.chain_version",
             "a.metadata",
         ] {
             assert!(

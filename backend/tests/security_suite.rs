@@ -60,3 +60,10 @@ mod session_attacks;
 /// session. Complements `session_attacks`, which covers the session lifecycle.
 #[path = "security/auth_attacks.rs"]
 mod auth_attacks;
+
+/// The residue of the final acceptance audit: one regression per LOW/INFO finding
+/// that was closed rather than accepted. Named for the state of the report rather
+/// than for a boundary, because the findings span modules and their common
+/// property is that each was harmless alone.
+#[path = "security/residual_hardening.rs"]
+mod residual_hardening;

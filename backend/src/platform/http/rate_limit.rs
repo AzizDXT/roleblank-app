@@ -271,13 +271,50 @@ pub mod keys {
     pub fn bootstrap_ip(ip: IpAddr) -> String {
         format!("bootstrap:ip:{ip}")
     }
+    /// The general authenticated budget.
+    ///
+    /// Keyed on the **user id**, not the session and not the address. The session
+    /// is wrong because an attacker holding stolen credentials can mint sessions
+    /// freely and would multiply their budget by doing so; the address is wrong
+    /// because an office behind one NAT is many innocent people who would share a
+    /// budget with each other and with anyone who compromised one of them.
     pub fn general_principal(user_id: uuid::Uuid) -> String {
         format!("general:user:{user_id}")
     }
+    /// The coarse pre-authentication ceiling.
+    ///
+    /// Address-keyed by necessity: before a token is resolved there is no principal
+    /// to key on, and resolving it costs a database query whether or not the token
+    /// is genuine. Generous, because at this point a corporate NAT and an attacker
+    /// look identical.
     pub fn general_ip(ip: IpAddr) -> String {
         format!("general:ip:{ip}")
     }
 }
+
+/// Consume one unit of a bucket, or turn the refusal into the `429` contract.
+///
+/// Lives here rather than in a module service because both the pre-authentication
+/// layer and the per-principal check in the extractors need it, and a second copy
+/// is a second place for the response contract to drift.
+pub async fn enforce(
+    limiter: &dyn RateLimiter,
+    key: &str,
+    quota: u32,
+    window: Duration,
+) -> Result<(), crate::platform::errors::AppError> {
+    match limiter.check(key, quota, window).await {
+        RateLimitDecision::Allowed { .. } => Ok(()),
+        RateLimitDecision::Limited {
+            retry_after_seconds,
+        } => Err(crate::platform::errors::AppError::TooManyRequests {
+            retry_after_seconds,
+        }),
+    }
+}
+
+/// The window every "per minute" quota is measured over.
+pub const MINUTE: Duration = Duration::from_secs(60);
 
 #[cfg(test)]
 mod tests {

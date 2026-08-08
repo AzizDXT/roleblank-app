@@ -28,6 +28,20 @@ type HmacSha256 = Hmac<Sha256>;
 /// field without changing the digest.
 const ABSENT: u64 = u64::MAX;
 
+/// The layout every entry written by this build is hashed under.
+///
+/// Version 1 covered every substantive column except `source_ip_hint`. That was
+/// consistent with the rule stated on `ChainedEntry` — a field not in the struct is
+/// not protected — but it left the one column an adversary holding the database
+/// could rewrite freely, and "an adversary holding the database" is the entire
+/// threat this chain is built against. Version 2 covers it.
+///
+/// Old rows keep verifying because the version is stored per row and selects the
+/// layout, and a row cannot be silently downgraded: the version is itself hashed
+/// under v2, so rewriting a v2 row's marker to `1` changes the bytes and the digest
+/// stops matching. Only the key can move a row between layouts.
+pub const CURRENT_CHAIN_VERSION: i16 = 2;
+
 /// The fields that are covered by the chain.
 ///
 /// Everything an auditor would care about is here. A field NOT in this struct is
@@ -36,6 +50,10 @@ const ABSENT: u64 = u64::MAX;
 /// automatic one.
 #[derive(Debug, Clone)]
 pub struct ChainedEntry {
+    /// Which layout this entry's digest was computed under. Read from the row, not
+    /// assumed: a verifier that assumed `CURRENT_CHAIN_VERSION` would report every
+    /// pre-existing entry as tampered the first time the layout changed.
+    pub chain_version: i16,
     pub seq: i64,
     pub id: Uuid,
     pub occurred_at: OffsetDateTime,
@@ -47,6 +65,11 @@ pub struct ChainedEntry {
     pub target_id: Option<Uuid>,
     pub outcome: String,
     pub request_id: Option<String>,
+    /// Covered from version 2 onwards. Ignored by the v1 layout, which is why a v1
+    /// row's value can still be rewritten undetectably — that is a property of the
+    /// rows already written, not of this code, and `WHERE chain_version = 1` makes
+    /// the affected set enumerable.
+    pub source_ip_hint: Option<String>,
     pub metadata: serde_json::Value,
 }
 
@@ -108,10 +131,26 @@ fn canonical_json(value: &serde_json::Value) -> String {
 }
 
 /// The exact byte sequence that gets HMAC'd.
+///
+/// # Why the layout branches on the version
+///
+/// The v1 byte sequence is frozen, because rows written under it exist and their
+/// digests were computed over exactly these bytes. Reproducing it is the only way
+/// an already-written chain stays verifiable across a layout change, and a chain
+/// that reports tampering after an upgrade is worse than one that never covered the
+/// field: an auditor who has learned to expect false positives will not act on a
+/// true one.
+///
+/// The version marker is emitted only from v2 onwards, for the same reason — adding
+/// it unconditionally would have changed the v1 bytes. From v2 it is inside the
+/// digest, so it cannot be edited to select a weaker layout.
 pub fn canonical_bytes(entry: &ChainedEntry, prev_hash: Option<&[u8]>) -> Vec<u8> {
     let mut buf = Vec::with_capacity(256);
 
     push_field(&mut buf, prev_hash);
+    if entry.chain_version >= 2 {
+        push_field(&mut buf, Some(&entry.chain_version.to_be_bytes()));
+    }
     push_field(&mut buf, Some(&entry.seq.to_be_bytes()));
     push_field(&mut buf, Some(entry.id.as_bytes()));
     // Nanoseconds since the epoch, big-endian. i128 so pre-1970 and far-future
@@ -146,6 +185,9 @@ pub fn canonical_bytes(entry: &ChainedEntry, prev_hash: Option<&[u8]>) -> Vec<u8
     );
     push_field(&mut buf, Some(entry.outcome.as_bytes()));
     push_field(&mut buf, entry.request_id.as_deref().map(str::as_bytes));
+    if entry.chain_version >= 2 {
+        push_field(&mut buf, entry.source_ip_hint.as_deref().map(str::as_bytes));
+    }
     push_field(&mut buf, Some(canonical_json(&entry.metadata).as_bytes()));
 
     buf
@@ -278,6 +320,7 @@ mod tests {
 
     fn entry(seq: i64, action: &str) -> ChainedEntry {
         ChainedEntry {
+            chain_version: CURRENT_CHAIN_VERSION,
             seq,
             id: Uuid::from_u128(seq as u128 + 1),
             occurred_at: OffsetDateTime::from_unix_timestamp(1_700_000_000 + seq).unwrap(),
@@ -289,6 +332,7 @@ mod tests {
             target_id: Some(Uuid::from_u128(7)),
             outcome: "SUCCESS".into(),
             request_id: Some("req-abc12345".into()),
+            source_ip_hint: Some("198.51.100.7".into()),
             metadata: json!({"b": 2, "a": 1}),
         }
     }
@@ -364,6 +408,25 @@ mod tests {
             (
                 "request_id",
                 Box::new(|e: &mut ChainedEntry| e.request_id = Some("req-other1".into())),
+            ),
+            // Added with chain version 2. Rewriting where an action came from is
+            // the single most useful edit an intruder can make to a log they cannot
+            // delete, and until v2 it was the one substantive column the chain did
+            // not cover.
+            (
+                "source_ip_hint",
+                Box::new(|e: &mut ChainedEntry| e.source_ip_hint = Some("203.0.113.9".into())),
+            ),
+            (
+                "source_ip_hint_to_null",
+                Box::new(|e: &mut ChainedEntry| e.source_ip_hint = None),
+            ),
+            // The version marker selects the layout, so it must not be editable:
+            // downgrading a v2 row to v1 would otherwise remove `source_ip_hint`
+            // from the digest and hand the attacker back the field v2 protects.
+            (
+                "chain_version_downgrade",
+                Box::new(|e: &mut ChainedEntry| e.chain_version = 1),
             ),
             (
                 "timestamp",
@@ -545,6 +608,60 @@ mod tests {
                 last_seq: 0
             }
         );
+    }
+
+    /// **The version 1 byte layout is frozen.**
+    ///
+    /// Rows written under it exist, and their stored digests were computed over
+    /// exactly these bytes. If this test fails, every audit entry written before the
+    /// v2 upgrade will report as tampered — and a verifier that cries wolf on an
+    /// untouched chain is worse than one that never covered the field, because an
+    /// auditor learns to ignore it.
+    ///
+    /// The digest is hard-coded rather than recomputed from the same code it is
+    /// meant to pin. A test that asks the implementation what the answer is cannot
+    /// detect the implementation changing its mind.
+    #[test]
+    fn the_version_1_layout_is_frozen() {
+        let mut legacy = entry(1, "USER.CREATED");
+        legacy.chain_version = 1;
+        // Set on the struct, and deliberately *not* covered by the v1 layout. That
+        // is the gap v2 closes; here it must make no difference to the digest.
+        legacy.source_ip_hint = Some("198.51.100.7".into());
+
+        let mut without_ip = legacy.clone();
+        without_ip.source_ip_hint = None;
+        assert_eq!(
+            entry_hash(&key(), &legacy, None),
+            entry_hash(&key(), &without_ip, None),
+            "the v1 layout must ignore source_ip_hint exactly as it always did"
+        );
+
+        assert_eq!(
+            hex(&entry_hash(&key(), &legacy, None)),
+            V1_GOLDEN_DIGEST,
+            "the version 1 byte layout changed; every already-written entry now fails verification"
+        );
+
+        // v1 and v2 over the same entry must differ, or the marker is decorative.
+        assert_ne!(
+            entry_hash(&key(), &legacy, None),
+            entry_hash(&key(), &entry(1, "USER.CREATED"), None),
+            "the version marker did not change the digest"
+        );
+    }
+
+    /// The digest of `entry(1, "USER.CREATED")` at `chain_version = 1`.
+    ///
+    /// Produced by an **independent** implementation of the layout (a short script
+    /// that emits the length-prefixed fields and HMACs them) rather than by calling
+    /// `entry_hash` and copying its answer. A golden vector taken from the code it
+    /// pins agrees with that code by construction and pins nothing.
+    const V1_GOLDEN_DIGEST: &str =
+        "38903af6024cabd890f310b8a030586df8be302bfc801e14db0e721b8b44185e";
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
     #[test]

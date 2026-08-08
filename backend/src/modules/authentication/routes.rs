@@ -10,10 +10,15 @@
 //!   * `Authenticated` rejects an MFA-pending session automatically and is used
 //!     for everything a password-only session must not reach.
 //!   * `MfaPendingSession` accepts pending *and* completed sessions. It is used by
-//!     the MFA endpoints, and by `/me` and `/logout`, which
-//!     `docs/backend/03-authentication.md` §4 explicitly lists as reachable from a
-//!     pending session — `/me` must be, or a client stuck in
+//!     the MFA *enrolment and verification* endpoints, and by `/me` and `/logout`,
+//!     which `docs/backend/03-authentication.md` §4 explicitly lists as reachable
+//!     from a pending session — `/me` must be, or a client stuck in
 //!     `MFA_ENROLLMENT_REQUIRED` could never discover why.
+//!
+//! The two MFA endpoints that *weaken* the second factor — `/mfa/disable` and
+//! `/mfa/recovery/regenerate` — take `Authenticated`, matching what `ROUTE_TABLE`
+//! declares for them. Being an MFA route is not the criterion; whether a
+//! password-only session may reach it is.
 //!
 //! The router is returned unmounted. It expects to be nested at `/api/v1/auth`.
 
@@ -223,9 +228,21 @@ async fn mfa_recovery_verify(
 
 /// Step-up gated inside the service (§8): minting a fresh set of bypass
 /// credentials from a merely-password-authenticated session would defeat MFA.
+///
+/// `Authenticated`, not `MfaPendingSession`, and this is the one place in this file
+/// where the two differ from what the endpoint *does*. `ROUTE_TABLE` has always
+/// declared both this route and `/mfa/disable` as `Authenticated` with
+/// `step_up = true`, while the handlers took the pending-tolerant extractor and
+/// relied on `state.require_step_up` inside the service to exclude a pending
+/// session. That exclusion was correct — a pending session has by construction
+/// never verified a factor, so the window can never be satisfied — but it was a
+/// consequence of one line in a service rather than a property of the type, and
+/// `Authenticated` exists precisely so that a handler which forgets to think about
+/// MFA gets the safe behaviour. The service check stays: two independent barriers,
+/// not one moved.
 async fn mfa_recovery_regenerate(
     State(state): State<AppState>,
-    MfaPendingSession(principal): MfaPendingSession,
+    Authenticated(principal): Authenticated,
     ip: ClientIp,
     agent: UserAgentHint,
 ) -> AppResult<impl IntoResponse> {
@@ -234,9 +251,13 @@ async fn mfa_recovery_regenerate(
 }
 
 /// Step-up gated, and refused outright for an account with `mfa_required`.
+///
+/// `Authenticated` for the same reason as `mfa_recovery_regenerate` above: turning
+/// off the second factor is the last thing a half-authenticated session should be
+/// able to attempt, and the extractor now says so.
 async fn mfa_disable(
     State(state): State<AppState>,
-    MfaPendingSession(principal): MfaPendingSession,
+    Authenticated(principal): Authenticated,
     ip: ClientIp,
     agent: UserAgentHint,
 ) -> AppResult<impl IntoResponse> {

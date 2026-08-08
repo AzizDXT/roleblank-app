@@ -645,20 +645,20 @@ async fn a_referenced_user_cannot_be_erased() {
     assert_eq!(still_there.0, 1);
 }
 
-/// Single-use tokens: what the *database* does and does not guarantee.
+/// Single-use tokens, in both layers.
 ///
-/// **This test documents a deliberate boundary rather than only a defence.** The
-/// schema makes it impossible for two rows to share a token digest, so a stolen
-/// link can never be duplicated into a second live credential. It does **not**
-/// constrain `consumed_at`: nothing at the database level stops a second UPDATE
-/// re-clearing it, because single use is enforced by the consuming statement's
-/// `WHERE consumed_at IS NULL` gate inside a `FOR UPDATE` transaction.
+/// The schema makes it impossible for two rows to share a token digest, so a stolen
+/// link can never be duplicated into a second live credential. Consumption used to
+/// be enforced only by the consuming statement's `WHERE consumed_at IS NULL` gate
+/// inside a `FOR UPDATE` transaction — proven to hold under contention by the race
+/// suite, but held in one layer, so a single stray `UPDATE` re-opened a spent
+/// credential. Migration 0011 makes `consumed_at` immutable once set.
 ///
-/// That split is worth pinning explicitly. A reader who assumes the database
-/// enforces single use would be wrong, and the race suite — not this file — is what
-/// proves the application-level gate actually holds under contention.
+/// The application gate is still the primary control and the race suite still
+/// proves it. This is the second layer, for the case the audit's threat model
+/// actually names: someone with SQL access rather than someone racing the API.
 #[tokio::test]
-async fn a_token_digest_is_unique_but_consumption_is_an_application_invariant() {
+async fn a_token_digest_is_unique_and_consumption_is_final() {
     let app = TestApp::spawn().await;
     let (_, employee, _) = seed(&app.db).await;
 
@@ -685,33 +685,130 @@ async fn a_token_digest_is_unique_but_consumption_is_an_application_invariant() 
     // A *different* digest is fine — the constraint is on the secret, not the user.
     insert("62").await.expect("a second, distinct token");
 
-    // And the honest half: the database does not itself prevent un-consuming.
+    // Consumption is now final in the database as well as in the application.
+    // Migration 0011 added `rb_consumption_is_final`, because a spent single-use
+    // credential that can be re-opened by one UPDATE is a used password-reset link
+    // that works again, a rotated refresh token that is live alongside its
+    // successor, and a burnt recovery code that is a working MFA bypass again.
     sqlx::query("UPDATE password_reset_tokens SET consumed_at = now()")
         .execute(&app.db)
         .await
         .expect("consume");
-    let reopened = sqlx::query("UPDATE password_reset_tokens SET consumed_at = NULL")
+    assert_refused(
+        sqlx::query("UPDATE password_reset_tokens SET consumed_at = NULL")
+            .execute(&app.db)
+            .await,
+        "re-opening a consumed password reset token",
+    );
+    // Rewriting *when* it was spent falsifies the same record without ever making
+    // the column NULL, so the rule is immutability rather than "not back to NULL".
+    assert_refused(
+        sqlx::query("UPDATE password_reset_tokens SET consumed_at = now() - interval '1 day'")
+            .execute(&app.db)
+            .await,
+        "back-dating a consumption timestamp",
+    );
+
+    // An unrelated column on a consumed row is still writable: the guard is about
+    // the consumption record, not a blanket freeze that would break rotation
+    // book-keeping such as `session_refresh_tokens.replaced_by`.
+    sqlx::query("UPDATE password_reset_tokens SET expires_at = now() + interval '1 hour'")
         .execute(&app.db)
         .await
-        .expect("the database does not constrain consumed_at");
-    assert_eq!(
-        reopened.rows_affected(),
-        2,
-        "if this ever starts failing, the schema gained a guard and the invariant \
-         table in the audit report needs updating"
-    );
+        .expect("an unrelated column on a consumed row remains writable");
 }
 
-/// Converting a principal between types is guarded **only for the owner**.
+/// The same rule on the two other single-use credential tables.
 ///
-/// Recorded as a measured boundary, not as a pass. The `CHECK` restricts the value
-/// set and `rb_users_protect_root` pins the owner, but an ordinary employee's
-/// `principal_type` can be rewritten by anyone holding the migration role — and the
-/// client-envelope triggers fire on membership and grant writes, not on this
-/// column, so the conversion leaves the user's existing INTERNAL role assignments
-/// in place. The application is the only thing that prevents this transition.
+/// `recovery_codes` was not named in the audit finding and is included anyway: it
+/// is the same column, the same statement shape and the same single-use claim, and
+/// it is the one whose re-opening walks straight past a second factor.
 #[tokio::test]
-async fn a_non_owner_principal_transition_is_constrained_only_by_the_value_set() {
+async fn consumption_is_final_on_every_single_use_credential_table() {
+    let app = TestApp::spawn().await;
+    let (_, employee, _) = seed(&app.db).await;
+
+    let session_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO sessions (id, user_id, access_token_hash, access_expires_at,
+                               idle_expires_at, absolute_expires_at, auth_level)
+         VALUES ($1, $2, decode(repeat('a1',32),'hex'), now() + interval '1 hour',
+                 now() + interval '1 day', now() + interval '7 days', 'PASSWORD')",
+    )
+    .bind(session_id)
+    .bind(employee)
+    .execute(&app.db)
+    .await
+    .expect("seed a session");
+
+    let spent_token = Uuid::now_v7();
+    let successor = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO session_refresh_tokens (id, session_id, token_hash, generation,
+                                             expires_at, consumed_at)
+         VALUES ($1, $3, decode(repeat('b2',32),'hex'), 0,
+                 now() + interval '1 day', now()),
+                ($2, $3, decode(repeat('b3',32),'hex'), 1,
+                 now() + interval '1 day', NULL)",
+    )
+    .bind(spent_token)
+    .bind(successor)
+    .bind(session_id)
+    .execute(&app.db)
+    .await
+    .expect("seed a rotated pair of refresh tokens");
+
+    sqlx::query(
+        "INSERT INTO recovery_codes (id, user_id, batch_id, code_hash, consumed_at)
+         VALUES ($1, $2, $3, decode(repeat('c3',32),'hex'), now())",
+    )
+    .bind(Uuid::now_v7())
+    .bind(employee)
+    .bind(Uuid::now_v7())
+    .execute(&app.db)
+    .await
+    .expect("seed a consumed recovery code");
+
+    assert_refused(
+        sqlx::query("UPDATE session_refresh_tokens SET consumed_at = NULL WHERE id = $1")
+            .bind(spent_token)
+            .execute(&app.db)
+            .await,
+        "re-opening a rotated refresh token",
+    );
+    assert_refused(
+        sqlx::query("UPDATE recovery_codes SET consumed_at = NULL")
+            .execute(&app.db)
+            .await,
+        "re-opening a burnt recovery code",
+    );
+
+    // Rotation book-keeping still works on a consumed row: `replaced_by` is written
+    // by the application *after* the row is consumed, so a blanket freeze on
+    // consumed rows would have broken refresh rotation outright.
+    sqlx::query("UPDATE session_refresh_tokens SET replaced_by = $2 WHERE id = $1")
+        .bind(spent_token)
+        .bind(successor)
+        .execute(&app.db)
+        .await
+        .expect("`replaced_by` is written after consumption and must remain writable");
+}
+
+/// Converting a principal between types cannot strand the grants the envelope
+/// would have refused on insert.
+///
+/// Three triggers enforce the client envelope at the point rows are written, and
+/// every one of them reads `users.principal_type` — so none of them fired when that
+/// column was the thing that changed. `UPDATE users SET principal_type = 'CLIENT'`
+/// used to succeed against a user holding INTERNAL-only roles and live department
+/// memberships, producing a principal the evaluator treats as external while the
+/// membership tables still treat them as staff. Migration 0011 re-checks the
+/// envelope on the transition.
+///
+/// The guard is a re-check and not a ban: a conversion that leaves nothing stranded
+/// still succeeds, which is what keeps a legitimate operator repair possible.
+#[tokio::test]
+async fn a_non_owner_principal_transition_cannot_strand_an_incompatible_grant() {
     let app = TestApp::spawn().await;
     let (_, employee, _) = seed(&app.db).await;
 
@@ -724,24 +821,25 @@ async fn a_non_owner_principal_transition_is_constrained_only_by_the_value_set()
         "an unknown principal type",
     );
 
+    let assignment = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO user_role_assignments (id, user_id, role_id)
          VALUES ($1, $2, '00000000-0000-7000-8000-000000000002')",
     )
-    .bind(Uuid::now_v7())
+    .bind(assignment)
     .bind(employee)
     .execute(&app.db)
     .await
     .expect("assign the built-in employee role");
 
-    // ...but the transition itself is not, and it does not cascade to the grants
-    // the envelope would have refused on insert. This is the gap the report records.
-    let converted = sqlx::query("UPDATE users SET principal_type = 'CLIENT' WHERE id = $1")
-        .bind(employee)
-        .execute(&app.db)
-        .await
-        .expect("the database permits a non-owner conversion");
-    assert_eq!(converted.rows_affected(), 1);
+    // The conversion is refused while the INTERNAL-only role assignment stands.
+    assert_refused(
+        sqlx::query("UPDATE users SET principal_type = 'CLIENT' WHERE id = $1")
+            .bind(employee)
+            .execute(&app.db)
+            .await,
+        "converting a user who holds an INTERNAL-only role to CLIENT",
+    );
 
     let stranded: (i64,) = sqlx::query_as(
         "SELECT count(*) FROM user_role_assignments ura
@@ -754,8 +852,95 @@ async fn a_non_owner_principal_transition_is_constrained_only_by_the_value_set()
     .expect("count");
     assert_eq!(
         stranded.0, 1,
-        "if this reaches zero the schema gained a cascade and the report needs updating"
+        "the refused conversion must leave the assignment exactly as it was"
     );
+
+    // A live department membership refuses it for the same reason, independently of
+    // the role — the guard covers each dependent table, not just the first one.
+    sqlx::query("DELETE FROM user_role_assignments WHERE id = $1")
+        .bind(assignment)
+        .execute(&app.db)
+        .await
+        .expect("clear the role assignment");
+    let department = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO departments (id, code, name, status)
+         VALUES ($1, 'envelope_probe', 'Envelope Probe', 'ACTIVE')",
+    )
+    .bind(department)
+    .execute(&app.db)
+    .await
+    .expect("seed a department");
+    sqlx::query(
+        "INSERT INTO department_memberships (id, department_id, user_id, role_in_department)
+         VALUES ($1, $2, $3, 'MEMBER')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(department)
+    .bind(employee)
+    .execute(&app.db)
+    .await
+    .expect("seed a department membership");
+
+    assert_refused(
+        sqlx::query("UPDATE users SET principal_type = 'CLIENT' WHERE id = $1")
+            .bind(employee)
+            .execute(&app.db)
+            .await,
+        "converting a user with a live department membership to CLIENT",
+    );
+
+    // With nothing left to strand, the conversion is permitted. This is the half
+    // that proves the guard is a re-check of the envelope rather than a pin on the
+    // column: an operator repairing a mis-created account is not locked out.
+    sqlx::query("UPDATE department_memberships SET removed_at = now() WHERE user_id = $1")
+        .bind(employee)
+        .execute(&app.db)
+        .await
+        .expect("end the membership");
+    let converted = sqlx::query("UPDATE users SET principal_type = 'CLIENT' WHERE id = $1")
+        .bind(employee)
+        .execute(&app.db)
+        .await
+        .expect("a conversion that strands nothing must still be permitted");
+    assert_eq!(converted.rows_affected(), 1);
+}
+
+/// The owner's email address is immutable at the database layer.
+///
+/// `rb_users_protect_root` pinned the owner's status, principal type, MFA mandate
+/// and id, but not the address the account authenticates and recovers with — so the
+/// runtime role, which holds `UPDATE` on `users`, could take the owner's email and
+/// drive the password-reset flow to a mailbox it controls. Nothing in the
+/// application updates that column for the owner: `identity::update_user` refuses
+/// them as its first substantive act.
+#[tokio::test]
+async fn the_owners_email_address_cannot_be_rewritten() {
+    let app = TestApp::spawn().await;
+    let (root, employee, _) = seed(&app.db).await;
+
+    assert_refused(
+        sqlx::query("UPDATE users SET email = 'attacker@evil.test' WHERE id = $1")
+            .bind(root)
+            .execute(&app.db)
+            .await,
+        "rewriting the system owner's display email address",
+    );
+    assert_refused(
+        sqlx::query("UPDATE users SET email_normalized = 'attacker@evil.test' WHERE id = $1")
+            .bind(root)
+            .execute(&app.db)
+            .await,
+        "rewriting the address the system owner's password reset resolves through",
+    );
+
+    // The guard is about the owner, not about the column: an ordinary user's email
+    // is still editable, which is what `PATCH /api/v1/users/{id}` does.
+    sqlx::query("UPDATE users SET email = 'renamed@fixture.test' WHERE id = $1")
+        .bind(employee)
+        .execute(&app.db)
+        .await
+        .expect("a non-owner email must remain writable");
 }
 
 // ===========================================================================
@@ -950,6 +1135,73 @@ async fn rewriting_audit_metadata_is_detected() {
         result["outcome"],
         json!("HASH_MISMATCH"),
         "rewritten metadata was not detected: {result}"
+    );
+    assert_eq!(result["first_divergent_seq"], json!(victim));
+}
+
+/// Rewriting where an action came from is detected.
+///
+/// `source_ip_hint` was stored but excluded from the chain, which made it the one
+/// substantive column an adversary holding the database could rewrite freely — and
+/// origin is exactly what an intruder wants to change in a log they cannot delete.
+/// Chain version 2 covers it; the version marker is itself hashed, so a v2 row
+/// cannot be relabelled as v1 to escape back to the weaker layout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rewriting_the_source_ip_of_an_audit_row_is_detected() {
+    let (app, token) = chain_with_real_events().await;
+    let (first, head) = chain_bounds(&app).await;
+    let victim = (first + head) / 2;
+
+    // Everything written by this build is version 2, so the assertion below is
+    // about coverage and not about an accidentally legacy row.
+    let version: (i16,) = sqlx::query_as("SELECT chain_version FROM audit_events WHERE seq = $1")
+        .bind(victim)
+        .fetch_one(&app.db)
+        .await
+        .expect("read the chain version");
+    assert_eq!(version.0, 2, "this build must write version 2 entries");
+
+    tamper(
+        &app,
+        "UPDATE audit_events SET source_ip_hint = '203.0.113.9' WHERE seq = $1",
+        victim,
+    )
+    .await;
+
+    let result = run_verifier(&app, &token).await;
+    println!("AUDIT-EVIDENCE source_ip seq={victim}: {result}");
+    assert_eq!(
+        result["outcome"],
+        json!("HASH_MISMATCH"),
+        "a rewritten source IP was not detected: {result}"
+    );
+    assert_eq!(result["first_divergent_seq"], json!(victim));
+}
+
+/// Downgrading the chain version is detected.
+///
+/// Without this the whole of the test above would be defeated by one extra UPDATE:
+/// relabel the row as version 1, blank the source IP, and the verifier would hash
+/// the v1 layout — which does not include the column — and agree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn downgrading_the_chain_version_of_an_audit_row_is_detected() {
+    let (app, token) = chain_with_real_events().await;
+    let (first, head) = chain_bounds(&app).await;
+    let victim = (first + head) / 2;
+
+    tamper(
+        &app,
+        "UPDATE audit_events SET chain_version = 1, source_ip_hint = NULL WHERE seq = $1",
+        victim,
+    )
+    .await;
+
+    let result = run_verifier(&app, &token).await;
+    println!("AUDIT-EVIDENCE downgrade seq={victim}: {result}");
+    assert_eq!(
+        result["outcome"],
+        json!("HASH_MISMATCH"),
+        "a chain-version downgrade was not detected: {result}"
     );
     assert_eq!(result["first_divergent_seq"], json!(victim));
 }

@@ -301,10 +301,15 @@ pub async fn update_user(
         .await?
         .ok_or(AppError::NotFound)?;
 
+    // The `is_root` branch above *is* the ROOT guard on this path: it refuses, it
+    // records `ROOT.PROTECTION_TRIGGERED`, and it masks the refusal for external
+    // principals. A `state.guard_root(false)` call used to follow it, which is
+    // unconditionally a no-op — the argument is a literal `false` — and was deleted
+    // because a reader could reasonably believe the protection lived there and
+    // move or remove the real check.
     if repo::is_root(&mut tx, row.id).await? {
         return Err(deny_root(state, tx, principal, row.id, "USER_UPDATE").await);
     }
-    state.guard_root(false)?;
 
     state.require(
         principal,
@@ -494,11 +499,12 @@ async fn change_status(
 
     // ROOT first, before authorisation and before validation. The owner must be
     // refused identically whether the caller is an unprivileged employee, an
-    // administrator, or the owner themselves.
+    // administrator, or the owner themselves. This branch is the whole guard — a
+    // trailing `state.guard_root(false)` no-op was removed for the reason given in
+    // `update_user`.
     if repo::is_root(&mut tx, row.id).await? {
         return Err(deny_root(state, tx, principal, row.id, root_context).await);
     }
-    state.guard_root(false)?;
 
     // Refused rather than analysed. An actor removing their own access is at best a
     // support ticket and at worst an attacker covering their tracks by suspending

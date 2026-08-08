@@ -1,347 +1,316 @@
 # Route security matrix
 
-Formal backend acceptance audit, §24. Every one of the 95 entries in
-`backend/src/routes.rs` `ROUTE_TABLE` (lines 62–674) has a row below.
+Regenerated from the current source. Every one of the **95** entries in
+`backend/src/routes.rs` `ROUTE_TABLE` has a row below.
 
-**Method.** Each column was filled by reading the mounted handler and the service
-it delegates to, not by copying `ROUTE_TABLE`. Where the declared table and the
-code disagree the code is reported and the disagreement is raised as a finding
-(see `audit/SECTION_23_26_FINDINGS.md`).
+Each column was filled by reading the mounted handler and the service it
+delegates to, not by copying `ROUTE_TABLE`. Where the declared table and the code
+disagree, the code is reported and the disagreement is listed in
+§14 "Routes with unclear security posture".
+
+## Status of the general rate limiter
+
+A **general rate limiter is newly enforced**, in two layers. Both were verified
+present in the source at the time this document was regenerated.
+
+| Layer | Where it runs | Key | Default quota | Applies to |
+|---|---|---|---|---|
+| **general-authenticated** | inside the `Authenticated` and `MfaPendingSession` extractors, after the principal is resolved and **before** any authorisation or resource work | `general:user:{user_id}` | 600/min, and **3000/min for the system owner** — a larger budget, not an exemption | every route that requires a session |
+| **coarse pre-auth ceiling** | the innermost middleware layer, before authentication | `general:ip:{ip}` | 3000/min | *every* request, including anonymous ones and requests bearing invalid tokens |
+
+The per-principal budget is keyed on the **user id**, not the session and not the
+address: a session key would let one compromised account multiply its budget by
+minting sessions, and an address key would make one office behind a NAT share a
+single budget.
+
+The coarse per-IP ceiling exists because resolving a bearer token costs a database
+query whether or not the token is real. It is deliberately generous and is not the
+control that governs normal traffic.
+
+Because both layers exist, **no route is completely unlimited**. Rows that say
+"coarse per-IP ceiling only" carry no dedicated limiter of their own; rows that say
+`anonymous-operation` carry a tight, purpose-built one on top of the ceiling.
+
+A frontend must handle `429 RATE_LIMITED` with `Retry-After` on every route.
 
 ## How to read the columns
 
 | Column | Meaning |
 | --- | --- |
-| **Auth** | `anon` — no session; `mfa-pending` — `MfaPendingSession` extractor, accepts a password-only session; `auth` — `Authenticated` extractor, refuses a pending-MFA session (`backend/src/platform/http/extract.rs:130-143`). |
-| **Permission** | The code passed to `state.require` / `ScopeFilter::build` by the service. `—` when the handler takes no permission decision. |
-| **Object-level authz** | `row` — the service loads the row (often `FOR UPDATE`) and builds a `TargetContext` from the *loaded* row's real department / membership before calling `state.require`. `collection` — authorised against `Target::Collection`, which `evaluator::scope_covers` admits only for `GLOBAL` (`backend/src/modules/authorization/evaluator.rs:89`); no per-object decision is taken. `filter` — the actor's scopes are translated into a SQL `WHERE` clause and no row-level `require` runs. `path-param` — authorised on the identifier the caller supplied. `—` — no authorisation decision. |
-| **Principals** | Derived from `max_principal_type` in `backend/src/modules/authorization/catalog.rs`. Every code except `client.portal.*` is `Internal`; `client.portal.*` is `Any`. |
-| **Step-up** | Whether a recent second factor is enforced *in code*, and where. |
-| **Rate limited** | The limiter key from `backend/src/platform/http/rate_limit.rs:226-280`, or `—`. |
-| **Audit event** | The `action::*` constant the handler's service writes. `—` for reads that write nothing. |
-| **Client-safe** | Whether a CLIENT principal receives `404` rather than `403`, and whether the response body is a reduced client DTO. |
+| **Access** | `anon` — no session, no `Authorization` header needed. `mfa-pending` — the `MfaPendingSession` extractor: accepts a password-only session *and* a fully verified one. `auth` — the `Authenticated` extractor, which rejects a session with `pending_mfa = true` with `403 MFA_REQUIRED` (`platform/http/extract.rs`). |
+| **Principals** | Which principal types can actually succeed. Derived from `max_principal_type` in `modules/authorization/catalog.rs`: every code except `client.portal.*` is `INTERNAL`, so a `CLIENT` principal is refused at the envelope before any grant is consulted. |
+| **Permission** | The code the service passes to `state.require`. `—` when the handler takes no permission decision. |
+| **Object-level authz** | `row` — the service loads the row (usually `FOR UPDATE`) and builds a `TargetContext` from the **loaded** row before calling `state.require`. `collection` — authorised against `Target::Collection`, which `evaluator::scope_covers` admits only for `GLOBAL`. `filter` — the actor's scopes become a SQL `WHERE` clause; no per-row `require` runs. `self` — the subject is the calling session, resolved from the bearer token. `—` — no authorisation decision. |
+| **Scope** | Which scope types can reach this operation. `GLOBAL only` for collection targets; `object` means `GLOBAL / DEPARTMENT / ASSIGNED / RESOURCE` are all evaluated against the loaded row (`SELF` for user targets). |
+| **Step-up** | Whether a recent second factor is enforced *in code*, and where. `route` means `ROUTE_TABLE` declares `step_up = true`; the enforcing call is named. |
+| **Rate-limit class** | `anonymous-operation` — the endpoint carries its own dedicated limiter for an unauthenticated flow. `general-authenticated` — covered by the newly enforced per-principal limiter charged in the extractor. `coarse per-IP ceiling only` — no dedicated limiter; only the pre-auth address ceiling applies. Dedicated limiters that additionally apply are named. |
+| **Audit** | The `action::*` constants the service writes. `—` for reads that write nothing. |
+| **Client-safe** | Whether an external `CLIENT` principal is answered `404` rather than `403` (`AppError::hide_from_external`), and whether the response body is a reduced client projection. |
+| **Idem.** | `key` — the handler takes `Idempotent<T>` and honours `Idempotency-Key`. `—` — the header is not read. |
+| **Success** | The status the handler returns on success. |
+| **Distinctive errors** | Codes beyond the universal set below. |
 
-Verification status is stated per row group. Anything I could not settle from the
-source is listed at the end under **Endpoints with no clear security decision**.
+### Universal error codes
+
+Every route can also produce these, so they are not repeated per row:
+
+* `INTERNAL_ERROR` (500), `SERVICE_UNAVAILABLE` (503 — database unreachable, or the
+  request timeout fired).
+* `RATE_LIMITED` (429), with a `Retry-After` header — every route is now covered by
+  at least the coarse per-IP ceiling, and every authenticated route by the
+  per-principal budget as well.
+* Every **authenticated** route: `AUTHENTICATION_FAILED` (401),
+  `MFA_REQUIRED` (403 — only from the `auth` extractor), `AUTHORIZATION_DENIED`
+  (403, or `RESOURCE_NOT_FOUND` 404 for a CLIENT principal).
+* Every route taking a `{id}` path segment: `VALIDATION_FAILED` (400) with field
+  code `INVALID_UUID`.
+* Every route with a JSON body: `UNSUPPORTED_MEDIA_TYPE` (415),
+  `PAYLOAD_TOO_LARGE` (413), `BAD_REQUEST` (400 — malformed JSON or an
+  unrecognised field, because every request DTO is `deny_unknown_fields`).
+* Every route with a query string: `BAD_REQUEST` (400) for an unrecognised
+  parameter.
 
 ---
 
 ## 1. Health and platform (3)
 
-| # | METHOD | PATH | Auth | Permission | Object-level authz | Principals | Step-up | Rate limited | Audit event | Client-safe |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 1 | GET | `/health/live` | anon | — | — | anyone | no | — | — | n/a — fixed body `{"status":"ok"}`, no DB call (`system/routes.rs:60`) |
-| 2 | GET | `/health/ready` | anon | — | — | anyone | no | — | — | n/a — closed two-value document; service returns bare `bool` so no driver text can reach the body (`system/service.rs:34`) |
-| 3 | GET | `/metrics` | anon | — | — | anyone | no | — | — | n/a — `404` (not `403`) when `metrics_enabled=false` (`system/routes.rs:100`). Restriction is the operator's network policy. |
+| METHOD | PATH | Access | Principals | Permission | Object-level authz | Scope | Step-up | Rate-limit class | Audit | Client-safe | Idem. | Success | Distinctive errors |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| GET | `/health/live` | anon | anyone | — | — | n/a | no | coarse per-IP ceiling only | — | n/a — fixed `{"status":"ok"}`, no database call | — | 200 | none |
+| GET | `/health/ready` | anon | anyone | — | — | n/a | no | coarse per-IP ceiling only | — | n/a — closed two-value document; the service collapses every failure to a `bool` | — | 200 | 503 with the plain body `{"status":"not_ready"}` — **not** problem+json |
+| GET | `/metrics` | anon | anyone | — | — | n/a | no | coarse per-IP ceiling only | — | n/a — Prometheus text; carries no principal-identifying label | — | 200 | `RESOURCE_NOT_FOUND` (404) when `RB_METRICS_ENABLED=false` |
 
 ## 2. Bootstrap (2)
 
-| # | METHOD | PATH | Auth | Permission | Object-level authz | Principals | Step-up | Rate limited | Audit event | Client-safe |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 4 | GET | `/api/v1/bootstrap/status` | anon | — | — | anyone | no | **—** (no limiter; see F-11) | — | n/a — single boolean |
-| 5 | POST | `/api/v1/bootstrap/root` | anon | — | — (advisory lock + `system_state FOR UPDATE`) | anyone | no | `bootstrap:ip:{ip}` | `SYSTEM.BOOTSTRAPPED`, `SYSTEM.BOOTSTRAP_REJECTED` | n/a — `404` when no operator secret configured; wrong-secret and already-initialised are the same `401` (`bootstrap/service.rs:86-91`) |
+| METHOD | PATH | Access | Principals | Permission | Object-level authz | Scope | Step-up | Rate-limit class | Audit | Client-safe | Idem. | Success | Distinctive errors |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| GET | `/api/v1/bootstrap/status` | anon | anyone | — | — | n/a | no | coarse per-IP ceiling only (no dedicated limiter) | — | n/a — one boolean | — | 200 | none |
+| POST | `/api/v1/bootstrap/root` | anon | anyone | — | advisory lock + `system_state FOR UPDATE` | n/a | no | anonymous-operation (`bootstrap:ip:{ip}`) | `SYSTEM.BOOTSTRAPPED`, `SYSTEM.BOOTSTRAP_REJECTED` | n/a — `404` when no operator secret is configured; wrong secret and already-initialised are the same `401` | — | 201 | `RESOURCE_NOT_FOUND` (404, secret not configured), `AUTHENTICATION_FAILED` (401), `SYSTEM_ALREADY_INITIALIZED` (409), `VALIDATION_FAILED` (400), `RATE_LIMITED` (429) |
 
 ## 3. Authentication (16)
 
-Object-level authorisation is not applicable to any of these: the subject is
-always the calling session, resolved from the bearer token, never from a path
-parameter. `DELETE /auth/sessions/{id}` is the only one taking an id, and
-ownership is a predicate inside the `UPDATE` (`authentication/service.rs:663-680`).
+Object-level authorisation does not apply to any of these: the subject is always
+the calling session. `DELETE /auth/sessions/{id}` is the only one taking an id,
+and ownership is a predicate inside the `UPDATE`.
 
-| # | METHOD | PATH | Auth | Permission | Object-level authz | Principals | Step-up | Rate limited | Audit event | Client-safe |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 6 | POST | `/api/v1/auth/login` | anon | — | — | anyone | no | `login:ip:{ip}` **and** `login:acct:{email_normalized}` | `AUTH.LOGIN_SUCCEEDED` / `AUTH.LOGIN_FAILED` / `SESSION.REVOKED` (cap eviction) | n/a — one undifferentiated `401` for every failure mode; dummy Argon2 on the unknown-account and inactive-account paths |
-| 7 | POST | `/api/v1/auth/refresh` | anon | — | — (token row `FOR UPDATE`) | anyone | no | `refresh:ip:{ip}` | `AUTH.REFRESHED` / `AUTH.REFRESH_REUSE_DETECTED` | n/a — reuse detection kills the family and still returns the generic `401` |
-| 8 | POST | `/api/v1/auth/logout` | **mfa-pending** (table declares `Authenticated` — see F-04) | — | — | anyone | no | — | `AUTH.LOGOUT` | n/a |
-| 9 | POST | `/api/v1/auth/logout-all` | auth | — | — | anyone | no | — | `SESSION.REVOKED_ALL` | n/a |
-| 10 | GET | `/api/v1/auth/me` | mfa-pending | — | — | anyone | no | — | — | n/a — a pending session gets the structurally smaller `PendingMfaMeResponse` with no capability list, no `is_root`, no `auth_level` (`authentication/service.rs:576-594`) |
-| 11 | GET | `/api/v1/auth/sessions` | auth | — | self-only, in SQL | anyone | no | — | — | n/a — scoped to `principal.user_id()` in the query; no path parameter exists |
-| 12 | DELETE | `/api/v1/auth/sessions/{id}` | auth | — | **SQL predicate** (`WHERE id=$1 AND user_id=$2`) | anyone | no | — | `SESSION.REVOKED` | n/a — zero rows affected renders as `404`, identical to "someone else's session" |
-| 13 | POST | `/api/v1/auth/password/change` | auth | — | self | anyone | no | `login:acct:{principal email}` | `PASSWORD.CHANGED` | n/a — requires the current password even with a valid session |
-| 14 | POST | `/api/v1/auth/password-reset/request` | anon | — | — | anyone | no | `pwreset:ip:{ip}` **and** `pwreset:acct:{email}` | `PASSWORD.RESET_REQUESTED` | n/a — always `202` with a body type that has no variable field |
-| 15 | POST | `/api/v1/auth/password-reset/confirm` | anon | — | — (token row `FOR UPDATE`) | anyone | no | `pwreset:ip:{ip}` | `PASSWORD.RESET_COMPLETED` | n/a |
-| 16 | POST | `/api/v1/auth/mfa/totp/setup` | mfa-pending | — | self | anyone | no | `mfa:sess:{sid}` **and** `mfa:user:{uid}` | `MFA.ENROLMENT_STARTED` | n/a — refuses when an ACTIVE factor already exists |
-| 17 | POST | `/api/v1/auth/mfa/totp/activate` | mfa-pending | — | self (factor `FOR UPDATE`) | anyone | no | `mfa:sess` + `mfa:user` | `MFA.ACTIVATED`, `MFA.RECOVERY_CODES_GENERATED`, `MFA.REPLAY_DETECTED`, `MFA.VERIFICATION_FAILED` | n/a |
-| 18 | POST | `/api/v1/auth/mfa/verify` | mfa-pending | — | self (factor `FOR UPDATE`) | anyone | no | `mfa:sess` + `mfa:user` | `AUTH.STEP_UP_COMPLETED`, `MFA.REPLAY_DETECTED`, `MFA.VERIFICATION_FAILED` | n/a |
-| 19 | POST | `/api/v1/auth/mfa/recovery/verify` | mfa-pending | — | self | anyone | no | `mfa:sess` + `mfa:user` | `MFA.RECOVERY_CODE_CONSUMED`, `MFA.VERIFICATION_FAILED` | n/a |
-| 20 | POST | `/api/v1/auth/mfa/recovery/regenerate` | mfa-pending extractor; `require_step_up` makes it unreachable for a pending session (`mfa.rs:535`) | — | self | anyone | **yes** — `state.require_step_up` | `mfa:sess` + `mfa:user` | `MFA.RECOVERY_CODES_GENERATED` | n/a |
-| 21 | POST | `/api/v1/auth/mfa/disable` | mfa-pending extractor; `require_step_up` (`mfa.rs:586`) | — | self | anyone | **yes** | **—** (no limiter — see F-11) | `MFA.DISABLED` | n/a — additionally refused outright when `mfa_required` |
+| METHOD | PATH | Access | Principals | Permission | Object-level authz | Scope | Step-up | Rate-limit class | Audit | Client-safe | Idem. | Success | Distinctive errors |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| POST | `/api/v1/auth/login` | anon | INTERNAL + CLIENT | — | — | n/a | no | anonymous-operation (`login:ip:{ip}` **and** `login:acct:{email}`) | `AUTH.LOGIN_SUCCEEDED`, `AUTH.LOGIN_FAILED`, `SESSION.REVOKED` (session-cap eviction) | n/a — one undifferentiated `401` for every failure mode; dummy Argon2 on the unknown-account path | — | 200 | `AUTHENTICATION_FAILED` (401), `RATE_LIMITED` (429) |
+| POST | `/api/v1/auth/refresh` | anon | INTERNAL + CLIENT | — | refresh-token row `FOR UPDATE` | n/a | no | anonymous-operation (`refresh:ip:{ip}`) | `AUTH.REFRESHED`, `AUTH.REFRESH_REUSE_DETECTED` | n/a — reuse kills the token family and still returns the generic `401` | — | 200 | `AUTHENTICATION_FAILED` (401), `RATE_LIMITED` (429) |
+| POST | `/api/v1/auth/logout` | **mfa-pending** (the table declares `Authenticated`; see §14) | INTERNAL + CLIENT | — | self | self | no | general-authenticated | `AUTH.LOGOUT` | n/a | — | 200 | — |
+| POST | `/api/v1/auth/logout-all` | auth | INTERNAL + CLIENT | — | self | self | no | general-authenticated | `SESSION.REVOKED_ALL` | n/a | — | 200 | — |
+| GET | `/api/v1/auth/me` | mfa-pending | INTERNAL + CLIENT | — | self | self | no | general-authenticated | — | n/a — a pending session receives the structurally smaller `PendingMfaMeResponse`, with no capability list, no `is_root` and no `auth_level` | — | 200 | — |
+| GET | `/api/v1/auth/sessions` | auth | INTERNAL + CLIENT | — | self (SQL-scoped to `principal.user_id()`) | self | no | general-authenticated | — | n/a — no path parameter exists, so no other list is addressable | — | 200 | — |
+| DELETE | `/api/v1/auth/sessions/{id}` | auth | INTERNAL + CLIENT | — | SQL predicate `WHERE id = $1 AND user_id = $2` | self | no | general-authenticated | `SESSION.REVOKED` | n/a — zero rows affected renders `404`, identical to "somebody else's session" | — | 200 | `RESOURCE_NOT_FOUND` (404) |
+| POST | `/api/v1/auth/password/change` | auth | INTERNAL + CLIENT | — | self | self | no | general-authenticated **plus** `login:acct:{own email}` | `PASSWORD.CHANGED` | n/a — the current password is required even with a valid session | — | 200 | `AUTHENTICATION_FAILED` (401 — wrong current password), `VALIDATION_FAILED` (400 — password policy), `RATE_LIMITED` (429) |
+| POST | `/api/v1/auth/password-reset/request` | anon | INTERNAL + CLIENT | — | — | n/a | no | anonymous-operation (`pwreset:ip:{ip}` **and** `pwreset:acct:{email}`) | `PASSWORD.RESET_REQUESTED` | n/a — always `202` with a fixed body type that has no variable field | — | 202 | `RATE_LIMITED` (429) |
+| POST | `/api/v1/auth/password-reset/confirm` | anon | INTERNAL + CLIENT | — | reset-token row `FOR UPDATE` | n/a | no | anonymous-operation (`pwreset:ip:{ip}`) | `PASSWORD.RESET_COMPLETED`, `SESSION.REVOKED_ALL` | n/a — every rejection is the same `401` | — | 200 | `AUTHENTICATION_FAILED` (401), `VALIDATION_FAILED` (400), `RATE_LIMITED` (429) |
+| POST | `/api/v1/auth/mfa/totp/setup` | mfa-pending | INTERNAL + CLIENT | — | self | self | no | general-authenticated **plus** `mfa:sess:{sid}` and `mfa:user:{uid}` | `MFA.ENROLMENT_STARTED` | n/a | — | 201 | `MFA_ALREADY_ENROLLED` (409), `RATE_LIMITED` (429) |
+| POST | `/api/v1/auth/mfa/totp/activate` | mfa-pending | INTERNAL + CLIENT | — | self (factor `FOR UPDATE`) | self | no | general-authenticated **plus** `mfa:sess` + `mfa:user` | `MFA.ACTIVATED`, `MFA.RECOVERY_CODES_GENERATED`, `MFA.REPLAY_DETECTED`, `MFA.VERIFICATION_FAILED` | n/a | — | 200 | `MFA_NOT_PENDING` (409), `AUTHENTICATION_FAILED` (401 — bad code), `RATE_LIMITED` (429) |
+| POST | `/api/v1/auth/mfa/verify` | mfa-pending | INTERNAL + CLIENT | — | self (factor `FOR UPDATE`) | self | no | general-authenticated **plus** `mfa:sess` + `mfa:user` | `AUTH.STEP_UP_COMPLETED`, `MFA.REPLAY_DETECTED`, `MFA.VERIFICATION_FAILED` | n/a | — | 200 | `AUTHENTICATION_FAILED` (401), `RATE_LIMITED` (429) |
+| POST | `/api/v1/auth/mfa/recovery/verify` | mfa-pending | INTERNAL + CLIENT | — | self | self | no | general-authenticated **plus** `mfa:sess` + `mfa:user` | `MFA.RECOVERY_CODE_CONSUMED`, `MFA.VERIFICATION_FAILED` | n/a | — | 200 | `AUTHENTICATION_FAILED` (401), `RATE_LIMITED` (429) |
+| POST | `/api/v1/auth/mfa/recovery/regenerate` | auth | INTERNAL + CLIENT | — | self | self | **yes** — route flag + `state.require_step_up` in the service | general-authenticated **plus** `mfa:sess` + `mfa:user` | `MFA.RECOVERY_CODES_GENERATED` | n/a | — | 200 | `STEP_UP_REQUIRED` (403), `MFA_NOT_ENROLLED` (409), `RATE_LIMITED` (429) |
+| POST | `/api/v1/auth/mfa/disable` | auth | INTERNAL + CLIENT | — | self | self | **yes** — route flag + `state.require_step_up` | general-authenticated **plus** `mfa:sess` + `mfa:user` | `MFA.DISABLED` | n/a | — | 200 | `STEP_UP_REQUIRED` (403), `MFA_MANDATORY` (409 — refused outright when the account has `mfa_required`) |
 
 ## 4. Registration and invitation acceptance (3)
 
-| # | METHOD | PATH | Auth | Permission | Object-level authz | Principals | Step-up | Rate limited | Audit event | Client-safe |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 22 | GET | `/api/v1/registration/config` | anon | — | — | anyone | no | — | — | n/a — two fields; unreadable setting fails closed to "disabled" (`identity/registration.rs:87-95`) |
-| 23 | POST | `/api/v1/registration` | anon | — | — | anyone | no | `register:ip:{ip}` | `USER.REGISTERED` (Success and Denied) | n/a — always `202`, identical body; `principal_type=CLIENT`, `status=PENDING` are literals in code, absent from the DTO |
-| 24 | POST | `/api/v1/invitations/accept` | anon | — | invitation row `FOR UPDATE`; inviter authority re-derived at acceptance | anyone | inviter's step-up is *asserted* `true` (`identity/invitations.rs:485`), deliberately | `invite-accept:ip:{ip}` | `USER.CREATED`, `INVITATION.ACCEPTED` | n/a — every rejection reason is the same `401` |
+| METHOD | PATH | Access | Principals | Permission | Object-level authz | Scope | Step-up | Rate-limit class | Audit | Client-safe | Idem. | Success | Distinctive errors |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| GET | `/api/v1/registration/config` | anon | anyone | — | — | n/a | no | coarse per-IP ceiling only (no dedicated limiter) | — | n/a — two fields; an unreadable setting fails closed to "disabled" | — | 200 | none (a database failure is reported as "closed", not as an error) |
+| POST | `/api/v1/registration` | anon | anyone (produces a CLIENT) | — | — | n/a | no | anonymous-operation (`register:ip:{ip}`) | `USER.REGISTERED` (Success **and** Denied) | n/a — always `202` with a byte-identical body; `principal_type = CLIENT` and `status = PENDING` are literals in code with no DTO field | — | 202 | `RESOURCE_NOT_FOUND` (404 — self-registration disabled, which is the default), `VALIDATION_FAILED` (400), `RATE_LIMITED` (429) |
+| POST | `/api/v1/invitations/accept` | anon | anyone (produces the invited principal type) | — | invitation row `FOR UPDATE`; the inviter's authority is re-derived at acceptance | n/a | the inviter's step-up recency is asserted `true` at acceptance, deliberately | anonymous-operation (`invite-accept:ip:{ip}` — a **separate** budget from registration) | `USER.CREATED`, `INVITATION.ACCEPTED` | n/a — every rejection reason is the same `401` | — | 201 | `AUTHENTICATION_FAILED` (401), `VALIDATION_FAILED` (400), `RATE_LIMITED` (429) |
 
 ## 5. Users (6)
 
-`iam.users.*` is `Internal` in the catalogue, so a CLIENT is refused at
-`evaluator` step 3 and `state.require` renders that as `404`
-(`app.rs:86`). `TargetContext::other_user` carries no department and no
-membership, so only `GLOBAL` and `SELF` scopes can ever reach a user record.
+`iam.users.*` is `INTERNAL` in the catalogue, so a CLIENT principal is refused at
+the envelope and receives `404`.
 
-| # | METHOD | PATH | Auth | Permission | Object-level authz | Principals | Step-up | Rate limited | Audit event | Client-safe |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 25 | GET | `/api/v1/users` | auth | `iam.users.read` | **filter** — `Target::Collection` first, then a scope-derived `WHERE` (`identity/service.rs:170-211`). Narrow DENY overrides are **not** applied — see F-02 | INTERNAL | no | — | — | yes — `404` via `require` in the no-scope branch; DTO is the internal `UserResponse`, unreachable by a CLIENT |
-| 26 | GET | `/api/v1/users/{id}` | auth | `iam.users.read` | **row** — `find_user` then `other_user(...)` (`identity/service.rs:233-240`) | INTERNAL | no | — | — | yes — `404` |
-| 27 | PATCH | `/api/v1/users/{id}` | auth | `iam.users.update` | **row** — `find_user_for_update` → `is_root` → `require` | INTERNAL | `require_step_up_for` (no-op: not dangerous) | — | `USER.UPDATED` | yes — `deny_root` masks `ROOT_PROTECTED` to `404` for external principals (`identity/service.rs:601`) |
-| 28 | POST | `/api/v1/users/{id}/suspend` | auth | `iam.users.suspend` | **row**, `FOR UPDATE` | INTERNAL | `require_step_up_for` (no-op) | — | `USER.SUSPENDED` + `SESSION.REVOKED_ALL` | yes |
-| 29 | POST | `/api/v1/users/{id}/reactivate` | auth | `iam.users.suspend` | **row**, `FOR UPDATE` | INTERNAL | no-op | — | `USER.REACTIVATED` | yes |
-| 30 | POST | `/api/v1/users/{id}/archive` | auth | `iam.users.archive` | **row**, `FOR UPDATE` | INTERNAL | no-op | — | `USER.ARCHIVED` + `SESSION.REVOKED_ALL` | yes |
+| METHOD | PATH | Access | Principals | Permission | Object-level authz | Scope | Step-up | Rate-limit class | Audit | Client-safe | Idem. | Success | Distinctive errors |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| GET | `/api/v1/users` | auth | INTERNAL only | `iam.users.read` | filter (scopes become a SQL `WHERE`; DENY overrides become exclusions) | scope-filtered; `GLOBAL` short-circuits the filter | no | general-authenticated | — | yes — 404 for CLIENT | — | 200 | — |
+| GET | `/api/v1/users/{id}` | auth | INTERNAL only | `iam.users.read` | row (`TargetContext::other_user`) | object (`GLOBAL` / `SELF` / `RESOURCE`) | no | general-authenticated | — | yes | — | 200 | `RESOURCE_NOT_FOUND` (404) |
+| PATCH | `/api/v1/users/{id}` | auth | INTERNAL only | `iam.users.update` | row (`FOR UPDATE`) | object | conditional — `require_step_up_for`; `iam.users.update` is **not** dangerous, so no step-up in practice | general-authenticated | `USER.UPDATED`, `ROOT.PROTECTION_TRIGGERED` on a ROOT target | yes | — | 200 | `VERSION_CONFLICT` (409), `ROOT_PROTECTED` (403), `EMAIL_IN_USE` (409), `VALIDATION_FAILED` (400) |
+| POST | `/api/v1/users/{id}/suspend` | auth | INTERNAL only | `iam.users.suspend` | row (`FOR UPDATE`) | object | conditional (not dangerous → none) | general-authenticated | `USER.SUSPENDED`, `SESSION.REVOKED_ALL`, `ROOT.PROTECTION_TRIGGERED` | yes | — | 200 | `VERSION_CONFLICT` (409), `ROOT_PROTECTED` (403), `SELF_TARGET_REFUSED` (409), `INVALID_STATUS_TRANSITION` (409) |
+| POST | `/api/v1/users/{id}/reactivate` | auth | INTERNAL only | `iam.users.suspend` | row (`FOR UPDATE`) | object | conditional (not dangerous → none) | general-authenticated | `USER.REACTIVATED`, `ROOT.PROTECTION_TRIGGERED` | yes | — | 200 | `VERSION_CONFLICT` (409), `ROOT_PROTECTED` (403), `SELF_TARGET_REFUSED` (409), `INVALID_STATUS_TRANSITION` (409) |
+| POST | `/api/v1/users/{id}/archive` | auth | INTERNAL only | `iam.users.archive` | row (`FOR UPDATE`) | object | conditional (not dangerous → none) | general-authenticated | `USER.ARCHIVED`, `SESSION.REVOKED_ALL`, `ROOT.PROTECTION_TRIGGERED` | yes | — | 200 | `VERSION_CONFLICT` (409), `ROOT_PROTECTED` (403), `SELF_TARGET_REFUSED` (409), `INVALID_STATUS_TRANSITION` (409) |
 
 ## 6. Invitations (3)
 
-| # | METHOD | PATH | Auth | Permission | Object-level authz | Principals | Step-up | Rate limited | Audit event | Client-safe |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 31 | GET | `/api/v1/invitations` | auth | `iam.users.invite` | **collection** — GLOBAL only | INTERNAL | no | — | — | yes — `404` |
-| 32 | POST | `/api/v1/invitations` | auth | `iam.users.invite` | **collection**. `department_id` and `client_account_id` in the body are **not authorised at all** — see **F-01** | INTERNAL | conditional: `require_step_up` when any named role carries a dangerous permission (`invitations.rs:134-136`) | — | `INVITATION.CREATED` | yes — `require` runs before any lookup. Idempotency operation `invitations.create` |
-| 33 | DELETE | `/api/v1/invitations/{id}` | auth | `iam.users.invite` | **collection** — row is loaded *before* `require` but the decision does not use it (`invitations.rs:308-312`) | INTERNAL | no | — | `INVITATION.REVOKED` | yes — `404` either way for a CLIENT; internally a missing id is `404` and an existing one `403` (minor, see F-10) |
+| METHOD | PATH | Access | Principals | Permission | Object-level authz | Scope | Step-up | Rate-limit class | Audit | Client-safe | Idem. | Success | Distinctive errors |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| GET | `/api/v1/invitations` | auth | INTERNAL only | `iam.users.invite` | collection | GLOBAL only | no | general-authenticated | — | yes | — | 200 | — |
+| POST | `/api/v1/invitations` | auth | INTERNAL only | `iam.users.invite` | collection, **plus** a placement decision against the named department (`departments.members.manage`) and/or client account (`clients.members.manage`), **plus** the delegation guard on every role | GLOBAL only for the invite itself; object for each placement | **conditional** — `state.require_step_up` fires when any named role carries a dangerous permission | general-authenticated | `INVITATION.CREATED` | yes | **key** | 201 | `EMAIL_IN_USE` (409), `DELEGATION_DENIED` (403), `STEP_UP_REQUIRED` (403), `VALIDATION_FAILED` (400), `IDEMPOTENCY_KEY_REUSED` (409), `IDEMPOTENCY_RACE` (409) |
+| DELETE | `/api/v1/invitations/{id}` | auth | INTERNAL only | `iam.users.invite` | collection, then the invitation row | GLOBAL only | no | general-authenticated | `INVITATION.REVOKED` | yes | — | 200 (returns the revoked invitation) | `INVITATION_NOT_PENDING` (409), `RESOURCE_NOT_FOUND` (404) |
 
 ## 7. Roles and permissions (13)
 
-`ResourceType` has no `ROLE` variant, so every role-level decision is
-`Target::Collection` — GLOBAL only. That is fail-closed and documented at
-`authorization/service.rs:25-33`. Verified.
+Roles are authorised against `Target::Collection` on purpose: `ResourceType` has
+no `ROLE` variant, so a role cannot be named by a `RESOURCE`-scoped grant and has
+no department to resolve `DEPARTMENT` against. Only a `GLOBAL` grant reaches them.
 
-| # | METHOD | PATH | Auth | Permission | Object-level authz | Principals | Step-up | Rate limited | Audit event | Client-safe |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 34 | GET | `/api/v1/permissions` | auth | `iam.permissions.read` | **collection** | INTERNAL | no | — | — | yes |
-| 35 | GET | `/api/v1/roles` | auth | `iam.roles.read` | **collection** | INTERNAL | no | — | — | yes |
-| 36 | POST | `/api/v1/roles` | auth | `iam.roles.create` | **collection** + `check_role_authoring` per contained permission | INTERNAL | **yes** — explicit `state.require_step_up` (`service.rs:612`), because `iam.roles.create` is *not* dangerous and `require_step_up_for` would be a no-op | — | `ROLE.CREATED` | yes. Idempotency operation `roles.create` |
-| 37 | GET | `/api/v1/roles/{id}` | auth | `iam.roles.read` | **collection** — row loaded first, decision does not use it | INTERNAL | no | — | — | yes |
-| 38 | PATCH | `/api/v1/roles/{id}` | auth | `iam.roles.update` | **collection** + `check_role_authoring` against the *effective* permission set (existing set when `permissions` is absent) | INTERNAL | **yes** — explicit | — | `ROLE.UPDATED` (+ `bump_security_version` for every holder) | yes |
-| 39 | DELETE | `/api/v1/roles/{id}` | auth | `iam.roles.delete` | **collection** + `check_role_authoring`; assignment count read under the row lock | INTERNAL | **yes** — explicit | — | `ROLE.DELETED` | yes |
-| 40 | GET | `/api/v1/users/{id}/roles` | auth | `iam.roles.read` | **row** — subject loaded, then `other_user` target | INTERNAL | no | — | — | yes |
-| 41 | POST | `/api/v1/users/{id}/roles` | auth | `iam.roles.assign` | **row** — subject `FOR UPDATE`, then `check_role_assignment` permission-by-permission | INTERNAL | **yes** — `require_step_up_for` (`iam.roles.assign` is dangerous) | — | `ROLE.ASSIGNED`; `AUTHORIZATION.DENIED` / `ROOT.PROTECTION_TRIGGERED` on refusal | yes |
-| 42 | DELETE | `/api/v1/users/{id}/roles/{role_id}` | auth | `iam.roles.assign` | **row** — same guard runs on removal | INTERNAL | **yes** | — | `ROLE.UNASSIGNED` | yes |
-| 43 | GET | `/api/v1/users/{id}/permissions` | auth | `iam.permissions.read` | **row** | INTERNAL | no | — | — | yes |
-| 44 | GET | `/api/v1/users/{id}/permission-overrides` | auth | `iam.permissions.read` | **row** | INTERNAL | no | — | — | yes |
-| 45 | POST | `/api/v1/users/{id}/permission-overrides` | auth | `iam.permissions.delegate` | **row** — subject `FOR UPDATE` + `authorise_grant` (derivability lattice) | INTERNAL | **yes** — dangerous | — | `PERMISSION.OVERRIDE_CREATED` | yes |
-| 46 | DELETE | `/api/v1/users/{id}/permission-overrides/{override_id}` | auth | `iam.permissions.delegate` | **row** — override loaded scoped to the subject, then `authorise_grant` on its stored scope | INTERNAL | **yes** | — | `PERMISSION.OVERRIDE_REMOVED` | yes |
+| METHOD | PATH | Access | Principals | Permission | Object-level authz | Scope | Step-up | Rate-limit class | Audit | Client-safe | Idem. | Success | Distinctive errors |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| GET | `/api/v1/permissions` | auth | INTERNAL only | `iam.permissions.read` | collection | GLOBAL only | no | general-authenticated | — | yes | — | 200 | — |
+| GET | `/api/v1/roles` | auth | INTERNAL only | `iam.roles.read` | collection | GLOBAL only | no | general-authenticated | — | yes | — | 200 | — |
+| POST | `/api/v1/roles` | auth | INTERNAL only | `iam.roles.create` | collection + `check_role_authoring` (the actor cannot author a role containing authority it does not itself hold) | GLOBAL only | **yes** — route flag; the service calls `state.require_step_up` explicitly because `iam.roles.create` is *not* flagged dangerous in the catalogue | general-authenticated | `ROLE.CREATED`, `AUTHORIZATION.DENIED` on refusal | yes | **key** | 201 | `STEP_UP_REQUIRED` (403), `DELEGATION_DENIED` (403), `UNKNOWN_PERMISSION` (400), `UNIQUE_VIOLATION` (409), `IDEMPOTENCY_KEY_REUSED` (409), `IDEMPOTENCY_RACE` (409) |
+| GET | `/api/v1/roles/{id}` | auth | INTERNAL only | `iam.roles.read` | collection (after loading the row for existence) | GLOBAL only | no | general-authenticated | — | yes | — | 200 | `RESOURCE_NOT_FOUND` (404) |
+| PATCH | `/api/v1/roles/{id}` | auth | INTERNAL only | `iam.roles.update` | collection + `check_role_authoring` | GLOBAL only | **yes** — route flag + explicit `state.require_step_up` | general-authenticated | `ROLE.UPDATED`, `AUTHORIZATION.DENIED` | yes | — | 200 | `VERSION_CONFLICT` (409), `STEP_UP_REQUIRED` (403), `DELEGATION_DENIED` (403), `UNKNOWN_PERMISSION` (400) |
+| DELETE | `/api/v1/roles/{id}` | auth | INTERNAL only | `iam.roles.delete` | collection | GLOBAL only | **yes** — route flag + explicit `state.require_step_up` | general-authenticated | `ROLE.DELETED`, `AUTHORIZATION.DENIED` | yes | — | 204 | `ROLE_IN_USE` (409), `STEP_UP_REQUIRED` (403), `RESOURCE_NOT_FOUND` (404) |
+| GET | `/api/v1/users/{id}/roles` | auth | INTERNAL only | `iam.roles.read` | row (user target) | object (`GLOBAL` / `SELF` / `RESOURCE`) | no | general-authenticated | — | yes | — | 200 | `RESOURCE_NOT_FOUND` (404) |
+| POST | `/api/v1/users/{id}/roles` | auth | INTERNAL only | `iam.roles.assign` | row (subject `FOR UPDATE`) + `check_role_assignment` | object | **yes** — route flag; `iam.roles.assign` is dangerous, so `require_step_up_for` fires | general-authenticated | `ROLE.ASSIGNED`, `AUTHORIZATION.DENIED`, `ROOT.PROTECTION_TRIGGERED` | yes | — | 201 | `STEP_UP_REQUIRED` (403), `DELEGATION_DENIED` (403), `ROOT_PROTECTED` (403), `SUBJECT_ARCHIVED` (409), `ROLE_ALREADY_ASSIGNED` (409) |
+| DELETE | `/api/v1/users/{id}/roles/{role_id}` | auth | INTERNAL only | `iam.roles.assign` | row (subject `FOR UPDATE`) | object | **yes** — route flag + dangerous permission | general-authenticated | `ROLE.UNASSIGNED`, `AUTHORIZATION.DENIED`, `ROOT.PROTECTION_TRIGGERED` | yes | — | 204 | `STEP_UP_REQUIRED` (403), `DELEGATION_DENIED` (403), `ROOT_PROTECTED` (403), `RESOURCE_NOT_FOUND` (404) |
+| GET | `/api/v1/users/{id}/permissions` | auth | INTERNAL only | `iam.permissions.read` | row (user target) | object | no | general-authenticated | — | yes | — | 200 | `RESOURCE_NOT_FOUND` (404) |
+| GET | `/api/v1/users/{id}/permission-overrides` | auth | INTERNAL only | `iam.permissions.read` | row (user target) | object | no | general-authenticated | — | yes | — | 200 | `RESOURCE_NOT_FOUND` (404) |
+| POST | `/api/v1/users/{id}/permission-overrides` | auth | INTERNAL only | `iam.permissions.delegate` | row (subject `FOR UPDATE`) + `check_permission_grant` | object | **yes** — route flag + dangerous permission | general-authenticated | `PERMISSION.OVERRIDE_CREATED`, `AUTHORIZATION.DENIED`, `ROOT.PROTECTION_TRIGGERED` | yes | — | 201 | `STEP_UP_REQUIRED` (403), `DELEGATION_DENIED` (403), `ROOT_PROTECTED` (403), `UNKNOWN_PERMISSION` (400), `SUBJECT_ARCHIVED` (409) |
+| DELETE | `/api/v1/users/{id}/permission-overrides/{override_id}` | auth | INTERNAL only | `iam.permissions.delegate` | row (subject `FOR UPDATE`) | object | **yes** — route flag + dangerous permission | general-authenticated | `PERMISSION.OVERRIDE_REMOVED`, `AUTHORIZATION.DENIED` | yes | — | 204 | `STEP_UP_REQUIRED` (403), `DELEGATION_DENIED` (403), `RESOURCE_NOT_FOUND` (404) |
 
-## 8. Departments (8)
+## 8. Departments (7)
 
-`target_for` sets `department_id = Some(row.id)` — a department's own id is its
-department for scope purposes (`departments/service.rs:40-46`). Verified.
+`target_for` sets `department_id = row.id`, so a `DEPARTMENT`-scoped grant reaches
+a department the actor is a member of.
 
-| # | METHOD | PATH | Auth | Permission | Object-level authz | Principals | Step-up | Rate limited | Audit event | Client-safe |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 47 | GET | `/api/v1/departments` | auth | `departments.read` | **filter** — `Target::Collection`, else `repo::visibility_for`. Narrow DENY overrides are **not** applied — F-02 | INTERNAL | no | — | — | yes — the `Nothing` branch routes through `state.require` so the 404 shaping and the denial metric happen in one place |
-| 48 | POST | `/api/v1/departments` | auth | `departments.create` | **collection** | INTERNAL | `require_step_up_for` (no-op) | — | `DEPARTMENT.CREATED` | yes. Idempotency operation `departments.create` |
-| 49 | GET | `/api/v1/departments/{id}` | auth | `departments.read` | **row** + real membership lookup | INTERNAL | no | — | — | yes |
-| 50 | PATCH | `/api/v1/departments/{id}` | auth | `departments.update` | **row**, `FOR UPDATE` | INTERNAL | no-op | — | `DEPARTMENT.UPDATED` | yes |
-| 51 | POST | `/api/v1/departments/{id}/archive` | auth | `departments.archive` | **row**, `FOR UPDATE` | INTERNAL | no-op | — | `DEPARTMENT.ARCHIVED` | yes |
-| 52 | GET | `/api/v1/departments/{id}/members` | auth | `departments.read` | **row** | INTERNAL | no | — | — | yes |
-| 53 | POST | `/api/v1/departments/{id}/members` | auth | `departments.members.manage` | **row**, `FOR UPDATE`. **But `guard_root(is_root_user(body.user_id))` runs before the row load and before `require`** — see **F-03** | INTERNAL | no-op | — | `DEPARTMENT.MEMBER_ADDED` (+ `bump_security_version`) | **no** — a CLIENT supplying the owner's id gets `403 ROOT_PROTECTED` instead of `404` |
-| 54 | DELETE | `/api/v1/departments/{id}/members/{user_id}` | auth | `departments.members.manage` | **row**, `FOR UPDATE`; same pre-`require` root guard | INTERNAL | no-op | — | `DEPARTMENT.MEMBER_REMOVED` | **no** — same as row 53 |
+| METHOD | PATH | Access | Principals | Permission | Object-level authz | Scope | Step-up | Rate-limit class | Audit | Client-safe | Idem. | Success | Distinctive errors |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| GET | `/api/v1/departments` | auth | INTERNAL only | `departments.read` | filter (a non-GLOBAL actor gets its own departments; no usable scope routes through `require` for the correctly shaped refusal) | scope-filtered | no | general-authenticated | — | yes | — | 200 | — |
+| POST | `/api/v1/departments` | auth | INTERNAL only | `departments.create` | collection | GLOBAL only | conditional (not dangerous → none) | general-authenticated | `DEPARTMENT.CREATED` | yes | **key** | 201 | `UNIQUE_VIOLATION` (409), `VALIDATION_FAILED` (400), `UNKNOWN_USER` (409 — unknown lead), `IDEMPOTENCY_KEY_REUSED` (409), `IDEMPOTENCY_RACE` (409) |
+| GET | `/api/v1/departments/{id}` | auth | INTERNAL only | `departments.read` | row (membership resolved from the database) | object | no | general-authenticated | — | yes | — | 200 | `RESOURCE_NOT_FOUND` (404) |
+| PATCH | `/api/v1/departments/{id}` | auth | INTERNAL only | `departments.update` | row (`FOR UPDATE`) | object | conditional (not dangerous → none) | general-authenticated | `DEPARTMENT.UPDATED` | yes | — | 200 | `VERSION_CONFLICT` (409), `DEPARTMENT_ARCHIVED` (409), `UNKNOWN_USER` (409) |
+| POST | `/api/v1/departments/{id}/archive` | auth | INTERNAL only | `departments.archive` | row (`FOR UPDATE`) | object | conditional (not dangerous → none) | general-authenticated | `DEPARTMENT.ARCHIVED` | yes | — | 200 | `VERSION_CONFLICT` (409), `DEPARTMENT_ALREADY_ARCHIVED` (409), `DEPARTMENT_HAS_LIVE_PROJECTS` (409) |
+| GET | `/api/v1/departments/{id}/members` | auth | INTERNAL only | `departments.read` | row | object | no | general-authenticated | — | yes | — | 200 | `RESOURCE_NOT_FOUND` (404) |
+| POST | `/api/v1/departments/{id}/members` | auth | INTERNAL only | `departments.members.manage` | row (`FOR UPDATE`) | object | conditional (not dangerous → none) | general-authenticated | `DEPARTMENT.MEMBER_ADDED`, `ROOT.PROTECTION_TRIGGERED` | yes | — | 201 | `UNKNOWN_USER` (409), `ALREADY_A_MEMBER` (409), `PRINCIPAL_TYPE_MISMATCH` (409), `USER_ARCHIVED` (409), `DEPARTMENT_ARCHIVED` (409), `ROOT_PROTECTED` (403) |
+| DELETE | `/api/v1/departments/{id}/members/{user_id}` | auth | INTERNAL only | `departments.members.manage` | row (`FOR UPDATE`) | object | conditional (not dangerous → none) | general-authenticated | `DEPARTMENT.MEMBER_REMOVED`, `ROOT.PROTECTION_TRIGGERED` | yes | — | 204 | `ROOT_PROTECTED` (403), `RESOURCE_NOT_FOUND` (404) |
 
 ## 9. Client accounts (9)
 
-`target_for` sets `department_id = None` explicitly so a DEPARTMENT-scoped grant
-cannot reach a client account, and `actor_is_member` means "the actor is the
-account manager" (`clients/service.rs:56-64`). Verified.
+`target_for` sets `department_id = None` deliberately, so a `DEPARTMENT`-scoped
+grant can never reach a client account. `actor_is_member` is true only for the
+account manager, which is what `ASSIGNED` resolves against.
 
-| # | METHOD | PATH | Auth | Permission | Object-level authz | Principals | Step-up | Rate limited | Audit event | Client-safe |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 55 | GET | `/api/v1/clients` | auth | `clients.read` | **filter** — `visibility_for`; narrow DENY not applied (F-02) | INTERNAL | no | — | — | yes |
-| 56 | POST | `/api/v1/clients` | auth | `clients.create` | **collection** | INTERNAL | no-op | — | `CLIENT.CREATED` | yes. Idempotency operation `clients.create` |
-| 57 | GET | `/api/v1/clients/{id}` | auth | `clients.read` | **row** | INTERNAL | no | — | — | yes |
-| 58 | PATCH | `/api/v1/clients/{id}` | auth | `clients.update` | **row**, `FOR UPDATE` | INTERNAL | no-op | — | `CLIENT.UPDATED` | yes |
-| 59 | POST | `/api/v1/clients/{id}/archive` | auth | `clients.archive` | **row**, `FOR UPDATE` | INTERNAL | no-op | — | `CLIENT.ARCHIVED` | yes |
-| 60 | GET | `/api/v1/clients/{id}/members` | auth | `clients.read` | **row** | INTERNAL | no | — | — | yes |
-| 61 | POST | `/api/v1/clients/{id}/members` | auth | `clients.members.manage` | **row**, `FOR UPDATE`; membership always created `PENDING` | INTERNAL | no-op | — | `CLIENT.MEMBER_ADDED` | yes |
-| 62 | POST | `/api/v1/clients/{id}/members/{user_id}/activate` | auth | `clients.members.manage` | **row** + membership row, both `FOR UPDATE` | INTERNAL | no-op | — | `CLIENT.MEMBER_ACTIVATED` (+ `bump_security_version`) | yes |
-| 63 | DELETE | `/api/v1/clients/{id}/members/{user_id}` | auth | `clients.members.manage` | **row** + membership row `FOR UPDATE` | INTERNAL | no-op | — | `CLIENT.MEMBER_REMOVED` | yes |
+| METHOD | PATH | Access | Principals | Permission | Object-level authz | Scope | Step-up | Rate-limit class | Audit | Client-safe | Idem. | Success | Distinctive errors |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| GET | `/api/v1/clients` | auth | INTERNAL only | `clients.read` | filter; an external principal is routed through `require` and gets `404` | scope-filtered | no | general-authenticated | — | yes | — | 200 | — |
+| POST | `/api/v1/clients` | auth | INTERNAL only | `clients.create` | collection | GLOBAL only | conditional (not dangerous → none) | general-authenticated | `CLIENT.CREATED` | yes | **key** | 201 | `UNIQUE_VIOLATION` (409), `UNKNOWN_USER` (409), `VALIDATION_FAILED` (400), `IDEMPOTENCY_KEY_REUSED` (409), `IDEMPOTENCY_RACE` (409) |
+| GET | `/api/v1/clients/{id}` | auth | INTERNAL only | `clients.read` | row | object (`GLOBAL` / `ASSIGNED` / `RESOURCE`) | no | general-authenticated | — | yes | — | 200 | `RESOURCE_NOT_FOUND` (404) |
+| PATCH | `/api/v1/clients/{id}` | auth | INTERNAL only | `clients.update` | row (`FOR UPDATE`) | object | conditional (not dangerous → none) | general-authenticated | `CLIENT.UPDATED` | yes | — | 200 | `VERSION_CONFLICT` (409), `CLIENT_ARCHIVED` (409), `UNKNOWN_USER` (409) |
+| POST | `/api/v1/clients/{id}/archive` | auth | INTERNAL only | `clients.archive` | row (`FOR UPDATE`) | object | conditional (not dangerous → none) | general-authenticated | `CLIENT.ARCHIVED` | yes | — | 200 | `VERSION_CONFLICT` (409), `CLIENT_ALREADY_ARCHIVED` (409) |
+| GET | `/api/v1/clients/{id}/members` | auth | INTERNAL only | `clients.read` | row | object | no | general-authenticated | — | yes | — | 200 | `RESOURCE_NOT_FOUND` (404) |
+| POST | `/api/v1/clients/{id}/members` | auth | INTERNAL only | `clients.members.manage` | row (`FOR UPDATE`) | object | conditional (not dangerous → none) | general-authenticated | `CLIENT.MEMBER_ADDED` | yes | — | 201 | `UNKNOWN_USER` (409), `ALREADY_A_MEMBER` (409), `PRINCIPAL_TYPE_MISMATCH` (409), `USER_ARCHIVED` (409), `CLIENT_ARCHIVED` (409) |
+| POST | `/api/v1/clients/{id}/members/{user_id}/activate` | auth | INTERNAL only | `clients.members.manage` | row (`FOR UPDATE`) | object | conditional (not dangerous → none) | general-authenticated | `CLIENT.MEMBER_ACTIVATED` | yes | — | 200 | `MEMBERSHIP_ALREADY_ACTIVE` (409), `MEMBERSHIP_REMOVED` (409), `MEMBERSHIP_CHANGED` (409), `CLIENT_ARCHIVED` (409) |
+| DELETE | `/api/v1/clients/{id}/members/{user_id}` | auth | INTERNAL only | `clients.members.manage` | row (`FOR UPDATE`) | object | conditional (not dangerous → none) | general-authenticated | `CLIENT.MEMBER_REMOVED` | yes | — | 204 | `MEMBERSHIP_ALREADY_REMOVED` (409), `MEMBERSHIP_CHANGED` (409), `RESOURCE_NOT_FOUND` (404) |
 
-## 10. Projects (12)
+## 10. Projects (11)
 
-| # | METHOD | PATH | Auth | Permission | Object-level authz | Principals | Step-up | Rate limited | Audit event | Client-safe |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 64 | GET | `/api/v1/projects` | auth | `projects.read` | **filter** — `ScopeFilter::build` → `PROJECT_SCOPE_PREDICATE`, which *does* carry narrow DENYs. Does not route the denial through `state.require` (F-08) | INTERNAL | no | — | — | yes — `hide_from_external` applied explicitly at `projects/service.rs:252` |
-| 65 | POST | `/api/v1/projects` | auth | `projects.create` | **request-derived target** — authorised against the *requested* `department_id`, which is also the department the row is created with. Correct: it narrows, never widens | INTERNAL | no | — | `PROJECT.CREATED` | yes. Idempotency operation `projects.create` |
-| 66 | GET | `/api/v1/projects/{id}` | auth | `projects.read` | **row** + real membership lookup | INTERNAL | no | — | — | yes |
-| 67 | PATCH | `/api/v1/projects/{id}` | auth | `projects.update` | **row**, `FOR UPDATE`; a department move takes a **second** `require` against the destination (`service.rs:471-477`) | INTERNAL | no | — | `PROJECT.UPDATED` | yes |
-| 68 | POST | `/api/v1/projects/{id}/archive` | auth | `projects.archive` | **row**, `FOR UPDATE` | INTERNAL | no | — | `PROJECT.ARCHIVED` | yes |
-| 69 | GET | `/api/v1/projects/{id}/members` | auth | `projects.read` | **row** | INTERNAL | no | — | — | yes |
-| 70 | POST | `/api/v1/projects/{id}/members` | auth | `projects.members.manage` | **row**, `FOR UPDATE` | INTERNAL | no | — | `PROJECT.MEMBER_ADDED` (+ `bump_security_version`) | yes |
-| 71 | DELETE | `/api/v1/projects/{id}/members/{user_id}` | auth | `projects.members.manage` | **row**, `FOR UPDATE` | INTERNAL | no | — | `PROJECT.MEMBER_REMOVED` | yes |
-| 72 | GET | `/api/v1/projects/{id}/clients` | auth | `projects.read` | **row** | INTERNAL | no | — | — | yes |
-| 73 | POST | `/api/v1/projects/{id}/clients` | auth | `projects.clients.share` | **row**, `FOR UPDATE` | INTERNAL | **yes** — `require_step_up_for`, deliberately *after* `require` so a CLIENT gets `404` rather than `STEP_UP_REQUIRED` (`service.rs:834-842`) | — | `PROJECT.SHARED_WITH_CLIENT`; `AUTHORIZATION.DENIED` **committed** on refusal | yes — the ordering is exactly what makes it safe |
-| 74 | DELETE | `/api/v1/projects/{id}/clients/{client_account_id}` | auth | `projects.clients.share` | **row**, `FOR UPDATE` | INTERNAL | **yes** — same ordering | — | `PROJECT.UNSHARED_FROM_CLIENT`; `AUTHORIZATION.DENIED` on refusal | yes |
-| 75 | GET | `/api/v1/projects/{project_id}/tasks` | auth | `tasks.read` | **filter** — the path `project_id` is a *filter only*; the task scope predicate is applied regardless (`tasks/service.rs:165-198`) | INTERNAL | no | — | — | yes |
+| METHOD | PATH | Access | Principals | Permission | Object-level authz | Scope | Step-up | Rate-limit class | Audit | Client-safe | Idem. | Success | Distinctive errors |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| GET | `/api/v1/projects` | auth | INTERNAL only | `projects.read` | filter | scope-filtered | no | general-authenticated | — | yes — an external principal is refused with `404` | — | 200 | — |
+| POST | `/api/v1/projects` | auth | INTERNAL only | `projects.create` | row-shaped target built from the **requested** `department_id`, so a department-scoped creator cannot create outside its department | object | no | general-authenticated | `PROJECT.CREATED` | yes | **key** | 201 | `UNIQUE_VIOLATION` (409), `EXTERNAL_PRINCIPAL` (409), `VALIDATION_FAILED` (400), `IDEMPOTENCY_KEY_REUSED` (409), `IDEMPOTENCY_RACE` (409) |
+| GET | `/api/v1/projects/{id}` | auth | INTERNAL only | `projects.read` | row (department + membership from the loaded row) | object | no | general-authenticated | — | yes | — | 200 | `RESOURCE_NOT_FOUND` (404) |
+| PATCH | `/api/v1/projects/{id}` | auth | INTERNAL only | `projects.update` | row (`FOR UPDATE`); a department move is authorised **twice**, once against the source and once against the destination | object | no | general-authenticated | `PROJECT.UPDATED` | yes | — | 200 | `VERSION_CONFLICT` (409), `INVALID_STATE_TRANSITION` (409), `EXTERNAL_PRINCIPAL` (409) |
+| POST | `/api/v1/projects/{id}/archive` | auth | INTERNAL only | `projects.archive` | row (`FOR UPDATE`) | object | no | general-authenticated | `PROJECT.ARCHIVED` | yes | — | 200 | `VERSION_CONFLICT` (409), `ALREADY_ARCHIVED` (409) |
+| GET | `/api/v1/projects/{id}/members` | auth | INTERNAL only | `projects.read` | row | object | no | general-authenticated | — | yes | — | 200 | `RESOURCE_NOT_FOUND` (404) |
+| POST | `/api/v1/projects/{id}/members` | auth | INTERNAL only | `projects.members.manage` | row (`FOR UPDATE`) | object | no | general-authenticated | `PROJECT.MEMBER_ADDED` | yes | — | 204 | `PROJECT_ARCHIVED` (409), `ALREADY_A_MEMBER` (409), `EXTERNAL_PRINCIPAL` (409) |
+| DELETE | `/api/v1/projects/{id}/members/{user_id}` | auth | INTERNAL only | `projects.members.manage` | row (`FOR UPDATE`) | object | no | general-authenticated | `PROJECT.MEMBER_REMOVED` | yes | — | 204 | `RESOURCE_NOT_FOUND` (404) |
+| GET | `/api/v1/projects/{id}/clients` | auth | INTERNAL only | `projects.read` | row | object | no | general-authenticated | — | yes | — | 200 | `RESOURCE_NOT_FOUND` (404) |
+| POST | `/api/v1/projects/{id}/clients` | auth | INTERNAL only | `projects.clients.share` | row (`FOR UPDATE`) | object | **yes** — route flag; `projects.clients.share` is dangerous | general-authenticated | `PROJECT.SHARED_WITH_CLIENT`, `AUTHORIZATION.DENIED` on refusal | yes | — | 204 | `STEP_UP_REQUIRED` (403), `PROJECT_ARCHIVED` (409), `CLIENT_ACCOUNT_NOT_ACTIVE` (409) |
+| DELETE | `/api/v1/projects/{id}/clients/{client_account_id}` | auth | INTERNAL only | `projects.clients.share` | row (`FOR UPDATE`) | object | **yes** — route flag + dangerous permission | general-authenticated | `PROJECT.UNSHARED_FROM_CLIENT`, `AUTHORIZATION.DENIED` | yes | — | 204 | `STEP_UP_REQUIRED` (403), `RESOURCE_NOT_FOUND` (404) |
 
-## 11. Tasks (8)
+## 11. Tasks (8, plus the project-nested listing)
 
-`task_target` takes the department from the task's **project** and membership
-from a real `task_assignees` lookup (`tasks/service.rs:126-136`). Verified.
+`task_target` takes its department from the task's **project**, so a
+`DEPARTMENT`-scoped grant follows the project. `ASSIGNED` resolves against an
+active assignee row.
 
-| # | METHOD | PATH | Auth | Permission | Object-level authz | Principals | Step-up | Rate limited | Audit event | Client-safe |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 76 | GET | `/api/v1/tasks` | auth | `tasks.read` | **filter** — `TASK_SCOPE_PREDICATE` | INTERNAL | no | — | — | yes |
-| 77 | POST | `/api/v1/tasks` | auth | `tasks.create` | **row of the parent project**, `FOR UPDATE`, loaded before `require`; missing project is `404` in both branches so the ordering is not an oracle | INTERNAL | no | — | `TASK.CREATED` | yes. Idempotency operation `tasks.create` |
-| 78 | GET | `/api/v1/tasks/{id}` | auth | `tasks.read` | **row** + project context + assignee lookup | INTERNAL | no | — | — | yes |
-| 79 | PATCH | `/api/v1/tasks/{id}` | auth | `tasks.update` | **row**, `FOR UPDATE` | INTERNAL | no | — | `TASK.UPDATED`, and `TASK.CLIENT_VISIBILITY_CHANGED` as a separate record when `client_visible` moves | yes |
-| 80 | DELETE | `/api/v1/tasks/{id}` | auth | `tasks.delete` | **row**, `FOR UPDATE`; cancels, never deletes | INTERNAL | no | — | `TASK.UPDATED` (**no `TASK.CANCELLED` code exists** — F-12) | yes |
-| 81 | GET | `/api/v1/tasks/{id}/assignees` | auth | `tasks.read` | **row** | INTERNAL | no | — | — | yes |
-| 82 | POST | `/api/v1/tasks/{id}/assignees` | auth | `tasks.assign` | **row**, `FOR UPDATE` | INTERNAL | no | — | `TASK.ASSIGNED` (+ `bump_security_version`) | yes |
-| 83 | DELETE | `/api/v1/tasks/{id}/assignees/{user_id}` | auth | `tasks.assign` | **row**, `FOR UPDATE` | INTERNAL | no | — | `TASK.UNASSIGNED` (+ `bump_security_version`) | yes |
+| METHOD | PATH | Access | Principals | Permission | Object-level authz | Scope | Step-up | Rate-limit class | Audit | Client-safe | Idem. | Success | Distinctive errors |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| GET | `/api/v1/projects/{project_id}/tasks` | auth | INTERNAL only | `tasks.read` | filter, bounded to the project in the path | scope-filtered | no | general-authenticated | — | yes | — | 200 | — |
+| GET | `/api/v1/tasks` | auth | INTERNAL only | `tasks.read` | filter | scope-filtered | no | general-authenticated | — | yes | — | 200 | — |
+| POST | `/api/v1/tasks` | auth | INTERNAL only | `tasks.create` | target built from the **loaded project** named in the body (project `404` first) | object | no | general-authenticated | `TASK.CREATED` | yes | **key** | 201 | `PROJECT_ARCHIVED` (409), `EXTERNAL_PRINCIPAL` (409), `RESOURCE_NOT_FOUND` (404), `IDEMPOTENCY_KEY_REUSED` (409), `IDEMPOTENCY_RACE` (409) |
+| GET | `/api/v1/tasks/{id}` | auth | INTERNAL only | `tasks.read` | row (project department + assignee) | object | no | general-authenticated | — | yes | — | 200 | `RESOURCE_NOT_FOUND` (404) |
+| PATCH | `/api/v1/tasks/{id}` | auth | INTERNAL only | `tasks.update` | row (`FOR UPDATE`) | object | no | general-authenticated | `TASK.UPDATED`, and additionally `TASK.CLIENT_VISIBILITY_CHANGED` when `client_visible` moves | yes | — | 200 | `VERSION_CONFLICT` (409), `INVALID_STATE_TRANSITION` (409) |
+| DELETE | `/api/v1/tasks/{id}` | auth | INTERNAL only | `tasks.delete` | row (`FOR UPDATE`) | object | no | general-authenticated | `TASK.CANCELLED` (cancellation is a status change, not a row removal) | yes | — | 204 | `VERSION_CONFLICT` (409 — only when `?version=` is supplied), `ALREADY_CANCELLED` (409), `INVALID_STATE_TRANSITION` (409) |
+| GET | `/api/v1/tasks/{id}/assignees` | auth | INTERNAL only | `tasks.read` | row | object | no | general-authenticated | — | yes | — | 200 | `RESOURCE_NOT_FOUND` (404) |
+| POST | `/api/v1/tasks/{id}/assignees` | auth | INTERNAL only | `tasks.assign` | row (`FOR UPDATE`) | object | no | general-authenticated | `TASK.ASSIGNED` | yes | — | 204 | `TASK_CANCELLED` (409), `ALREADY_ASSIGNED` (409), `EXTERNAL_PRINCIPAL` (409) |
+| DELETE | `/api/v1/tasks/{id}/assignees/{user_id}` | auth | INTERNAL only | `tasks.assign` | row (`FOR UPDATE`) | object | no | general-authenticated | `TASK.UNASSIGNED` | yes | — | 204 | `RESOURCE_NOT_FOUND` (404) |
 
 ## 12. Client portal (4)
 
-The only surface an external principal may reach. Layer 4 (the SQL visibility
-predicate in `projects/visibility.rs`) is applied *before* and *independently of*
-the `state.require` call, so a bug in the evaluator returns fewer rows rather
-than another company's. Verified by reading both the predicate and every call
-site's bind order (`projects/repo.rs:37` static-asserts `CLIENT_UID_BIND == 1`).
+The only business surface an external principal may reach, and read-only
+throughout. Each handler builds a target with `department_id = None` and
+`actor_is_member = true`, and every portal permission is `ASSIGNED`-scoped in
+practice — visibility resolves through an **ACTIVE** client membership joined to a
+live project link. An INTERNAL principal holding the portal permission may also
+call these.
 
-| # | METHOD | PATH | Auth | Permission | Object-level authz | Principals | Step-up | Rate limited | Audit event | Client-safe |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 84 | GET | `/api/v1/client-portal/projects` | auth | `client.portal.projects.read` | **filter** — `ScopeFilter::build` presence check + `PROJECT_VISIBLE_TO_CLIENT` in the query | INTERNAL **and** CLIENT (`Any`) | no | — | — | yes — reduced `ClientProjectResponse`: no `internal_note`, no `manager_user_id`, no `department_id`, no `version`, no `created_by` |
-| 85 | GET | `/api/v1/client-portal/projects/{id}` | auth | `client.portal.projects.read` | **row fetched *with* the visibility predicate** → a project that exists but is not shared produces no row and therefore `404` | INTERNAL + CLIENT | no | — | — | yes — reduced DTO |
-| 86 | GET | `/api/v1/client-portal/projects/{id}/tasks` | auth | `client.portal.tasks.read` | **filter** + the parent project is re-checked through `projects::client_get` first, so an unshared project id is `404` rather than an empty page | INTERNAL + CLIENT | no | — | — | yes — reduced `ClientTaskResponse`: no `client_visible`, no `internal_note`, no `version`, no `created_by` |
-| 87 | GET | `/api/v1/client-portal/tasks/{id}` | auth | `client.portal.tasks.read` | **row fetched with the predicate** (`t.client_visible` AND a live project link) → `404` | INTERNAL + CLIENT | no | — | — | yes — reduced DTO |
+| METHOD | PATH | Access | Principals | Permission | Object-level authz | Scope | Step-up | Rate-limit class | Audit | Client-safe | Idem. | Success | Distinctive errors |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| GET | `/api/v1/client-portal/projects` | auth | INTERNAL **and** CLIENT | `client.portal.projects.read` | filter, bounded to the actor's ACTIVE client memberships | `ASSIGNED` in practice | no | general-authenticated | — | **yes** — reduced `ClientProjectResponse` projection chosen by the route, not by a flag | — | 200 | — |
+| GET | `/api/v1/client-portal/projects/{id}` | auth | INTERNAL **and** CLIENT | `client.portal.projects.read` | row, loaded through the client-visibility predicate | `ASSIGNED` | no | general-authenticated | — | yes | — | 200 | `RESOURCE_NOT_FOUND` (404) |
+| GET | `/api/v1/client-portal/projects/{id}/tasks` | auth | INTERNAL **and** CLIENT | `client.portal.tasks.read` | filter, bounded to the visible project and `client_visible = true` tasks | `ASSIGNED` | no | general-authenticated | — | yes — `ClientTaskResponse` carries no `internal_note`, `created_by`, `version` or `client_visible` | — | 200 | `RESOURCE_NOT_FOUND` (404) |
+| GET | `/api/v1/client-portal/tasks/{id}` | auth | INTERNAL **and** CLIENT | `client.portal.tasks.read` | row, loaded through the client-visibility predicate | `ASSIGNED` | no | general-authenticated | — | yes | — | 200 | `RESOURCE_NOT_FOUND` (404) |
 
-## 13. Settings, flags and system info (5)
+## 13. Settings, feature flags, system and audit (8)
 
-| # | METHOD | PATH | Auth | Permission | Object-level authz | Principals | Step-up | Rate limited | Audit event | Client-safe |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 88 | GET | `/api/v1/settings` | auth | `settings.read` | **collection**; `is_security_sensitive` rows are excluded **by the query**, gated on `settings.security.write` (`settings/service.rs:235-256`) | INTERNAL | no | — | — | yes |
-| 89 | PUT | `/api/v1/settings/{key}` | auth | `settings.features.write` **or** `settings.security.write`, selected by the loaded row's `is_security_sensitive` | **row**, `FOR UPDATE` — this is the `ENFORCED_DYNAMICALLY` case named in `routes.rs:749` | INTERNAL | **conditional** — `require_step_up_for(settings.security.write)` when the row is sensitive | — | `SETTING.CHANGED` (Success and Denied) | yes — a coarse pre-check stops a principal with no write authority telling an existing key from a missing one |
-| 90 | GET | `/api/v1/feature-flags` | auth | `settings.read` | **collection**; same sensitivity split | INTERNAL | no | — | — | yes |
-| 91 | PUT | `/api/v1/feature-flags/{key}` | auth | `settings.features.write` / `settings.security.write` | **row**, `FOR UPDATE` | INTERNAL | conditional | — | `FEATURE_FLAG.CHANGED` (Success and Denied) | yes |
-| 92 | GET | `/api/v1/system/info` | auth | **—** (`system/service.rs:69` takes `_principal` and calls no `require`) | — | INTERNAL **and** CLIENT | no | — | — | partially — same body for every principal by design; leaks the **key list of enabled feature flags** to a CLIENT (see F-09) |
-
-## 14. Audit (3)
-
-| # | METHOD | PATH | Auth | Permission | Object-level authz | Principals | Step-up | Rate limited | Audit event | Client-safe |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 93 | GET | `/api/v1/audit/events` | auth | `audit.read` | **collection** — GLOBAL only; audit history has no department or owner | INTERNAL | no | — | — | yes |
-| 94 | GET | `/api/v1/audit/events/{id}` | auth | `audit.read` | **collection** — `require` runs *before* the lookup; there is deliberately no per-event filter, so any `audit.read` holder can read any event | INTERNAL | no | — | — | yes — a malformed id is `404`, not a validation error that echoes it |
-| 95 | GET | `/api/v1/audit/verify` | auth | `audit.read` | **collection** | INTERNAL | **yes** — unconditional `state.require_step_up` (`audit/service.rs:407`), because `audit.read` is not dangerous but this operation is a bulk cryptographic scan | — | — (deliberately not audited) | yes — window bounded at 100 000 entries so it cannot be its own DoS |
+| METHOD | PATH | Access | Principals | Permission | Object-level authz | Scope | Step-up | Rate-limit class | Audit | Client-safe | Idem. | Success | Distinctive errors |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| GET | `/api/v1/settings` | auth | INTERNAL only | `settings.read` | collection | GLOBAL only | no | general-authenticated | — | yes | — | 200 | — |
+| PUT | `/api/v1/settings/{key}` | auth | INTERNAL only | `settings.features.write` **or** `settings.security.write` — decided **after** the row is loaded, from its `is_security_sensitive` column | row (`FOR UPDATE`) | GLOBAL only (`Target::Collection`) | **conditional** — a security-sensitive key requires `settings.security.write`, which is dangerous, so `require_step_up_for` fires | general-authenticated | `SETTING.CHANGED` (Success and Denied; values are **not** recorded for security-sensitive keys) | yes | — | 200 | `VERSION_CONFLICT` (409), `STEP_UP_REQUIRED` (403), `VALIDATION_FAILED` (400 — bad key grammar or value type), `RESOURCE_NOT_FOUND` (404 — unknown key) |
+| GET | `/api/v1/feature-flags` | auth | INTERNAL only | `settings.read` | collection | GLOBAL only | no | general-authenticated | — | yes | — | 200 | — |
+| PUT | `/api/v1/feature-flags/{key}` | auth | INTERNAL only | `settings.features.write` **or** `settings.security.write` (same dynamic split) | row (`FOR UPDATE`) | GLOBAL only | conditional, as above | general-authenticated | `FEATURE_FLAG.CHANGED` (Success and Denied) | yes | — | 200 | `VERSION_CONFLICT` (409), `STEP_UP_REQUIRED` (403), `VALIDATION_FAILED` (400), `RESOURCE_NOT_FOUND` (404) |
+| GET | `/api/v1/system/info` | auth | INTERNAL **and** CLIENT — the handler takes no permission decision and ignores the principal | **—** | — | n/a | no | general-authenticated | — | **no reduction** — any authenticated principal, including a CLIENT, receives `environment`, `initialized` and the list of enabled feature-flag keys. See §14. | — | 200 | — |
+| GET | `/api/v1/audit/events` | auth | INTERNAL only | `audit.read` | collection | GLOBAL only | no | general-authenticated | — | yes | — | 200 | `BAD_REQUEST` (400 — bad filter) |
+| GET | `/api/v1/audit/events/{id}` | auth | INTERNAL only | `audit.read` | collection | GLOBAL only | no | general-authenticated | — | yes | — | 200 | `RESOURCE_NOT_FOUND` (404 — a malformed id is also `404`, not a validation error, so it does not reflect the caller's input) |
+| GET | `/api/v1/audit/verify` | auth | INTERNAL only | `audit.read` | collection | GLOBAL only | **yes** — route flag + explicit `state.require_step_up` in the service; the permission is not flagged dangerous, so the demand is stated in code | general-authenticated | — | yes | — | 200 | `STEP_UP_REQUIRED` (403), `VALIDATION_FAILED` / `BAD_REQUEST` (400 — window out of range) |
 
 ---
 
-# Endpoints with no clear security decision
+## 14. Routes with unclear security posture
 
-Nine entries. Each names what is unclear and what would settle it.
+Four items. Nothing else in the 95 was ambiguous.
 
-### U-1 — `POST /api/v1/invitations` (row 32): the destination department and client account are never authorised
+### 14.1 `POST /api/v1/auth/logout` — declared `Authenticated`, implemented `MfaPendingSession`
 
-`identity/invitations.rs:66-108` authorises only `iam.users.invite` at
-`Target::Collection`. `request.department_id` and `request.client_account_id` are
-validated for *mutual exclusion with the principal type* and for nothing else. On
-acceptance (`invitations.rs:531-551`) they become a department membership and an
-**ACTIVE** client membership. Whether that was intended cannot be determined from
-the code: the module header discusses roles at length and is silent on
-memberships. **Settles it:** a decision on whether `iam.users.invite` is meant to
-subsume `departments.members.manage` and `clients.members.manage`. Raised as
-finding **F-01 (HIGH)** because the code as written grants both.
+`ROUTE_TABLE` declares `Access::Authenticated`, but `modules/authentication/routes.rs`
+extracts `MfaPendingSession`, with a comment saying a session stuck in
+`MFA_ENROLLMENT_REQUIRED` must be able to dispose of its token. The **implementation
+is the wider of the two**, and it is the behaviour a frontend must code against: a
+pending-MFA session can log out. The declared table is what the OpenAPI drift test
+compares, so this deviation is invisible to that test. Reported below as a bug.
 
-### U-2 — `GET /api/v1/users` (row 25): which DENY overrides apply to the listing
+### 14.2 `POST /api/v1/auth/mfa/recovery/regenerate` and `POST /api/v1/auth/mfa/disable` — **resolved**
 
-`identity/service.rs:170-211` builds the filter from `effective_scopes`, which
-removes only *GLOBAL* denies. A `DEPARTMENT`- or `RESOURCE`-scoped DENY on
-`iam.users.read` is silently absent from the listing while `GET /users/{id}`
-honours it. `projects` and `tasks` carry narrow denies into SQL
-(`ScopeFilter::deny_department`, `deny_assigned`, `denied_resource_ids`);
-`users`, `departments` and `clients` do not. It is not stated anywhere which is
-the intended semantic. **Settles it:** a statement in
-`docs/backend/04-authorization.md` §5 on whether a narrow DENY restricts
-collections, plus a parity test. Raised as **F-02 (MEDIUM)**.
+These two previously had the same mismatch as `logout` (declared `Authenticated`,
+implemented with `MfaPendingSession`). As of the source read for this
+regeneration, both handlers use the `Authenticated` extractor, so the declaration
+and the implementation now agree, and both remain behind `state.require_step_up`
+in the service. `POST /api/v1/auth/mfa/disable` has also gained the dedicated
+`mfa:sess` / `mfa:user` limiter it previously lacked. **No action needed** — the
+item is retained here only so a reader comparing against an earlier revision of
+this document is not misled.
 
-### U-3 — `POST` / `DELETE /api/v1/departments/{id}/members` (rows 53–54): the root guard runs before authorisation
+### 14.3 `GET /api/v1/system/info` — authenticated, but no permission and no principal-type reduction
 
-`departments/service.rs:464` and `:548` call
-`state.guard_root(state.is_root_user(user_id).await?)` before the department row
-is read and before `state.require`. The equivalent path in `identity` explicitly
-masks this for external principals and documents why at length
-(`identity/service.rs:588-605`). Whether departments is a deliberate exception or
-an oversight is not stated. **Settles it:** apply the same masking, or document
-why the departments surface is exempt. Raised as **F-03 (MEDIUM)**.
+The handler ignores its `Principal` (`_principal`), and the service returns the
+environment name, whether the system is initialised, and the enabled feature-flag
+keys. There is no permission check and no client projection, so an external
+`CLIENT` principal receives the same document an administrator does.
 
-### U-4 — `POST /api/v1/auth/logout` (row 8): declared `Authenticated`, implemented `MfaPendingSession`
+The source now argues this is deliberate and safe: the environment is visible from
+the URL, `initialized` is already observable from the bootstrap endpoint's
+behaviour, and `enabled_feature_flag_keys` **excludes `is_security_sensitive` rows
+in the query itself** — a filter the comment records as previously missing. The
+residual disclosure is therefore the set of enabled *non-sensitive* flag keys.
 
-`routes.rs:75` declares `Authenticated`; `authentication/routes.rs:115-117` uses
-`MfaPendingSession`, and the module header at `authentication/routes.rs:13-16`
-says `/logout` *must* be reachable from a pending session. Both cannot be true.
-The behaviour is defensible; the declaration is wrong, and because it is wrong
-the `the_mfa_pending_surface_is_minimal` test (`routes.rs:861`) never sees this
-route. **Settles it:** decide which is authoritative and change the other. Raised
-as **F-04 (MEDIUM)**.
+It is left in this section because the posture is still a judgement rather than an
+enforced rule: nothing in the route table, the catalogue or a test prevents a
+future non-sensitive flag from being an internal fact, and there is no permission
+gate to fall back on. A frontend must not treat this endpoint as internal-only,
+and should not surface `enabled_features` in a client-portal experience.
 
-### U-5 — `POST /api/v1/auth/mfa/recovery/regenerate` and `/mfa/disable` (rows 20–21)
+### 14.4 Step-up on `iam.roles.create` / `iam.roles.update` / `iam.roles.delete` and `audit.read`
 
-Both are declared `Authenticated, step_up = true` but mounted with
-`MfaPendingSession`. In practice `state.require_step_up` refuses any pending
-session, so the effective access is `Authenticated`-equivalent — but that is a
-property of the service, not of the extractor, and a future edit that removed the
-step-up check would silently open both to a password-only session. **Settles it:**
-either use `Authenticated` or add a test asserting a pending session is refused.
-Raised as **F-05 (LOW)**.
-
-### U-6 — `GET /api/v1/system/info` (row 92): who may see the enabled feature-flag list
-
-The handler takes `_principal` and calls no `require`. `system/repo.rs`
-`enabled_feature_flag_keys` selects **every** enabled flag key with no
-`is_security_sensitive` filter, while `GET /api/v1/feature-flags` excludes
-sensitive rows from readers without `settings.security.write`. The doc comment
-argues "a feature flag key is not a capability", which is a reasonable position,
-but the two endpoints disagree about it. **Settles it:** decide whether the
-sensitivity marker governs the key as well as the value. Raised as **F-09 (LOW)**.
-
-### U-7 — `GET /api/v1/audit/events/{id}` (row 94): no object-level filter
-
-Every holder of `audit.read` can read every audit event, including events whose
-metadata names projects, users and client accounts they cannot otherwise see. The
-service comments justify collection-level authorisation for the *listing*
-("audit history has no department and no owner") but say nothing about a
-single-event read of an event whose target the reader has no visibility of.
-Whether that is intended is not determinable from the code. **Settles it:** an
-explicit statement in ADR-006 or §5 of the authorization document.
-
-### U-8 — `POST` / `DELETE /api/v1/projects/{id}/clients` (rows 73–74): audit-on-denial is committed with no rate limit
-
-`projects/service.rs:817-833` writes an `AUTHORIZATION.DENIED` row and **commits**
-it on every refused attempt. The same pattern is in `authorization::refuse`
-(`service.rs:414-442`). `audit_events` is append-only with no delete path
-anywhere in the system. None of these routes is rate limited. Whether an
-attacker-driven growth bound was considered is not stated. **Settles it:** a
-decision on whether denial recording needs its own budget. Raised as **F-06
-(MEDIUM)**.
-
-### U-9 — every route except the eight named in §3/§4: no rate limiter at all
-
-`RateLimitConfig::general_per_principal_per_minute` exists
-(`platform/config/mod.rs:109`, default 600) and `keys::general_principal` /
-`keys::general_ip` exist (`rate_limit.rs:274-279`), but nothing calls them and no
-middleware installs a general limiter. Every authenticated route — including the
-expensive `GET /audit/verify` and every listing — is unlimited. Whether that is a
-deliberate deferral or an incomplete wiring is not stated anywhere I could find.
-**Settles it:** either wire the general limiter or delete the config field and the
-key builders so the gap is not disguised as a control. Raised as **F-07
-(MEDIUM)**.
-
----
-
-## Cross-cutting properties I verified
-
-* **No handler with a declared permission fails to reach an authorisation
-  decision.** All 71 permission-bearing rows reach either `state.require` (row
-  target or collection) or `ScopeFilter::build`/`visibility_for` followed by a
-  SQL predicate. There is no forgotten-authorisation route.
-* **No `Path<Uuid>` reaches a decision unvalidated.** `PathId`/`PathIds`/`PathKey`
-  parse and refuse without echoing the value; `authorization::routes::parse_id`
-  and `audit::service::parse_uuid` do the same by hand (see F-13 on the
-  divergence).
-* **No SQL fragment is built from request input.** Every dynamic fragment in
-  `visibility.rs`, `departments/repo.rs`, `identity/repo.rs`, `audit/repo.rs` is
-  a `&'static str` chosen by a `match` on a closed enum or an allowlist lookup;
-  the only `format!`-built SQL interpolates `&'static str` sort columns and
-  operators taken from compile-time allowlists.
-* **Every mutation authorises inside the transaction that mutates**, against a
-  row read `FOR UPDATE`, with three exceptions that are correct by construction:
-  `projects::create` and `departments::create`/`clients::create` (no row exists
-  yet, so the decision is collection- or request-department-level), and
-  `departments::add_member`/`remove_member` whose *root guard* is outside (F-03).
+These four routes declare `step_up = true` in `ROUTE_TABLE`, but their permissions
+are **not** flagged `is_dangerous` in the catalogue, so `require_step_up_for` would
+not fire. The services therefore call `state.require_step_up` explicitly, and the
+source comments say so. The behaviour is correct and verified; the posture is
+"unclear" only in the sense that the catalogue and the route table disagree about
+why, so a reader consulting only `catalog.rs` would conclude no step-up applies.

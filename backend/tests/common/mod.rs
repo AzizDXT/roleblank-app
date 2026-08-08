@@ -217,6 +217,18 @@ pub struct TestApp {
 
 impl TestApp {
     pub async fn spawn() -> Self {
+        Self::spawn_with(|_| {}).await
+    }
+
+    /// Spawn with a chance to adjust the configuration first.
+    ///
+    /// Exists so a suite can test a control that is deliberately set out of the way
+    /// for every other suite — the general rate limiter, whose production quotas are
+    /// far too large to reach in a test and whose harness quotas are far too large
+    /// on purpose. Rather than lowering the limit globally (which would make every
+    /// other suite assert against the limiter by accident), the suite that tests the
+    /// limiter asks for a small one.
+    pub async fn spawn_with(adjust: impl FnOnce(&mut Config)) -> Self {
         ensure_template().await;
 
         // A UUID-derived name: parallel test binaries must not collide.
@@ -251,7 +263,8 @@ impl TestApp {
         cloned.expect("clone the template");
         admin.close().await;
 
-        let config = test_config(&database_name);
+        let mut config = test_config(&database_name);
+        adjust(&mut config);
         let db = database::connect(&config.database)
             .await
             .expect("connect to the test database");
@@ -550,10 +563,31 @@ pub fn test_config(database: &str) -> Config {
             max_page_size: 100,
             default_page_size: 25,
         },
-        rate_limits: RateLimitConfig::default(),
+        // The *general* budgets are raised far above production for the harness, and
+        // only those.
+        //
+        // Several suites legitimately send hundreds of requests as one principal in
+        // well under a minute — 630 mass-assignment probes, ~1 500 injection probes —
+        // because that is what proving an input boundary takes. Under the production
+        // quota those suites would start returning `429` and would then be asserting
+        // against the limiter instead of against the thing they exist to test, which
+        // is how a suite quietly stops testing anything.
+        //
+        // This is not a relaxed security posture: the operation-specific budgets
+        // (login, MFA, reset, registration, invitation acceptance, bootstrap) keep
+        // their real production values above, because several tests assert on them.
+        // The general limiter's own behaviour is proven by `rate_limit_suite`, which
+        // builds an app with deliberately tiny quotas instead of relying on these.
+        rate_limits: RateLimitConfig {
+            general_per_principal_per_minute: 100_000,
+            general_root_per_minute: 100_000,
+            general_per_ip_per_minute: 100_000,
+            ..RateLimitConfig::default()
+        },
         cors_allowed_origins: vec![],
         trusted_proxies: Default::default(),
         mail: MailProviderKind::DevSink,
+        mail_allow_disabled: true,
         log_json: false,
         expose_openapi: true,
         metrics_enabled: true,

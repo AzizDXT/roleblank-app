@@ -317,3 +317,64 @@ implementation of `trait RateLimiter` must ship *before* a second replica does.
 | File storage | No upload surface exists |
 | Realtime / chat | No WebSocket surface exists |
 | AI / MCP | No agent surface exists; the `ai.assistant` flag is off and is not an access control |
+
+---
+
+## 13. Rate limiting
+
+Full design and reasoning: `docs/backend/RATE_LIMIT_ARCHITECTURE.md`. What an
+operator needs day to day:
+
+**Three classes.** Per-operation anonymous budgets (login, MFA, reset,
+registration, invitation acceptance, bootstrap); a general authenticated budget
+keyed on the **user id**; and a coarse pre-authentication ceiling keyed on the
+client address.
+
+**Every limit is tunable**, and none may be zero — a zero quota would refuse every
+request, so it is rejected at startup rather than read as "unlimited". Names and
+defaults are in `backend/.env.example`.
+
+**Tuning during an incident.** Tighten `RB_RATE_GENERAL_PER_PRINCIPAL_PER_MINUTE`
+first: it is keyed per user, so it slows one abusive account without touching
+anyone else. Reach for `RB_RATE_GENERAL_PER_IP_PER_MINUTE` only when the source is
+an address rather than an account, and remember that a corporate NAT is a crowd.
+
+**ROOT is not exempt**, only larger (`RB_RATE_GENERAL_ROOT_PER_MINUTE`). No lockout
+is possible: the buckets refill continuously, and the authenticated budget is keyed
+on the user id, so an external attacker cannot consume the owner's budget without
+the owner's token.
+
+**Single instance only.** Enforcement is per process. Running more than one API
+instance requires a distributed implementation of the `RateLimiter` trait first —
+recorded as release gate RR-3.
+
+## 14. Mail
+
+**Production requires a delivery path.** `RB_MAIL_PROVIDER=smtp` is the production
+transport: SMTP over TLS, either implicit (port 465) or with STARTTLS *required*
+(port 587). Opportunistic STARTTLS is not offered, and port 25 is refused —
+it is the relay port, is blocked on many networks, and its failure mode looks
+exactly like "invitations stopped working".
+
+Startup **fails** if:
+
+* a development sink is configured in production;
+* `RB_MAIL_PROVIDER=smtp` is set with any of host, username, password or from empty;
+* `RB_MAIL_PROVIDER=disabled` in production **without** `RB_MAIL_ALLOW_DISABLED=true`.
+
+That last one is deliberate and was a closure change. Invitations are the only path
+to an internal account and password reset is the only path back into an existing
+one, so a production deployment with no mail can neither onboard nor recover a
+single user. It never *pretended* to deliver — `DisabledProvider` has always
+returned an error — but it used to boot looking perfectly healthy. An operator who
+genuinely wants that posture (accounts provisioned by other means) can still have
+it, but has to say so out loud.
+
+**Nothing logs a delivery URL or token.** Log lines carry the recipient *domain*
+only: the local part is frequently the person's real name and is enough to
+enumerate accounts from a log export.
+
+**Delivery is at-least-once.** The worker claims a message, calls the provider, then
+marks it sent; a crash in that window re-delivers. Closing that window would need a
+distributed transaction across PostgreSQL and a third-party mail API, so instead the
+property is documented and the handlers are safe to run twice.

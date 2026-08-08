@@ -58,6 +58,15 @@ tracing = "0.1"
 # timer emits an uptime duration, which is useless for correlating across services.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt", "std", "time"] }
 
+# --- Mail -------------------------------------------------------------------
+# The only production delivery mechanism. Deliberately narrow: SMTP over TLS and
+# nothing else. `default-features = false` keeps the file/sendmail transports and
+# the native-tls stack out of the tree — rustls is already here through sqlx, and
+# two TLS implementations would mean two to audit.
+lettre = { version = "0.11", default-features = false, features = [
+    "smtp-transport", "tokio1", "tokio1-rustls", "builder", "ring", "webpki-roots",
+] }
+
 # --- Misc -------------------------------------------------------------------
 thiserror = "2"
 dotenvy = "0.15"

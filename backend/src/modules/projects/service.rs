@@ -246,9 +246,20 @@ pub async fn list(
 
     let Some(filter) = ScopeFilter::build(&principal.actor, PERM_READ, ResourceType::Project)
     else {
-        // No grant at all. `hide_from_external` turns this into a 404 for an
-        // external principal, which is also what stops an internal-only route from
-        // confirming its own existence to the client portal.
+        // No grant at all. Routed back through `state.require` rather than raising
+        // the error here, because `require` is the single place that increments
+        // `metrics.authz_denial(reason)` and emits the `"authorization denied"` log
+        // line with the actor, the permission and the reason — and it applies the
+        // same `hide_from_external` shaping this branch used to apply by hand.
+        // Raising it directly meant a refused listing was invisible to both the
+        // denial metric and the intrusion feed, which is precisely the signal an
+        // enumeration attempt produces. `departments::list` already does this; the
+        // comment there calls it "in exactly one place", and this was the second.
+        //
+        // `require` cannot itself succeed where `ScopeFilter::build` failed: both
+        // read the same effective scopes for the same permission, and
+        // `Target::Collection` is the strictest of the two questions.
+        state.require(principal, PERM_READ, &Target::Collection)?;
         return Err(AppError::AuthorizationDenied.hide_from_external(principal.is_external()));
     };
     if filter.matches_nothing() {
@@ -979,6 +990,10 @@ pub async fn client_list(
     // established that the rows are ones the actor is linked to — which is what the
     // predicate below does, row by row.
     if ScopeFilter::build(&principal.actor, PERM_PORTAL_READ, ResourceType::Project).is_none() {
+        // Through `state.require` so the denial is metered and logged; see `list`.
+        // A client probing the portal without the portal permission is exactly the
+        // event that must reach the intrusion feed rather than being swallowed.
+        state.require(principal, PERM_PORTAL_READ, &Target::Collection)?;
         return Err(AppError::AuthorizationDenied.hide_from_external(principal.is_external()));
     }
 

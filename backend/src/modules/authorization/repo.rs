@@ -337,6 +337,29 @@ pub async fn lock_user(
     .map_err(AppError::from)
 }
 
+/// Mandate a second factor for a subject who has just been given dangerous
+/// authority, and report whether the flag actually moved.
+///
+/// The `WHERE mfa_required = false` predicate is not an optimisation. It makes the
+/// statement report "this grant is what introduced the mandate" in
+/// `rows_affected`, which is the fact the audit metadata records; a bare `SET`
+/// would report `1` every time and the log would claim every grant imposed MFA.
+///
+/// This never touches the owner: `delegation` refuses ROOT as a subject before any
+/// caller reaches here, and `rb_users_protect_root` independently refuses to clear
+/// the flag on that row. Setting it is monotonic — nothing in this module ever
+/// clears it — so an account that reaches `true` stays there until the
+/// step-up-gated `POST /auth/mfa/disable` is refused by `MFA_MANDATORY`.
+pub async fn mandate_mfa(tx: &mut Transaction<'_, Postgres>, user_id: Uuid) -> AppResult<bool> {
+    let result =
+        sqlx::query("UPDATE users SET mfa_required = true WHERE id = $1 AND mfa_required = false")
+            .bind(user_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(AppError::from)?;
+    Ok(result.rows_affected() > 0)
+}
+
 // ---------------------------------------------------------------------------
 // Role assignments
 // ---------------------------------------------------------------------------

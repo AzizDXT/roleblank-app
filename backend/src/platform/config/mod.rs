@@ -106,7 +106,28 @@ pub struct RateLimitConfig {
     /// people per hour per office.
     pub invitation_accept_per_ip_per_hour: u32,
     pub bootstrap_per_ip_per_hour: u32,
+    /// The general authenticated budget, keyed on the **user id**.
+    ///
+    /// Keyed on the principal rather than the address for two reasons that pull in
+    /// opposite directions and are both real: an office behind one NAT is many
+    /// people who must not share a budget, and one compromised account spread over
+    /// many sessions is one attacker who must not multiply theirs. A user id is the
+    /// only key that gets both right.
     pub general_per_principal_per_minute: u32,
+    /// The same budget for the system owner, deliberately higher.
+    ///
+    /// ROOT is not exempt from physics — an unbounded owner session is still a way
+    /// to hurt the system — but the owner is also the account that recovers the
+    /// company from an incident, and throttling it during one would be its own
+    /// outage. See `docs/backend/RATE_LIMIT_ARCHITECTURE.md` §ROOT.
+    pub general_root_per_minute: u32,
+    /// A coarse per-address ceiling applied **before** authentication.
+    ///
+    /// Its job is narrow: bound the work an unauthenticated flood can force, since
+    /// resolving a bearer token costs a database query whether or not the token is
+    /// real. It is deliberately generous, because a corporate NAT is a legitimate
+    /// crowd behind one address and this layer cannot tell them apart.
+    pub general_per_ip_per_minute: u32,
 }
 
 impl Default for RateLimitConfig {
@@ -121,6 +142,92 @@ impl Default for RateLimitConfig {
             invitation_accept_per_ip_per_hour: 20,
             bootstrap_per_ip_per_hour: 5,
             general_per_principal_per_minute: 600,
+            general_root_per_minute: 3_000,
+            general_per_ip_per_minute: 3_000,
+        }
+    }
+}
+
+impl RateLimitConfig {
+    /// Read the limits from the environment, falling back to the defaults above.
+    ///
+    /// Previously this struct was built with `Default::default()` and read nothing,
+    /// so an operator facing abuse could not tighten a single limit without a
+    /// rebuild — a control that exists in configuration but not in configuration.
+    /// Recorded as a finding in the acceptance audit; closed here.
+    ///
+    /// A limit of `0` is rejected rather than treated as "unlimited": a zero quota
+    /// would refuse every request, and reading it as its opposite is exactly the
+    /// kind of silent inversion that a security control must never do.
+    fn from_env(errors: &mut ConfigErrors) -> Self {
+        let d = Self::default();
+        let read = |key: &str, default: u32, errors: &mut ConfigErrors| -> u32 {
+            let value = env_parse(key, default, errors);
+            if value == 0 {
+                errors.push(format!(
+                    "{key}: a rate limit of 0 would refuse every request;                      omit the variable to use the default, or set a positive quota"
+                ));
+                default
+            } else {
+                value
+            }
+        };
+        Self {
+            login_per_ip_per_minute: read(
+                "RB_RATE_LOGIN_PER_IP_PER_MINUTE",
+                d.login_per_ip_per_minute,
+                errors,
+            ),
+            login_per_account_per_minute: read(
+                "RB_RATE_LOGIN_PER_ACCOUNT_PER_MINUTE",
+                d.login_per_account_per_minute,
+                errors,
+            ),
+            mfa_per_session_per_minute: read(
+                "RB_RATE_MFA_PER_SESSION_PER_MINUTE",
+                d.mfa_per_session_per_minute,
+                errors,
+            ),
+            refresh_per_ip_per_minute: read(
+                "RB_RATE_REFRESH_PER_IP_PER_MINUTE",
+                d.refresh_per_ip_per_minute,
+                errors,
+            ),
+            password_reset_per_ip_per_hour: read(
+                "RB_RATE_PASSWORD_RESET_PER_IP_PER_HOUR",
+                d.password_reset_per_ip_per_hour,
+                errors,
+            ),
+            registration_per_ip_per_hour: read(
+                "RB_RATE_REGISTRATION_PER_IP_PER_HOUR",
+                d.registration_per_ip_per_hour,
+                errors,
+            ),
+            invitation_accept_per_ip_per_hour: read(
+                "RB_RATE_INVITATION_ACCEPT_PER_IP_PER_HOUR",
+                d.invitation_accept_per_ip_per_hour,
+                errors,
+            ),
+            bootstrap_per_ip_per_hour: read(
+                "RB_RATE_BOOTSTRAP_PER_IP_PER_HOUR",
+                d.bootstrap_per_ip_per_hour,
+                errors,
+            ),
+            general_per_principal_per_minute: read(
+                "RB_RATE_GENERAL_PER_PRINCIPAL_PER_MINUTE",
+                d.general_per_principal_per_minute,
+                errors,
+            ),
+            general_root_per_minute: read(
+                "RB_RATE_GENERAL_ROOT_PER_MINUTE",
+                d.general_root_per_minute,
+                errors,
+            ),
+            general_per_ip_per_minute: read(
+                "RB_RATE_GENERAL_PER_IP_PER_MINUTE",
+                d.general_per_ip_per_minute,
+                errors,
+            ),
         }
     }
 }
@@ -139,7 +246,62 @@ pub enum MailProviderKind {
     DevFile { directory: String },
     /// Refuse to accept mail work at all.
     Disabled,
+    /// The production path: SMTP over TLS, and nothing else.
+    ///
+    /// Deliberately narrow. A single well-understood transport that every provider
+    /// speaks beats an SDK per vendor, and it keeps the credential surface to one
+    /// username and one password held as a `Secret`.
+    Smtp(Box<SmtpConfig>),
 }
+
+/// Connection details for the SMTP transport.
+///
+/// `implicit_tls` selects between the two ways SMTP is secured, because getting
+/// this wrong silently sends credentials in clear text:
+///
+/// * `true`  — TLS from the first byte, conventionally port 465 (SMTPS).
+/// * `false` — connect in clear, then **require** STARTTLS before authenticating.
+///   Conventionally port 587. This is not opportunistic: if the server does not
+///   offer STARTTLS the connection fails rather than continuing unencrypted.
+///
+/// There is no third option. Unencrypted SMTP is not configurable here at all.
+#[derive(Clone)]
+pub struct SmtpConfig {
+    pub host: String,
+    pub port: u16,
+    pub implicit_tls: bool,
+    pub username: String,
+    pub password: Secret<String>,
+    /// The envelope sender, e.g. `RoleBlank <no-reply@example.com>`.
+    pub from: String,
+}
+
+impl std::fmt::Debug for SmtpConfig {
+    /// Never renders the password, and never the username either — an SMTP
+    /// username is usually the sending address, which is not a secret but is an
+    /// identifier nobody needs in a log line.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SmtpConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("implicit_tls", &self.implicit_tls)
+            .field("username", &"<redacted>")
+            .field("password", &"<redacted>")
+            .field("from", &self.from)
+            .finish()
+    }
+}
+
+impl PartialEq for SmtpConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.host == other.host
+            && self.port == other.port
+            && self.implicit_tls == other.implicit_tls
+            && self.username == other.username
+            && self.from == other.from
+    }
+}
+impl Eq for SmtpConfig {}
 
 #[derive(Debug, Clone)]
 pub struct SecurityConfig {
@@ -171,6 +333,11 @@ pub struct Config {
     pub cors_allowed_origins: Vec<String>,
     pub trusted_proxies: net::TrustedProxies,
     pub mail: MailProviderKind,
+    /// An explicit operator acknowledgement that running without mail delivery is
+    /// intended. Parsed here rather than read inside `validate` so that validation
+    /// stays a pure function of the configuration — a validator that consults the
+    /// environment cannot be tested without mutating global state.
+    pub mail_allow_disabled: bool,
     pub log_json: bool,
     /// Serving the OpenAPI document is opt-in and off by default in production.
     pub expose_openapi: bool,
@@ -480,10 +647,11 @@ impl Config {
             sessions,
             security,
             limits,
-            rate_limits: RateLimitConfig::default(),
+            rate_limits: RateLimitConfig::from_env(&mut errors),
             cors_allowed_origins,
             trusted_proxies,
             mail,
+            mail_allow_disabled: env_parse("RB_MAIL_ALLOW_DISABLED", false, &mut errors),
             log_json: env_parse("RB_LOG_JSON", environment.is_production(), &mut errors),
             expose_openapi: env_parse(
                 "RB_EXPOSE_OPENAPI",
@@ -651,16 +819,47 @@ impl Config {
             errors.push("RB_LOG_JSON must be true in production so logs are machine-parseable");
         }
 
-        if matches!(
-            self.mail,
-            MailProviderKind::DevSink | MailProviderKind::DevFile { .. }
-        ) {
-            errors.push(
-                "RB_MAIL_PROVIDER is a development sink. No production mail provider is \
-                 implemented yet, so password-reset and invitation delivery would silently \
-                 go nowhere. Set RB_MAIL_PROVIDER=disabled to acknowledge this, which makes \
-                 those flows fail loudly instead.",
-            );
+        // Mail is not optional in production, because the flows that need it are the
+        // flows that let people in: an invitation is the only path to an internal
+        // account, and a password reset is the only path back into an existing one.
+        match &self.mail {
+            MailProviderKind::DevSink | MailProviderKind::DevFile { .. } => {
+                errors.push(
+                    "RB_MAIL_PROVIDER is a development sink, so invitation and                      password-reset delivery would go nowhere. Use RB_MAIL_PROVIDER=smtp                      in production.",
+                );
+            }
+            MailProviderKind::Disabled => {
+                // Refusing here is the change that closes the gap. Previously
+                // `disabled` was accepted in production unconditionally, so a
+                // deployment could boot looking healthy while every invitation and
+                // every password reset failed in the outbox. It never *pretended* to
+                // deliver — that part was always right — but a backend that starts
+                // cleanly and cannot onboard or recover a single user is not a
+                // working production system.
+                //
+                // An operator who genuinely wants that (an internal instance where
+                // accounts are provisioned another way) can still have it, but has to
+                // say so out loud.
+                if !self.mail_allow_disabled {
+                    errors.push(
+                        "RB_MAIL_PROVIDER=disabled in production: invitations and password                          resets cannot be delivered, so nobody can be onboarded or                          recovered. Configure RB_MAIL_PROVIDER=smtp, or set                          RB_MAIL_ALLOW_DISABLED=true to accept that deliberately.",
+                    );
+                }
+            }
+            MailProviderKind::Smtp(smtp) => {
+                // The transport refuses to send in clear text on its own, but a
+                // configuration that only looks complete should fail here rather
+                // than at the first invitation.
+                if smtp.host.trim().is_empty() {
+                    errors.push("RB_SMTP_HOST is empty");
+                }
+                if smtp.password.expose().trim().is_empty() {
+                    errors.push("RB_SMTP_PASSWORD is empty");
+                }
+                if smtp.from.trim().is_empty() {
+                    errors.push("RB_SMTP_FROM is empty");
+                }
+            }
         }
 
         if self.trusted_proxies.is_empty() && self.bind_address.starts_with("0.0.0.0") {
@@ -730,7 +929,19 @@ mod tests {
             rate_limits: RateLimitConfig::default(),
             cors_allowed_origins: vec!["https://app.example.com".into()],
             trusted_proxies: net::TrustedProxies::default(),
-            mail: MailProviderKind::Disabled,
+            // A *correct* production posture has a working delivery path, so the
+            // reference configuration shows one rather than the acknowledged-absent
+            // variant. Every value here is a placeholder that would fail validation
+            // if it were empty, which is the point.
+            mail: MailProviderKind::Smtp(Box::new(SmtpConfig {
+                host: "smtp.example.com".into(),
+                port: 465,
+                implicit_tls: true,
+                username: "no-reply@example.com".into(),
+                password: Secret::new("smtp-password".into()),
+                from: "RoleBlank <no-reply@example.com>".into(),
+            })),
+            mail_allow_disabled: false,
             log_json: true,
             expose_openapi: false,
             metrics_enabled: true,
@@ -869,7 +1080,39 @@ mod tests {
             directory: "/tmp".into()
         })
         .contains("development sink"));
-        assert_eq!(prod_errors(|c| c.mail = MailProviderKind::Disabled), "");
+        // `disabled` is no longer silently acceptable: a production backend that
+        // boots cleanly but can neither onboard nor recover a user is not working.
+        assert!(prod_errors(|c| c.mail = MailProviderKind::Disabled)
+            .contains("nobody can be onboarded"));
+    }
+
+    /// ...but an operator may still choose it deliberately, out loud.
+    #[test]
+    fn production_accepts_disabled_mail_only_when_explicitly_acknowledged() {
+        assert_eq!(
+            prod_errors(|c| {
+                c.mail = MailProviderKind::Disabled;
+                c.mail_allow_disabled = true;
+            }),
+            ""
+        );
+    }
+
+    #[test]
+    fn production_refuses_a_half_configured_smtp_transport() {
+        let errors = prod_errors(|c| {
+            c.mail = MailProviderKind::Smtp(Box::new(SmtpConfig {
+                host: "".into(),
+                port: 465,
+                implicit_tls: true,
+                username: "u".into(),
+                password: Secret::new(String::new()),
+                from: "".into(),
+            }))
+        });
+        assert!(errors.contains("RB_SMTP_HOST is empty"), "{errors}");
+        assert!(errors.contains("RB_SMTP_PASSWORD is empty"), "{errors}");
+        assert!(errors.contains("RB_SMTP_FROM is empty"), "{errors}");
     }
 
     #[test]

@@ -383,3 +383,59 @@ fn the_scanner_recovers_the_extensions_it_claims_to() {
          {anonymous_in_table}"
     );
 }
+
+/// The JSON artifact and the YAML source must describe the same API.
+///
+/// Only the YAML is checked against `ROUTE_TABLE` by the tests above, but
+/// `api/openapi.json` is the artifact a frontend generates its client from. Two
+/// files that are meant to be the same document and are validated differently will
+/// eventually disagree, and the failure would surface as a frontend calling a route
+/// with the wrong shape — a long way from here, and hard to trace back.
+///
+/// Compared as sets of `METHOD path`, not byte-for-byte: the two serialisations
+/// legitimately differ in key order and formatting.
+#[test]
+fn the_json_artifact_and_the_yaml_source_agree() {
+    let json_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../api/openapi.json");
+    let raw = std::fs::read_to_string(&json_path)
+        .unwrap_or_else(|e| panic!("could not read {}: {e}", json_path.display()));
+    let spec: serde_json::Value =
+        serde_json::from_str(&raw).expect("api/openapi.json is not valid JSON");
+
+    let mut from_json: Vec<String> = spec["paths"]
+        .as_object()
+        .expect("paths object")
+        .iter()
+        .flat_map(|(path, item)| {
+            item.as_object()
+                .into_iter()
+                .flatten()
+                .filter(|(method, _)| {
+                    matches!(method.as_str(), "get" | "post" | "put" | "patch" | "delete")
+                })
+                .map(move |(method, _)| format!("{} {path}", method.to_uppercase()))
+        })
+        .collect();
+
+    let mut from_yaml: Vec<String> = load()
+        .keys()
+        .map(|(method, path)| format!("{method} {path}"))
+        .collect();
+
+    from_json.sort();
+    from_yaml.sort();
+
+    let only_json: Vec<&String> = from_json
+        .iter()
+        .filter(|k| !from_yaml.contains(k))
+        .collect();
+    let only_yaml: Vec<&String> = from_yaml
+        .iter()
+        .filter(|k| !from_json.contains(k))
+        .collect();
+
+    assert!(
+        only_json.is_empty() && only_yaml.is_empty(),
+        "the two OpenAPI artifacts disagree.\n  only in openapi.json: {only_json:?}\n  only in openapi.yaml: {only_yaml:?}"
+    );
+}
