@@ -1,0 +1,229 @@
+###############################################################################
+# 02 — Users, invitations and self-registration
+#
+# There is no POST /api/v1/users. An account comes into existence in exactly
+# three ways: bootstrap (the owner), an invitation that somebody redeems, or
+# self-registration when the deployment has it switched on. There is also no
+# user-delete endpoint — accounts are archived, never erased.
+#
+# NEVER COMMIT A REAL CREDENTIAL OR TOKEN TO THIS FILE.
+# Everything below is a placeholder.
+###############################################################################
+
+@baseUrl = http://localhost:8090
+@accessToken = REPLACE_WITH_ACCESS_TOKEN
+
+@userId = 00000000-0000-7000-8000-000000000001
+@invitationId = 00000000-0000-7000-8000-000000000002
+@roleId = 00000000-0000-7000-8000-000000000003
+@departmentId = 00000000-0000-7000-8000-000000000004
+@clientAccountId = 00000000-0000-7000-8000-000000000005
+
+# The optimistic-concurrency token, read from the resource you are about to
+# change. Send back the value you actually read — a guess is a 409.
+@userVersion = 1
+
+# Any 8–200 printable-ASCII string, unique per logical create. A UUID is fine.
+@idempotencyKey = REPLACE_WITH_A_FRESH_UUID_PER_CREATE
+
+
+### List users
+# Cursor-paginated. `limit` defaults to 25 and caps at 100; `sort` is an
+# allowlist per endpoint, not a column name.
+# Correct response: 200 {items: [...], next_cursor, has_more}. Note there is no
+# `total` — computing one means re-scanning the whole matching set on every
+# request.
+GET {{baseUrl}}/api/v1/users?limit=25&sort=created_at&direction=desc&status=ACTIVE&principal_type=INTERNAL
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### Search users
+# `search` is a case-insensitive substring over the normalised email and the
+# display name. Correct response: 200 with a (possibly empty) page.
+GET {{baseUrl}}/api/v1/users?search=alice&limit=10
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### Follow a cursor
+# Paste `next_cursor` from the previous page. The cursor is opaque and keyset
+# based, so page 10 000 costs the same as page 1. It is not signed and is not a
+# security boundary — a forged cursor can only reposition a query you were
+# already allowed to run.
+GET {{baseUrl}}/api/v1/users?limit=25&cursor=REPLACE_WITH_NEXT_CURSOR
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### Read one user
+# Correct response: 200. `email_normalized` is deliberately absent, and no
+# response type in this module has a field capable of holding a password hash.
+GET {{baseUrl}}/api/v1/users/{{userId}}
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### Update a user
+# Only `display_name` and `email` are writable. `principal_type`, `status`,
+# `security_version`, `mfa_required` and role membership are not fields of this
+# request at all.
+# Correct response: 200 with the updated user and an incremented `version`.
+# A stale `version` is 409 VERSION_CONFLICT — re-read and retry.
+PATCH {{baseUrl}}/api/v1/users/{{userId}}
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "version": {{userVersion}},
+  "display_name": "Alice Example"
+}
+
+
+### Suspend a user
+# Correct response: 200 with status SUSPENDED; the subject's sessions are
+# revoked. Targeting the system owner is 403 ROOT_PROTECTED.
+POST {{baseUrl}}/api/v1/users/{{userId}}/suspend
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "version": {{userVersion}},
+  "reason": "Investigating a reported credential compromise"
+}
+
+
+### Reactivate a user
+# Correct response: 200 with status ACTIVE. An ARCHIVED account is not
+# reactivated here: that transition is 409.
+POST {{baseUrl}}/api/v1/users/{{userId}}/reactivate
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "version": {{userVersion}}
+}
+
+
+### Archive a user
+# The terminal state, and the closest thing to deletion this API offers. The row
+# survives so historical references and the meaning of the audit log survive
+# with it. There is no DELETE /api/v1/users/{id} and the runtime database role
+# holds no DELETE grant on the users table at all.
+# Correct response: 200 with status ARCHIVED.
+POST {{baseUrl}}/api/v1/users/{{userId}}/archive
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "version": {{userVersion}},
+  "reason": "Left the company"
+}
+
+
+### List invitations
+# Correct response: 200, a page of invitations. No projection anywhere carries
+# the invitation token or its digest — the token exists only in the email.
+GET {{baseUrl}}/api/v1/invitations?status=PENDING&limit=25
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### Invite an internal colleague  — idempotent
+# The only path to an INTERNAL account. The role set is checked against the
+# INVITER's own authority now and again at acceptance, so a stale invitation
+# cannot outlive the authority that created it.
+#
+# `Idempotency-Key` makes the retry safe: same key + same body replays the
+# stored response; same key + DIFFERENT body is 409 IDEMPOTENCY_KEY_REUSED.
+# Keys are scoped per principal, so one caller's key can never replay another's.
+#
+# Correct response: 201 with the invitation and an email dispatched. Inviting an
+# address that already has a live invitation is 409 — one live invitation per
+# address, deterministically.
+POST {{baseUrl}}/api/v1/invitations
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+Idempotency-Key: {{idempotencyKey}}
+
+{
+  "email": "new.colleague@example.com",
+  "display_name": "New Colleague",
+  "principal_type": "INTERNAL",
+  "role_ids": ["{{roleId}}"],
+  "department_id": "{{departmentId}}",
+  "client_account_id": null
+}
+
+
+### Invite an external client contact  — idempotent
+# A CLIENT invitation carries a client account and never a department; the
+# database refuses the other combination outright.
+POST {{baseUrl}}/api/v1/invitations
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+Idempotency-Key: REPLACE_WITH_A_DIFFERENT_FRESH_UUID
+
+{
+  "email": "contact@client.example.com",
+  "display_name": "Client Contact",
+  "principal_type": "CLIENT",
+  "role_ids": [],
+  "department_id": null,
+  "client_account_id": "{{clientAccountId}}"
+}
+
+
+### Revoke a pending invitation
+# Correct response: 204. Revocation is a status change, not a row deletion. An
+# already accepted invitation cannot be revoked: 409.
+DELETE {{baseUrl}}/api/v1/invitations/{{invitationId}}
+Authorization: Bearer {{accessToken}}
+
+
+### Redeem an invitation  — ANONYMOUS
+# No Authorization header: the invitee has no account yet. The token is in the
+# BODY, never in the path or query.
+# Correct response: 200 with the new account, and NO session and NO token — the
+# invitee logs in through the ordinary path. An unknown or expired token is 404.
+POST {{baseUrl}}/api/v1/invitations/accept
+Content-Type: application/json
+Accept: application/json
+
+{
+  "token": "REPLACE_WITH_INVITATION_TOKEN_FROM_EMAIL",
+  "password": "REPLACE_WITH_A_LONG_PASSPHRASE",
+  "display_name": "New Colleague"
+}
+
+
+### Is self-registration open?  — ANONYMOUS
+# Correct response: 200 with exactly two fields, e.g.
+# {"registration_available": false, "registration_type": null}. It must not
+# disclose the configured mode name.
+GET {{baseUrl}}/api/v1/registration/config
+Accept: application/json
+
+
+### Self-register  — ANONYMOUS
+# Available only when `registration.mode` is CLIENT_SELF_REGISTRATION, and it
+# can only ever create a CLIENT principal in PENDING status with no client
+# memberships — so it grants visibility of nothing until somebody internal acts.
+# There is no field here for `principal_type`, `role_ids` or `status`.
+# Correct response: 202 with a fixed constant that does not reveal whether the
+# address was already registered.
+POST {{baseUrl}}/api/v1/registration
+Content-Type: application/json
+Accept: application/json
+
+{
+  "email": "prospect@client.example.com",
+  "display_name": "Prospective Client",
+  "password": "REPLACE_WITH_A_LONG_PASSPHRASE"
+}

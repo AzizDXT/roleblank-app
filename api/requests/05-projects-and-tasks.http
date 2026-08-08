@@ -1,0 +1,248 @@
+###############################################################################
+# 05 — Projects, project membership, client sharing, tasks and assignees
+#
+# The rule that shapes this whole file: a resource identifier is NOT an
+# authorisation. Client visibility comes from an explicit share joined to an
+# active client membership, never from possession of a UUID.
+#
+# There is deliberately no file-upload endpoint anywhere in this API.
+#
+# NEVER COMMIT A REAL CREDENTIAL OR TOKEN TO THIS FILE.
+###############################################################################
+
+@baseUrl = http://localhost:8090
+@accessToken = REPLACE_WITH_ACCESS_TOKEN
+
+@projectId = 00000000-0000-7000-8000-000000000007
+@taskId = 00000000-0000-7000-8000-000000000009
+@internalUserId = 00000000-0000-7000-8000-000000000001
+@departmentId = 00000000-0000-7000-8000-000000000004
+@clientAccountId = 00000000-0000-7000-8000-000000000005
+@version = 1
+@idempotencyKey = REPLACE_WITH_A_FRESH_UUID_PER_CREATE
+
+
+# =============================================================================
+# Projects
+# =============================================================================
+
+### List projects
+GET {{baseUrl}}/api/v1/projects?limit=25&status=ACTIVE&department_id={{departmentId}}&sort=created_at&direction=desc
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### Create a project  — idempotent
+# The manager must be an INTERNAL principal; the database refuses anything else.
+# Creating a project shares it with nobody — external visibility comes only from
+# an explicit share, further down this file.
+# Correct response: 201 with the internal projection, including `internal_note`.
+POST {{baseUrl}}/api/v1/projects
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+Idempotency-Key: {{idempotencyKey}}
+
+{
+  "code": "acme-rollout",
+  "name": "Acme rollout",
+  "description": "Phase one of the Acme delivery programme.",
+  "manager_user_id": "{{internalUserId}}",
+  "department_id": "{{departmentId}}",
+  "start_date": "2026-09-01",
+  "target_date": "2026-12-15",
+  "internal_note": "Margin is thin; escalate scope changes."
+}
+
+
+### Read one project (internal projection)
+# Correct response: 200 with all sixteen internal fields, including
+# `internal_note`, `manager_user_id`, `department_id`, `created_by` and
+# `version`. Compare 06-client-portal.http, which returns nine.
+GET {{baseUrl}}/api/v1/projects/{{projectId}}
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### Update a project
+# `code` is immutable, and `status` may not be set to ARCHIVED here.
+# `department_id`, `start_date` and `target_date` distinguish absent from an
+# explicit null.
+# Correct response: 200 with an incremented `version`. Stale version → 409.
+PATCH {{baseUrl}}/api/v1/projects/{{projectId}}
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "version": {{version}},
+  "name": "Acme rollout — phase one",
+  "status": "PAUSED",
+  "target_date": null
+}
+
+
+### Archive a project
+# Terminal. Existing client shares stop resolving.
+POST {{baseUrl}}/api/v1/projects/{{projectId}}/archive
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "version": {{version}},
+  "reason": "Delivered and signed off"
+}
+
+
+### List internal project members
+# Company staff only. Client accounts with access are a different relationship
+# entirely and appear under the project's client links, below.
+GET {{baseUrl}}/api/v1/projects/{{projectId}}/members?limit=50
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### Add an internal member
+# Membership is what resolves ASSIGNED scope for this project, so adding
+# somebody genuinely widens what they can reach — it is an authorisation change,
+# not bookkeeping.
+POST {{baseUrl}}/api/v1/projects/{{projectId}}/members
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "user_id": "{{internalUserId}}",
+  "role_in_project": "LEAD"
+}
+
+
+### Remove an internal member
+DELETE {{baseUrl}}/api/v1/projects/{{projectId}}/members/{{internalUserId}}
+Authorization: Bearer {{accessToken}}
+
+
+### Which client accounts is this project shared with?
+# Live shares only. Revocation is an update, not a delete: the history of what
+# was shared with whom is exactly what a client dispute later turns on.
+GET {{baseUrl}}/api/v1/projects/{{projectId}}/clients
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### Share the project with a client account  — REQUIRES STEP-UP
+# This call crosses the external trust boundary. It makes the project visible to
+# every ACTIVE member of the named client account, which is why it sits behind a
+# recent second factor rather than a permission alone.
+#
+# It does NOT expose the project's tasks. There is no `tasks` and no
+# `include_tasks` field here, and task visibility is per task and never
+# inherited — see `client_visible` below.
+#
+# Correct response: 201. Without a recent second factor: 403 STEP_UP_REQUIRED.
+POST {{baseUrl}}/api/v1/projects/{{projectId}}/clients
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "client_account_id": "{{clientAccountId}}",
+  "note": "Shared for the phase-one status review"
+}
+
+
+### Withdraw the share  — REQUIRES STEP-UP
+# Correct response: 204. The link is marked revoked rather than deleted.
+DELETE {{baseUrl}}/api/v1/projects/{{projectId}}/clients/{{clientAccountId}}
+Authorization: Bearer {{accessToken}}
+
+
+# =============================================================================
+# Tasks
+# =============================================================================
+
+### List the tasks of one project
+# The internal projection, including `internal_note` and `client_visible`.
+GET {{baseUrl}}/api/v1/projects/{{projectId}}/tasks?limit=25&status=TODO
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### List tasks across projects
+GET {{baseUrl}}/api/v1/tasks?limit=25&project_id={{projectId}}&status=IN_PROGRESS&priority=HIGH
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### Create a task  — idempotent
+# `client_visible` defaults to false. Setting it true is the deliberate act that
+# exposes a task through the client portal, and it is never inherited from the
+# project's share state — sharing a project must not silently expose its task
+# list.
+POST {{baseUrl}}/api/v1/tasks
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+Idempotency-Key: REPLACE_WITH_A_DIFFERENT_FRESH_UUID
+
+{
+  "project_id": "{{projectId}}",
+  "title": "Confirm the site survey date",
+  "description": "Needs the client's facilities contact.",
+  "status": "TODO",
+  "priority": "HIGH",
+  "due_date": "2026-09-30",
+  "client_visible": false,
+  "internal_note": "Chase via the account manager, not the site directly."
+}
+
+
+### Read one task (internal projection)
+GET {{baseUrl}}/api/v1/tasks/{{taskId}}
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### Update a task
+# `project_id` is immutable: moving a task between projects would move it across
+# a visibility boundary silently.
+# Flipping `client_visible` to true is what makes this task readable in the
+# client portal — and only if its project is also shared.
+PATCH {{baseUrl}}/api/v1/tasks/{{taskId}}
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "version": {{version}},
+  "status": "IN_PROGRESS",
+  "client_visible": true
+}
+
+
+### Delete a task
+# The only true delete in this API, and it is scoped to a task. Users, projects,
+# departments, client accounts, invitations and audit rows are never deleted.
+# Correct response: 204.
+DELETE {{baseUrl}}/api/v1/tasks/{{taskId}}
+Authorization: Bearer {{accessToken}}
+
+
+### Assign somebody to a task
+# Assignees must be INTERNAL principals. Assignment resolves ASSIGNED scope for
+# this task, so it widens what that person can reach.
+POST {{baseUrl}}/api/v1/tasks/{{taskId}}/assignees
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "user_id": "{{internalUserId}}"
+}
+
+
+### Unassign
+# Correct response: 204. Sets `removed_at`; the row is retained.
+DELETE {{baseUrl}}/api/v1/tasks/{{taskId}}/assignees/{{internalUserId}}
+Authorization: Bearer {{accessToken}}

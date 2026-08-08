@@ -1,0 +1,128 @@
+###############################################################################
+# 06 — The client portal: the complete surface an external principal may reach
+#
+# Four operations. All GET. Nothing here mutates anything, and there is no fifth
+# endpoint hiding elsewhere in the spec.
+#
+# Use a token belonging to a CLIENT principal for these. Using an INTERNAL token
+# works too — the permissions allow it — but it proves nothing about the
+# boundary. The interesting run is the CLIENT one, and the interesting result is
+# what comes back missing.
+#
+# NEVER COMMIT A REAL CREDENTIAL OR TOKEN TO THIS FILE.
+###############################################################################
+
+@baseUrl = http://localhost:8090
+
+# A token for an external CLIENT principal with an ACTIVE client membership.
+@clientAccessToken = REPLACE_WITH_A_CLIENT_PRINCIPAL_ACCESS_TOKEN
+
+@projectId = 00000000-0000-7000-8000-000000000007
+@taskId = 00000000-0000-7000-8000-000000000009
+
+
+### Projects shared with me
+# Only `cursor` and `limit` are accepted here. There is no `sort`, no
+# `direction`, no `status` and no `department_id`, because an external principal
+# must not learn that departments exist — see the probe at the bottom of this
+# file.
+#
+# Correct response: 200 {items, next_cursor, has_more} where each item has
+# exactly nine fields: id, code, name, description, status, start_date,
+# target_date, completed_at, updated_at.
+#
+# Absent by construction, not by filtering: internal_note, created_by,
+# manager_user_id, department_id, version. `ClientProject` is a separate type
+# from `Project`, so those fields have no place in it to leak from.
+GET {{baseUrl}}/api/v1/client-portal/projects?limit=25
+Authorization: Bearer {{clientAccessToken}}
+Accept: application/json
+
+
+### One shared project
+# Correct response: 200 with the same nine-field projection.
+#
+# A project that is NOT shared with one of your active client accounts answers
+# 404, never 403 — the refusal must not confirm that the project exists.
+# Visibility is derived per request from a live share joined to an ACTIVE
+# membership joined to an ACTIVE client account; holding the UUID authorises
+# nothing.
+GET {{baseUrl}}/api/v1/client-portal/projects/{{projectId}}
+Authorization: Bearer {{clientAccessToken}}
+Accept: application/json
+
+
+### Client-visible tasks of a shared project
+# Returns ONLY tasks explicitly marked `client_visible`. Sharing a project does
+# not share its tasks; the flag is per task, defaults to false and is never
+# inherited.
+#
+# Correct response: 200 with items carrying id, project_id, title, description,
+# status, due_date, completed_at, updated_at. `internal_note`, `created_by`,
+# assignee identities, `version` — and `client_visible` itself — are absent.
+GET {{baseUrl}}/api/v1/client-portal/projects/{{projectId}}/tasks?limit=25
+Authorization: Bearer {{clientAccessToken}}
+Accept: application/json
+
+
+### One client-visible task
+# Correct response: 200 with the reduced projection.
+# A task that is not client-visible, or whose project is not shared with you,
+# answers 404.
+GET {{baseUrl}}/api/v1/client-portal/tasks/{{taskId}}
+Authorization: Bearer {{clientAccessToken}}
+Accept: application/json
+
+
+###############################################################################
+# Boundary probes. These MUST fail. Run them with the CLIENT token.
+###############################################################################
+
+### A CLIENT reaching an internal route
+# EXPECTED: 404, code RESOURCE_NOT_FOUND.
+# Not 403: for an external principal a would-be 403 is converted to a 404, so
+# that a refusal does not confirm the existence of anything internal. The
+# refusal happens at the principal-envelope check, before any grant is even
+# looked up, because `projects.read` has max_principal_type INTERNAL.
+GET {{baseUrl}}/api/v1/projects
+Authorization: Bearer {{clientAccessToken}}
+Accept: application/json
+
+
+### A CLIENT reading the internal projection of a project it CAN see in the portal
+# EXPECTED: 404, code RESOURCE_NOT_FOUND — even though the same project is
+# readable at /client-portal/projects/{id}. The portal projection is the only
+# view an external principal has of it.
+GET {{baseUrl}}/api/v1/projects/{{projectId}}
+Authorization: Bearer {{clientAccessToken}}
+Accept: application/json
+
+
+### A CLIENT reading the user directory
+# EXPECTED: 404, code RESOURCE_NOT_FOUND.
+GET {{baseUrl}}/api/v1/users
+Authorization: Bearer {{clientAccessToken}}
+Accept: application/json
+
+
+### A CLIENT trying to sort or filter the portal listing
+# EXPECTED: 400, code VALIDATION_FAILED. The portal list query accepts `cursor`
+# and `limit` and nothing else; unknown query parameters are rejected rather
+# than ignored. Ignoring them is how a filter that should not exist quietly
+# starts working after somebody widens the shared query struct.
+GET {{baseUrl}}/api/v1/client-portal/projects?limit=25&sort=name&direction=asc&department_id=00000000-0000-7000-8000-000000000004
+Authorization: Bearer {{clientAccessToken}}
+Accept: application/json
+
+
+### A CLIENT trying to write through the portal
+# EXPECTED: 405 from the router — there is no POST on this path in the route
+# table, so it is not merely forbidden, it does not exist. The client portal is
+# read-only and a test in routes.rs asserts every portal route is a GET.
+POST {{baseUrl}}/api/v1/client-portal/projects
+Authorization: Bearer {{clientAccessToken}}
+Content-Type: application/json
+
+{
+  "name": "A project I invented"
+}

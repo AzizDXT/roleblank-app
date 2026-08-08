@@ -1,0 +1,413 @@
+###############################################################################
+# 99 — Attack probes. EVERY REQUEST IN THIS FILE MUST FAIL.
+#
+# This file is documentation of the security posture as much as it is a test
+# tool. Each probe states the status and the stable `code` a correct
+# implementation returns. If any of them succeeds, or returns a 500, or returns
+# a body that echoes the input back, that is a defect — not a curiosity.
+#
+# Three failure modes to watch for beyond the status code:
+#   * a 500 where a 4xx was expected — the input reached somewhere it should not
+#     have, and the stack trace went into a log instead of being handled;
+#   * a `detail` or field `message` that quotes the rejected value back — that is
+#     how a validation error becomes a reflection gadget and a log-injection
+#     vector;
+#   * an error that differentiates between two authentication failure modes —
+#     that is an account-enumeration oracle.
+#
+# NEVER COMMIT A REAL CREDENTIAL OR TOKEN TO THIS FILE.
+# The tokens below are deliberately fake and deliberately malformed.
+###############################################################################
+
+@baseUrl = http://localhost:8090
+
+# A real, valid access token. Needed only by the probes that test what a
+# legitimately authenticated caller still cannot do.
+@accessToken = REPLACE_WITH_ACCESS_TOKEN
+
+@bootstrapSecret = REPLACE_WITH_RB_BOOTSTRAP_SECRET
+
+
+### PROBE 01 — a token in the query string
+# EXPECTED: 401, code AUTHENTICATION_FAILED.
+# `Authorization: Bearer` is the only way to authenticate. There is no
+# `?access_token=` fallback and there must never be one: a URL is written to
+# proxy logs, kept in browser history and forwarded in the `Referer` header of
+# every outbound link, so a credential in one is a credential you have published.
+# The server must not even look at this parameter.
+GET {{baseUrl}}/api/v1/users?access_token=rb_at_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+Accept: application/json
+
+
+### PROBE 02 — an unknown JSON field on a registration body
+# EXPECTED: 400, code VALIDATION_FAILED.
+# Request DTOs are closed: an unknown member is a rejection, never a silently
+# ignored field. Silently ignoring it is how a smuggled field starts being
+# honoured the day somebody widens the struct for an unrelated reason.
+POST {{baseUrl}}/api/v1/registration
+Content-Type: application/json
+Accept: application/json
+
+{
+  "email": "attacker@example.com",
+  "display_name": "Attacker",
+  "password": "correct horse battery staple",
+  "is_root": true
+}
+
+
+### PROBE 03 — role_ids submitted during registration
+# EXPECTED: 400, code VALIDATION_FAILED.
+# Self-registration cannot choose its own authority. `RegisterRequest` has three
+# members and none of them is `role_ids`; the refusal is structural, not a
+# service check somebody could forget to write.
+POST {{baseUrl}}/api/v1/registration
+Content-Type: application/json
+Accept: application/json
+
+{
+  "email": "attacker@example.com",
+  "display_name": "Attacker",
+  "password": "correct horse battery staple",
+  "role_ids": ["00000000-0000-7000-8000-000000000001"]
+}
+
+
+### PROBE 04 — principal_type INTERNAL on registration
+# EXPECTED: 400, code VALIDATION_FAILED.
+# The single most valuable field an attacker could set. Self-registration can
+# only ever produce a CLIENT principal, and it produces one because the service
+# writes the literal — not because it validated what the caller asked for. Even
+# if this field were accepted it would be overwritten; it is rejected so that
+# the attempt is visible rather than silently ignored.
+POST {{baseUrl}}/api/v1/registration
+Content-Type: application/json
+Accept: application/json
+
+{
+  "email": "attacker@example.com",
+  "display_name": "Attacker",
+  "password": "correct horse battery staple",
+  "principal_type": "INTERNAL"
+}
+
+
+### PROBE 05 — a second bootstrap attempt
+# EXPECTED: 409, code SYSTEM_ALREADY_INITIALIZED.
+# Even with the correct operator secret. Bootstrap is permanently closed once
+# the system has an owner, and the guarantee is a primary-key constraint on a
+# singleton row rather than an application check — a second bootstrap is a
+# storage-layer violation, which is stronger than anything code can promise.
+#
+# Run this with a WRONG secret too. It must give the same 409, not a 401: once
+# the system is initialised the endpoint has nothing to authenticate against,
+# and answering differently would turn it into a secret oracle.
+POST {{baseUrl}}/api/v1/bootstrap/root
+Content-Type: application/json
+Accept: application/json
+
+{
+  "bootstrap_secret": "{{bootstrapSecret}}",
+  "email": "second.owner@example.com",
+  "display_name": "Second Owner",
+  "password": "correct horse battery staple"
+}
+
+
+### PROBE 06 — an oversized page limit
+# EXPECTED: 400, code VALIDATION_FAILED, with a field error on `limit` whose
+# code is OUT_OF_RANGE.
+# The cap is 100 and a deployment may configure it lower; a client cannot
+# override either. An unbounded limit turns one request into an arbitrarily
+# expensive query, which is a denial-of-service primitive handed out for free.
+# `limit=0` and `limit=-1` must fail the same way.
+GET {{baseUrl}}/api/v1/users?limit=1000000
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### PROBE 07 — SQL injection through `sort`
+# EXPECTED: 400, code VALIDATION_FAILED, with a field error on `sort` whose code
+# is NOT_ALLOWED.
+# `ORDER BY $user_input` cannot be parameterised, so it is either an allowlist or
+# it is SQL injection. Every sortable field maps to a compile-time `&'static str`
+# and the caller's string is only ever COMPARED, never interpolated.
+#
+# Check the response body as carefully as the status: the message names the
+# permitted fields, because those are public API surface, and it must NOT
+# contain the word DROP or any other fragment of what was sent.
+GET {{baseUrl}}/api/v1/users?sort=created_at;%20DROP%20TABLE%20users--
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### PROBE 07b — a subquery smuggled through `sort`
+# EXPECTED: 400, code VALIDATION_FAILED, field `sort`, code NOT_ALLOWED.
+GET {{baseUrl}}/api/v1/users?sort=(SELECT%20password_hash%20FROM%20credentials)
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### PROBE 08 — CRLF injection through a display name
+# EXPECTED: 400, code VALIDATION_FAILED, with a field error on `display_name`.
+# The payload is a carriage return, a line feed and a forged log line. Two
+# independent defences must hold, and this probe tests both:
+#   1. the value is rejected at validation, and
+#   2. even if it were accepted, the log layer sanitises control characters, so
+#      it could not forge a log line or smuggle an ANSI escape into a terminal.
+# The error `message` must not echo the payload — echoing it is exactly the
+# injection the probe is testing for, just via a different channel.
+POST {{baseUrl}}/api/v1/registration
+Content-Type: application/json
+Accept: application/json
+
+{
+  "email": "crlf@example.com",
+  "display_name": "Attacker\r\nlevel=ERROR event=\"AUDIT BYPASSED\" actor=root",
+  "password": "correct horse battery staple"
+}
+
+
+### PROBE 09 — a malformed UUID in a path
+# EXPECTED: 400 (code BAD_REQUEST or VALIDATION_FAILED). Never 500, and never a
+# body containing a parser message, a type name or a stack frame.
+# The path extractor rejects before any handler, any database query and any
+# authorisation check runs.
+GET {{baseUrl}}/api/v1/users/not-a-uuid
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### PROBE 09b — a UUID-shaped value with an injection tail
+# EXPECTED: 400. Same reasoning; the extractor is the boundary.
+GET {{baseUrl}}/api/v1/projects/00000000-0000-7000-8000-000000000001'%20OR%20'1'='1
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### PROBE 10 — a missing Authorization header
+# EXPECTED: 401, code AUTHENTICATION_FAILED.
+# Note what this must NOT be: a 403. A 403 would say "you are somebody, but not
+# somebody allowed", which is information. No header means no principal.
+GET {{baseUrl}}/api/v1/users
+Accept: application/json
+
+
+### PROBE 11 — a malformed bearer header
+# EXPECTED: 401, code AUTHENTICATION_FAILED — byte for byte the same body as
+# PROBE 10 and as a wrong password, apart from `request_id`.
+# A malformed header, an unknown token, an expired token, a revoked session and
+# a suspended user must be indistinguishable on the wire. Any distinction is an
+# oracle. Try each of these lines in turn; all must answer identically.
+#   Authorization: Basic YWRtaW46YWRtaW4=
+#   Authorization: bearer
+#   Authorization: Bearer
+#   Authorization: rb_at_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+GET {{baseUrl}}/api/v1/users
+Authorization: Bearer=rb_at_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+Accept: application/json
+
+
+### PROBE 12 — an unsupported Content-Type
+# EXPECTED: 415, code UNSUPPORTED_MEDIA_TYPE.
+# Every body-bearing endpoint accepts application/json only. Accepting
+# form-encoded bodies alongside JSON is how a JSON endpoint becomes reachable
+# from a cross-site form post, because a form submission is not subject to the
+# preflight that a JSON request is.
+POST {{baseUrl}}/api/v1/auth/login
+Content-Type: application/x-www-form-urlencoded
+Accept: application/json
+
+email=owner@example.com&password=correct+horse+battery+staple
+
+
+### PROBE 12b — a text/plain body containing JSON
+# EXPECTED: 415, code UNSUPPORTED_MEDIA_TYPE. The bytes being valid JSON is not
+# the point; the declared type is.
+POST {{baseUrl}}/api/v1/auth/login
+Content-Type: text/plain
+Accept: application/json
+
+{"email":"owner@example.com","password":"correct horse battery staple"}
+
+
+###############################################################################
+# Further probes worth running by hand
+###############################################################################
+
+### An unknown query parameter on a list endpoint
+# EXPECTED: 400, code VALIDATION_FAILED. Query structs are closed too. A
+# silently ignored parameter is a filter that quietly starts working later.
+GET {{baseUrl}}/api/v1/users?limit=10&include_password_hash=true
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### A hand-crafted pagination cursor
+# EXPECTED: 400, code VALIDATION_FAILED, field `cursor`, code INVALID.
+# The cursor is opaque but NOT signed, and it is not a security boundary: the
+# worst a forged one can do is reposition a query the caller was already allowed
+# to run. It is length-bounded before decoding so that an unbounded base64 blob
+# is not free work.
+GET {{baseUrl}}/api/v1/users?cursor=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### A blind write with no version
+# EXPECTED: 400, code VALIDATION_FAILED — `version` is mandatory on every
+# versioned mutation. An optional version would make "overwrite whatever is
+# there" the default behaviour, which is the wrong default.
+PATCH {{baseUrl}}/api/v1/users/00000000-0000-7000-8000-000000000001
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "display_name": "Renamed without reading first"
+}
+
+
+### Mass assignment on a role update
+# EXPECTED: 400, code VALIDATION_FAILED. `is_system`, `code` and
+# `allowed_principal_type` are not members of the update request, so a role
+# cannot promote itself to a system role or change the envelope its permission
+# set was authorised against.
+PATCH {{baseUrl}}/api/v1/roles/00000000-0000-7000-8000-000000000003
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "version": 1,
+  "is_system": true,
+  "allowed_principal_type": "CLIENT"
+}
+
+
+### An override targeting somebody chosen in the body
+# EXPECTED: 400, code VALIDATION_FAILED. The subject comes from the path and
+# there is no `user_id` member to override it with.
+POST {{baseUrl}}/api/v1/users/00000000-0000-7000-8000-000000000001/permission-overrides
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "permission_code": "settings.features.write",
+  "effect": "ALLOW",
+  "scope": "GLOBAL",
+  "user_id": "00000000-0000-7000-8000-00000000ffff"
+}
+
+
+### A permission code that is not in the catalogue
+# EXPECTED: 400, code UNKNOWN_PERMISSION — a distinct code from an ordinary
+# validation failure, because it means the caller is probing the authorisation
+# surface, and it is audited as such.
+POST {{baseUrl}}/api/v1/users/00000000-0000-7000-8000-000000000001/permission-overrides
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "permission_code": "system.god_mode",
+  "effect": "ALLOW",
+  "scope": "GLOBAL"
+}
+
+
+### Suspending the system owner
+# EXPECTED: 403, code ROOT_PROTECTED — and unmistakably that, never masked into
+# a 404 and never a transient-looking error. Substitute the real owner id.
+POST {{baseUrl}}/api/v1/users/REPLACE_WITH_ROOT_USER_ID/suspend
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "version": 1,
+  "reason": "Testing the ROOT invariant"
+}
+
+
+### A dangerous operation without a recent second factor
+# EXPECTED: 403, code STEP_UP_REQUIRED, with `step_up.window_seconds` in the
+# body so the client knows to re-prompt rather than give up. Wait out the window
+# (600 s by default) after verifying MFA, then run this.
+POST {{baseUrl}}/api/v1/roles
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "code": "escalation_test",
+  "name": "Escalation Test",
+  "allowed_principal_type": "INTERNAL",
+  "permissions": []
+}
+
+
+### An MFA-pending session reaching a business endpoint
+# EXPECTED: 403, code MFA_REQUIRED. Use a token from a login whose response had
+# `mfa_required: true`, before verifying. That session may reach the MFA
+# endpoints and /auth/me, and nothing else.
+GET {{baseUrl}}/api/v1/projects
+Authorization: Bearer REPLACE_WITH_AN_MFA_PENDING_ACCESS_TOKEN
+Accept: application/json
+
+
+### Reusing an Idempotency-Key with a different body
+# EXPECTED: 409, code IDEMPOTENCY_KEY_REUSED. Run the invitation create in
+# 02-users-and-invitations.http first with this same key, then run this.
+POST {{baseUrl}}/api/v1/invitations
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+Idempotency-Key: REPLACE_WITH_A_KEY_ALREADY_USED_FOR_A_DIFFERENT_BODY
+
+{
+  "email": "somebody.else@example.com",
+  "display_name": "Somebody Else",
+  "principal_type": "INTERNAL",
+  "role_ids": [],
+  "department_id": null,
+  "client_account_id": null
+}
+
+
+### An oversized request body
+# EXPECTED: 413, code PAYLOAD_TOO_LARGE, and the body must be refused rather
+# than buffered. Paste a very large string into `display_name` — several
+# megabytes — to trigger it.
+POST {{baseUrl}}/api/v1/registration
+Content-Type: application/json
+Accept: application/json
+
+{
+  "email": "big@example.com",
+  "display_name": "REPLACE_WITH_SEVERAL_MEGABYTES_OF_TEXT",
+  "password": "correct horse battery staple"
+}
+
+
+### Enumerating accounts through the password-reset endpoint
+# EXPECTED: 202 both times, with byte-identical bodies. This probe "passes" by
+# returning success — the failure it looks for is any difference at all between
+# the two responses, including a difference in latency large enough to time.
+POST {{baseUrl}}/api/v1/auth/password-reset/request
+Content-Type: application/json
+Accept: application/json
+
+{
+  "email": "owner@example.com"
+}
+
+###
+POST {{baseUrl}}/api/v1/auth/password-reset/request
+Content-Type: application/json
+Accept: application/json
+
+{
+  "email": "definitely-not-a-real-account-9f2c@example.com"
+}

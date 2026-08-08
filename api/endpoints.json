@@ -1,0 +1,1357 @@
+{
+  "$comment": "Generated from ROUTE_TABLE in backend/src/routes.rs and api/openapi.yaml. The Rust mirror of this file is backend/src/platform/http/endpoints.rs, whose test asserts that the two describe the same set of paths. Do not hand-edit a path here without changing ROUTE_TABLE.",
+  "apiVersion": "v1",
+  "basePath": "/api/v1",
+  "servers": {
+    "development": "http://localhost:8090"
+  },
+  "endpoints": [
+    {
+      "key": "health.live",
+      "constant": "health::LIVE",
+      "method": "GET",
+      "path": "/health/live",
+      "operationId": "healthLive",
+      "access": "ANONYMOUS",
+      "principalTypes": [
+        "ANONYMOUS"
+      ],
+      "permission": null,
+      "stepUp": false,
+      "summary": "Liveness probe"
+    },
+    {
+      "key": "health.ready",
+      "constant": "health::READY",
+      "method": "GET",
+      "path": "/health/ready",
+      "operationId": "healthReady",
+      "access": "ANONYMOUS",
+      "principalTypes": [
+        "ANONYMOUS"
+      ],
+      "permission": null,
+      "stepUp": false,
+      "summary": "Readiness probe"
+    },
+    {
+      "key": "health.metrics",
+      "constant": "health::METRICS",
+      "method": "GET",
+      "path": "/metrics",
+      "operationId": "getMetrics",
+      "access": "ANONYMOUS",
+      "principalTypes": [
+        "ANONYMOUS"
+      ],
+      "permission": null,
+      "stepUp": false,
+      "summary": "Prometheus exposition"
+    },
+    {
+      "key": "bootstrap.status",
+      "constant": "bootstrap::STATUS",
+      "method": "GET",
+      "path": "/api/v1/bootstrap/status",
+      "operationId": "getBootstrapStatus",
+      "access": "ANONYMOUS",
+      "principalTypes": [
+        "ANONYMOUS"
+      ],
+      "permission": null,
+      "stepUp": false,
+      "summary": "Whether the system has an owner yet"
+    },
+    {
+      "key": "bootstrap.root",
+      "constant": "bootstrap::ROOT",
+      "method": "POST",
+      "path": "/api/v1/bootstrap/root",
+      "operationId": "bootstrapRoot",
+      "access": "ANONYMOUS",
+      "principalTypes": [
+        "ANONYMOUS"
+      ],
+      "permission": null,
+      "stepUp": false,
+      "summary": "Create the system owner (once, ever)"
+    },
+    {
+      "key": "auth.login",
+      "constant": "auth::LOGIN",
+      "method": "POST",
+      "path": "/api/v1/auth/login",
+      "operationId": "login",
+      "access": "ANONYMOUS",
+      "principalTypes": [
+        "ANONYMOUS"
+      ],
+      "permission": null,
+      "stepUp": false,
+      "summary": "Exchange an email and password for a session"
+    },
+    {
+      "key": "auth.refresh",
+      "constant": "auth::REFRESH",
+      "method": "POST",
+      "path": "/api/v1/auth/refresh",
+      "operationId": "refreshSession",
+      "access": "ANONYMOUS",
+      "principalTypes": [
+        "ANONYMOUS"
+      ],
+      "permission": null,
+      "stepUp": false,
+      "summary": "Rotate an access token using a refresh token"
+    },
+    {
+      "key": "auth.logout",
+      "constant": "auth::LOGOUT",
+      "method": "POST",
+      "path": "/api/v1/auth/logout",
+      "operationId": "logout",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL",
+        "CLIENT"
+      ],
+      "permission": null,
+      "stepUp": false,
+      "summary": "Revoke the calling session"
+    },
+    {
+      "key": "auth.logout_all",
+      "constant": "auth::LOGOUT_ALL",
+      "method": "POST",
+      "path": "/api/v1/auth/logout-all",
+      "operationId": "logoutAllSessions",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL",
+        "CLIENT"
+      ],
+      "permission": null,
+      "stepUp": false,
+      "summary": "Revoke every session belonging to the caller"
+    },
+    {
+      "key": "auth.me",
+      "constant": "auth::ME",
+      "method": "GET",
+      "path": "/api/v1/auth/me",
+      "operationId": "getCurrentPrincipal",
+      "access": "MFA_PENDING",
+      "principalTypes": [
+        "INTERNAL",
+        "CLIENT"
+      ],
+      "permission": null,
+      "stepUp": false,
+      "summary": "The calling principal and its capability hints"
+    },
+    {
+      "key": "auth.sessions",
+      "constant": "auth::SESSIONS",
+      "method": "GET",
+      "path": "/api/v1/auth/sessions",
+      "operationId": "listOwnSessions",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL",
+        "CLIENT"
+      ],
+      "permission": null,
+      "stepUp": false,
+      "summary": "List the caller's own sessions"
+    },
+    {
+      "key": "auth.session_by_id",
+      "constant": "auth::SESSION_BY_ID",
+      "method": "DELETE",
+      "path": "/api/v1/auth/sessions/{id}",
+      "operationId": "revokeOwnSession",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL",
+        "CLIENT"
+      ],
+      "permission": null,
+      "stepUp": false,
+      "summary": "Revoke one of the caller's own sessions"
+    },
+    {
+      "key": "auth.password_change",
+      "constant": "auth::PASSWORD_CHANGE",
+      "method": "POST",
+      "path": "/api/v1/auth/password/change",
+      "operationId": "changeOwnPassword",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL",
+        "CLIENT"
+      ],
+      "permission": null,
+      "stepUp": false,
+      "summary": "Change the caller's own password"
+    },
+    {
+      "key": "auth.password_reset_request",
+      "constant": "auth::PASSWORD_RESET_REQUEST",
+      "method": "POST",
+      "path": "/api/v1/auth/password-reset/request",
+      "operationId": "requestPasswordReset",
+      "access": "ANONYMOUS",
+      "principalTypes": [
+        "ANONYMOUS"
+      ],
+      "permission": null,
+      "stepUp": false,
+      "summary": "Request a password-reset email"
+    },
+    {
+      "key": "auth.password_reset_confirm",
+      "constant": "auth::PASSWORD_RESET_CONFIRM",
+      "method": "POST",
+      "path": "/api/v1/auth/password-reset/confirm",
+      "operationId": "confirmPasswordReset",
+      "access": "ANONYMOUS",
+      "principalTypes": [
+        "ANONYMOUS"
+      ],
+      "permission": null,
+      "stepUp": false,
+      "summary": "Complete a password reset with a token"
+    },
+    {
+      "key": "auth.mfa_totp_setup",
+      "constant": "auth::MFA_TOTP_SETUP",
+      "method": "POST",
+      "path": "/api/v1/auth/mfa/totp/setup",
+      "operationId": "beginTotpEnrolment",
+      "access": "MFA_PENDING",
+      "principalTypes": [
+        "INTERNAL",
+        "CLIENT"
+      ],
+      "permission": null,
+      "stepUp": false,
+      "summary": "Begin TOTP enrolment"
+    },
+    {
+      "key": "auth.mfa_totp_activate",
+      "constant": "auth::MFA_TOTP_ACTIVATE",
+      "method": "POST",
+      "path": "/api/v1/auth/mfa/totp/activate",
+      "operationId": "activateTotpFactor",
+      "access": "MFA_PENDING",
+      "principalTypes": [
+        "INTERNAL",
+        "CLIENT"
+      ],
+      "permission": null,
+      "stepUp": false,
+      "summary": "Activate a pending TOTP factor"
+    },
+    {
+      "key": "auth.mfa_verify",
+      "constant": "auth::MFA_VERIFY",
+      "method": "POST",
+      "path": "/api/v1/auth/mfa/verify",
+      "operationId": "verifyMfaCode",
+      "access": "MFA_PENDING",
+      "principalTypes": [
+        "INTERNAL",
+        "CLIENT"
+      ],
+      "permission": null,
+      "stepUp": false,
+      "summary": "Complete MFA for a pending session"
+    },
+    {
+      "key": "auth.mfa_recovery_verify",
+      "constant": "auth::MFA_RECOVERY_VERIFY",
+      "method": "POST",
+      "path": "/api/v1/auth/mfa/recovery/verify",
+      "operationId": "verifyRecoveryCode",
+      "access": "MFA_PENDING",
+      "principalTypes": [
+        "INTERNAL",
+        "CLIENT"
+      ],
+      "permission": null,
+      "stepUp": false,
+      "summary": "Complete MFA with a single-use recovery code"
+    },
+    {
+      "key": "auth.mfa_recovery_regenerate",
+      "constant": "auth::MFA_RECOVERY_REGENERATE",
+      "method": "POST",
+      "path": "/api/v1/auth/mfa/recovery/regenerate",
+      "operationId": "regenerateRecoveryCodes",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL",
+        "CLIENT"
+      ],
+      "permission": null,
+      "stepUp": true,
+      "summary": "Issue a fresh batch of recovery codes"
+    },
+    {
+      "key": "auth.mfa_disable",
+      "constant": "auth::MFA_DISABLE",
+      "method": "POST",
+      "path": "/api/v1/auth/mfa/disable",
+      "operationId": "disableMfa",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL",
+        "CLIENT"
+      ],
+      "permission": null,
+      "stepUp": true,
+      "summary": "Disable MFA for the caller"
+    },
+    {
+      "key": "auth.registration_config",
+      "constant": "auth::REGISTRATION_CONFIG",
+      "method": "GET",
+      "path": "/api/v1/registration/config",
+      "operationId": "getRegistrationConfig",
+      "access": "ANONYMOUS",
+      "principalTypes": [
+        "ANONYMOUS"
+      ],
+      "permission": null,
+      "stepUp": false,
+      "summary": "Whether self-registration is open"
+    },
+    {
+      "key": "auth.registration",
+      "constant": "auth::REGISTRATION",
+      "method": "POST",
+      "path": "/api/v1/registration",
+      "operationId": "submitRegistration",
+      "access": "ANONYMOUS",
+      "principalTypes": [
+        "ANONYMOUS"
+      ],
+      "permission": null,
+      "stepUp": false,
+      "summary": "Submit a self-registration"
+    },
+    {
+      "key": "invitations.accept",
+      "constant": "invitations::ACCEPT",
+      "method": "POST",
+      "path": "/api/v1/invitations/accept",
+      "operationId": "acceptInvitation",
+      "access": "ANONYMOUS",
+      "principalTypes": [
+        "ANONYMOUS"
+      ],
+      "permission": null,
+      "stepUp": false,
+      "summary": "Redeem an invitation token and create the account"
+    },
+    {
+      "key": "users.list",
+      "constant": "users::ROOT",
+      "method": "GET",
+      "path": "/api/v1/users",
+      "operationId": "listUsers",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "iam.users.read",
+      "stepUp": false,
+      "summary": "List users"
+    },
+    {
+      "key": "users.get",
+      "constant": "users::BY_ID",
+      "method": "GET",
+      "path": "/api/v1/users/{id}",
+      "operationId": "getUser",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "iam.users.read",
+      "stepUp": false,
+      "summary": "Read one user"
+    },
+    {
+      "key": "users.update",
+      "constant": "users::BY_ID",
+      "method": "PATCH",
+      "path": "/api/v1/users/{id}",
+      "operationId": "updateUser",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "iam.users.update",
+      "stepUp": false,
+      "summary": "Update a user's own attributes"
+    },
+    {
+      "key": "users.suspend",
+      "constant": "users::SUSPEND",
+      "method": "POST",
+      "path": "/api/v1/users/{id}/suspend",
+      "operationId": "suspendUser",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "iam.users.suspend",
+      "stepUp": false,
+      "summary": "Suspend a user"
+    },
+    {
+      "key": "users.reactivate",
+      "constant": "users::REACTIVATE",
+      "method": "POST",
+      "path": "/api/v1/users/{id}/reactivate",
+      "operationId": "reactivateUser",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "iam.users.suspend",
+      "stepUp": false,
+      "summary": "Reactivate a suspended user"
+    },
+    {
+      "key": "users.archive",
+      "constant": "users::ARCHIVE",
+      "method": "POST",
+      "path": "/api/v1/users/{id}/archive",
+      "operationId": "archiveUser",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "iam.users.archive",
+      "stepUp": false,
+      "summary": "Archive a user"
+    },
+    {
+      "key": "invitations.list",
+      "constant": "invitations::ROOT",
+      "method": "GET",
+      "path": "/api/v1/invitations",
+      "operationId": "listInvitations",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "iam.users.invite",
+      "stepUp": false,
+      "summary": "List invitations"
+    },
+    {
+      "key": "invitations.create",
+      "constant": "invitations::ROOT",
+      "method": "POST",
+      "path": "/api/v1/invitations",
+      "operationId": "createInvitation",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "iam.users.invite",
+      "stepUp": false,
+      "summary": "Invite somebody to the system"
+    },
+    {
+      "key": "invitations.revoke",
+      "constant": "invitations::BY_ID",
+      "method": "DELETE",
+      "path": "/api/v1/invitations/{id}",
+      "operationId": "revokeInvitation",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "iam.users.invite",
+      "stepUp": false,
+      "summary": "Revoke a pending invitation"
+    },
+    {
+      "key": "permissions.list",
+      "constant": "permissions::ROOT",
+      "method": "GET",
+      "path": "/api/v1/permissions",
+      "operationId": "listPermissions",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "iam.permissions.read",
+      "stepUp": false,
+      "summary": "The permission catalogue"
+    },
+    {
+      "key": "roles.list",
+      "constant": "roles::ROOT",
+      "method": "GET",
+      "path": "/api/v1/roles",
+      "operationId": "listRoles",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "iam.roles.read",
+      "stepUp": false,
+      "summary": "List roles"
+    },
+    {
+      "key": "roles.create",
+      "constant": "roles::ROOT",
+      "method": "POST",
+      "path": "/api/v1/roles",
+      "operationId": "createRole",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "iam.roles.create",
+      "stepUp": true,
+      "summary": "Create a role"
+    },
+    {
+      "key": "roles.get",
+      "constant": "roles::BY_ID",
+      "method": "GET",
+      "path": "/api/v1/roles/{id}",
+      "operationId": "getRole",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "iam.roles.read",
+      "stepUp": false,
+      "summary": "Read one role with its grants"
+    },
+    {
+      "key": "roles.update",
+      "constant": "roles::BY_ID",
+      "method": "PATCH",
+      "path": "/api/v1/roles/{id}",
+      "operationId": "updateRole",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "iam.roles.update",
+      "stepUp": true,
+      "summary": "Update a role"
+    },
+    {
+      "key": "roles.delete",
+      "constant": "roles::BY_ID",
+      "method": "DELETE",
+      "path": "/api/v1/roles/{id}",
+      "operationId": "deleteRole",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "iam.roles.delete",
+      "stepUp": true,
+      "summary": "Delete a role"
+    },
+    {
+      "key": "roles.list_for_user",
+      "constant": "roles::FOR_USER",
+      "method": "GET",
+      "path": "/api/v1/users/{id}/roles",
+      "operationId": "listUserRoles",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "iam.roles.read",
+      "stepUp": false,
+      "summary": "The roles assigned to a user"
+    },
+    {
+      "key": "roles.assign_to_user",
+      "constant": "roles::FOR_USER",
+      "method": "POST",
+      "path": "/api/v1/users/{id}/roles",
+      "operationId": "assignRoleToUser",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "iam.roles.assign",
+      "stepUp": true,
+      "summary": "Assign a role to a user"
+    },
+    {
+      "key": "roles.revoke_from_user",
+      "constant": "roles::FOR_USER_BY_ID",
+      "method": "DELETE",
+      "path": "/api/v1/users/{id}/roles/{role_id}",
+      "operationId": "revokeRoleFromUser",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "iam.roles.assign",
+      "stepUp": true,
+      "summary": "Revoke a role from a user"
+    },
+    {
+      "key": "permissions.effective_for_user",
+      "constant": "permissions::EFFECTIVE_FOR_USER",
+      "method": "GET",
+      "path": "/api/v1/users/{id}/permissions",
+      "operationId": "getEffectivePermissions",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "iam.permissions.read",
+      "stepUp": false,
+      "summary": "A user's effective permissions"
+    },
+    {
+      "key": "permissions.list_overrides",
+      "constant": "permissions::OVERRIDES_FOR_USER",
+      "method": "GET",
+      "path": "/api/v1/users/{id}/permission-overrides",
+      "operationId": "listPermissionOverrides",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "iam.permissions.read",
+      "stepUp": false,
+      "summary": "The permission overrides recorded against a user"
+    },
+    {
+      "key": "permissions.create_override",
+      "constant": "permissions::OVERRIDES_FOR_USER",
+      "method": "POST",
+      "path": "/api/v1/users/{id}/permission-overrides",
+      "operationId": "createPermissionOverride",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "iam.permissions.delegate",
+      "stepUp": true,
+      "summary": "Grant or deny one permission directly to a user"
+    },
+    {
+      "key": "permissions.delete_override",
+      "constant": "permissions::OVERRIDE_BY_ID",
+      "method": "DELETE",
+      "path": "/api/v1/users/{id}/permission-overrides/{override_id}",
+      "operationId": "deletePermissionOverride",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "iam.permissions.delegate",
+      "stepUp": true,
+      "summary": "Remove a permission override"
+    },
+    {
+      "key": "departments.list",
+      "constant": "departments::ROOT",
+      "method": "GET",
+      "path": "/api/v1/departments",
+      "operationId": "listDepartments",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "departments.read",
+      "stepUp": false,
+      "summary": "List departments"
+    },
+    {
+      "key": "departments.create",
+      "constant": "departments::ROOT",
+      "method": "POST",
+      "path": "/api/v1/departments",
+      "operationId": "createDepartment",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "departments.create",
+      "stepUp": false,
+      "summary": "Create a department"
+    },
+    {
+      "key": "departments.get",
+      "constant": "departments::BY_ID",
+      "method": "GET",
+      "path": "/api/v1/departments/{id}",
+      "operationId": "getDepartment",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "departments.read",
+      "stepUp": false,
+      "summary": "Read one department"
+    },
+    {
+      "key": "departments.update",
+      "constant": "departments::BY_ID",
+      "method": "PATCH",
+      "path": "/api/v1/departments/{id}",
+      "operationId": "updateDepartment",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "departments.update",
+      "stepUp": false,
+      "summary": "Update a department"
+    },
+    {
+      "key": "departments.archive",
+      "constant": "departments::ARCHIVE",
+      "method": "POST",
+      "path": "/api/v1/departments/{id}/archive",
+      "operationId": "archiveDepartment",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "departments.archive",
+      "stepUp": false,
+      "summary": "Archive a department"
+    },
+    {
+      "key": "departments.list_members",
+      "constant": "departments::MEMBERS",
+      "method": "GET",
+      "path": "/api/v1/departments/{id}/members",
+      "operationId": "listDepartmentMembers",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "departments.read",
+      "stepUp": false,
+      "summary": "List a department's members"
+    },
+    {
+      "key": "departments.add_member",
+      "constant": "departments::MEMBERS",
+      "method": "POST",
+      "path": "/api/v1/departments/{id}/members",
+      "operationId": "addDepartmentMember",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "departments.members.manage",
+      "stepUp": false,
+      "summary": "Add a member to a department"
+    },
+    {
+      "key": "departments.remove_member",
+      "constant": "departments::MEMBER_BY_ID",
+      "method": "DELETE",
+      "path": "/api/v1/departments/{id}/members/{user_id}",
+      "operationId": "removeDepartmentMember",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "departments.members.manage",
+      "stepUp": false,
+      "summary": "Remove a member from a department"
+    },
+    {
+      "key": "clients.list",
+      "constant": "clients::ROOT",
+      "method": "GET",
+      "path": "/api/v1/clients",
+      "operationId": "listClients",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "clients.read",
+      "stepUp": false,
+      "summary": "List client accounts"
+    },
+    {
+      "key": "clients.create",
+      "constant": "clients::ROOT",
+      "method": "POST",
+      "path": "/api/v1/clients",
+      "operationId": "createClient",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "clients.create",
+      "stepUp": false,
+      "summary": "Create a client account"
+    },
+    {
+      "key": "clients.get",
+      "constant": "clients::BY_ID",
+      "method": "GET",
+      "path": "/api/v1/clients/{id}",
+      "operationId": "getClient",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "clients.read",
+      "stepUp": false,
+      "summary": "Read one client account"
+    },
+    {
+      "key": "clients.update",
+      "constant": "clients::BY_ID",
+      "method": "PATCH",
+      "path": "/api/v1/clients/{id}",
+      "operationId": "updateClient",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "clients.update",
+      "stepUp": false,
+      "summary": "Update a client account"
+    },
+    {
+      "key": "clients.archive",
+      "constant": "clients::ARCHIVE",
+      "method": "POST",
+      "path": "/api/v1/clients/{id}/archive",
+      "operationId": "archiveClient",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "clients.archive",
+      "stepUp": false,
+      "summary": "Archive a client account"
+    },
+    {
+      "key": "clients.list_members",
+      "constant": "clients::MEMBERS",
+      "method": "GET",
+      "path": "/api/v1/clients/{id}/members",
+      "operationId": "listClientMembers",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "clients.read",
+      "stepUp": false,
+      "summary": "List a client account's members"
+    },
+    {
+      "key": "clients.add_member",
+      "constant": "clients::MEMBERS",
+      "method": "POST",
+      "path": "/api/v1/clients/{id}/members",
+      "operationId": "addClientMember",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "clients.members.manage",
+      "stepUp": false,
+      "summary": "Attach an external user to a client account"
+    },
+    {
+      "key": "clients.activate_member",
+      "constant": "clients::MEMBER_ACTIVATE",
+      "method": "POST",
+      "path": "/api/v1/clients/{id}/members/{user_id}/activate",
+      "operationId": "activateClientMember",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "clients.members.manage",
+      "stepUp": false,
+      "summary": "Activate a pending client membership"
+    },
+    {
+      "key": "clients.remove_member",
+      "constant": "clients::MEMBER_BY_ID",
+      "method": "DELETE",
+      "path": "/api/v1/clients/{id}/members/{user_id}",
+      "operationId": "removeClientMember",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "clients.members.manage",
+      "stepUp": false,
+      "summary": "Remove a member from a client account"
+    },
+    {
+      "key": "projects.list",
+      "constant": "projects::ROOT",
+      "method": "GET",
+      "path": "/api/v1/projects",
+      "operationId": "listProjects",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "projects.read",
+      "stepUp": false,
+      "summary": "List projects"
+    },
+    {
+      "key": "projects.create",
+      "constant": "projects::ROOT",
+      "method": "POST",
+      "path": "/api/v1/projects",
+      "operationId": "createProject",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "projects.create",
+      "stepUp": false,
+      "summary": "Create a project"
+    },
+    {
+      "key": "projects.get",
+      "constant": "projects::BY_ID",
+      "method": "GET",
+      "path": "/api/v1/projects/{id}",
+      "operationId": "getProject",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "projects.read",
+      "stepUp": false,
+      "summary": "Read one project"
+    },
+    {
+      "key": "projects.update",
+      "constant": "projects::BY_ID",
+      "method": "PATCH",
+      "path": "/api/v1/projects/{id}",
+      "operationId": "updateProject",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "projects.update",
+      "stepUp": false,
+      "summary": "Update a project"
+    },
+    {
+      "key": "projects.archive",
+      "constant": "projects::ARCHIVE",
+      "method": "POST",
+      "path": "/api/v1/projects/{id}/archive",
+      "operationId": "archiveProject",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "projects.archive",
+      "stepUp": false,
+      "summary": "Archive a project"
+    },
+    {
+      "key": "projects.list_members",
+      "constant": "projects::MEMBERS",
+      "method": "GET",
+      "path": "/api/v1/projects/{id}/members",
+      "operationId": "listProjectMembers",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "projects.read",
+      "stepUp": false,
+      "summary": "List a project's internal members"
+    },
+    {
+      "key": "projects.add_member",
+      "constant": "projects::MEMBERS",
+      "method": "POST",
+      "path": "/api/v1/projects/{id}/members",
+      "operationId": "addProjectMember",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "projects.members.manage",
+      "stepUp": false,
+      "summary": "Add an internal member to a project"
+    },
+    {
+      "key": "projects.remove_member",
+      "constant": "projects::MEMBER_BY_ID",
+      "method": "DELETE",
+      "path": "/api/v1/projects/{id}/members/{user_id}",
+      "operationId": "removeProjectMember",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "projects.members.manage",
+      "stepUp": false,
+      "summary": "Remove an internal member from a project"
+    },
+    {
+      "key": "projects.list_client_links",
+      "constant": "projects::CLIENTS",
+      "method": "GET",
+      "path": "/api/v1/projects/{id}/clients",
+      "operationId": "listProjectClientLinks",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "projects.read",
+      "stepUp": false,
+      "summary": "Which client accounts this project is shared with"
+    },
+    {
+      "key": "projects.share_with_client",
+      "constant": "projects::CLIENTS",
+      "method": "POST",
+      "path": "/api/v1/projects/{id}/clients",
+      "operationId": "shareProjectWithClient",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "projects.clients.share",
+      "stepUp": true,
+      "summary": "Share a project with a client account"
+    },
+    {
+      "key": "projects.revoke_client_share",
+      "constant": "projects::CLIENT_BY_ID",
+      "method": "DELETE",
+      "path": "/api/v1/projects/{id}/clients/{client_account_id}",
+      "operationId": "revokeProjectClientShare",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "projects.clients.share",
+      "stepUp": true,
+      "summary": "Withdraw a project share from a client account"
+    },
+    {
+      "key": "projects.list_tasks",
+      "constant": "projects::TASKS",
+      "method": "GET",
+      "path": "/api/v1/projects/{project_id}/tasks",
+      "operationId": "listProjectTasks",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "tasks.read",
+      "stepUp": false,
+      "summary": "List the tasks of one project"
+    },
+    {
+      "key": "tasks.list",
+      "constant": "tasks::ROOT",
+      "method": "GET",
+      "path": "/api/v1/tasks",
+      "operationId": "listTasks",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "tasks.read",
+      "stepUp": false,
+      "summary": "List tasks"
+    },
+    {
+      "key": "tasks.create",
+      "constant": "tasks::ROOT",
+      "method": "POST",
+      "path": "/api/v1/tasks",
+      "operationId": "createTask",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "tasks.create",
+      "stepUp": false,
+      "summary": "Create a task"
+    },
+    {
+      "key": "tasks.get",
+      "constant": "tasks::BY_ID",
+      "method": "GET",
+      "path": "/api/v1/tasks/{id}",
+      "operationId": "getTask",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "tasks.read",
+      "stepUp": false,
+      "summary": "Read one task"
+    },
+    {
+      "key": "tasks.update",
+      "constant": "tasks::BY_ID",
+      "method": "PATCH",
+      "path": "/api/v1/tasks/{id}",
+      "operationId": "updateTask",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "tasks.update",
+      "stepUp": false,
+      "summary": "Update a task"
+    },
+    {
+      "key": "tasks.delete",
+      "constant": "tasks::BY_ID",
+      "method": "DELETE",
+      "path": "/api/v1/tasks/{id}",
+      "operationId": "deleteTask",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "tasks.delete",
+      "stepUp": false,
+      "summary": "Delete a task"
+    },
+    {
+      "key": "tasks.list_assignees",
+      "constant": "tasks::ASSIGNEES",
+      "method": "GET",
+      "path": "/api/v1/tasks/{id}/assignees",
+      "operationId": "listTaskAssignees",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "tasks.read",
+      "stepUp": false,
+      "summary": "The internal users assigned to a task"
+    },
+    {
+      "key": "tasks.add_assignee",
+      "constant": "tasks::ASSIGNEES",
+      "method": "POST",
+      "path": "/api/v1/tasks/{id}/assignees",
+      "operationId": "addTaskAssignee",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "tasks.assign",
+      "stepUp": false,
+      "summary": "Assign an internal user to a task"
+    },
+    {
+      "key": "tasks.remove_assignee",
+      "constant": "tasks::ASSIGNEE_BY_ID",
+      "method": "DELETE",
+      "path": "/api/v1/tasks/{id}/assignees/{user_id}",
+      "operationId": "removeTaskAssignee",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "tasks.assign",
+      "stepUp": false,
+      "summary": "Unassign a user from a task"
+    },
+    {
+      "key": "client_portal.list_projects",
+      "constant": "client_portal::PROJECTS",
+      "method": "GET",
+      "path": "/api/v1/client-portal/projects",
+      "operationId": "listClientPortalProjects",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL",
+        "CLIENT"
+      ],
+      "permission": "client.portal.projects.read",
+      "stepUp": false,
+      "summary": "Projects shared with the caller's client accounts"
+    },
+    {
+      "key": "client_portal.get_project",
+      "constant": "client_portal::PROJECT_BY_ID",
+      "method": "GET",
+      "path": "/api/v1/client-portal/projects/{id}",
+      "operationId": "getClientPortalProject",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL",
+        "CLIENT"
+      ],
+      "permission": "client.portal.projects.read",
+      "stepUp": false,
+      "summary": "Read one shared project"
+    },
+    {
+      "key": "client_portal.list_project_tasks",
+      "constant": "client_portal::PROJECT_TASKS",
+      "method": "GET",
+      "path": "/api/v1/client-portal/projects/{id}/tasks",
+      "operationId": "listClientPortalProjectTasks",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL",
+        "CLIENT"
+      ],
+      "permission": "client.portal.tasks.read",
+      "stepUp": false,
+      "summary": "The client-visible tasks of a shared project"
+    },
+    {
+      "key": "client_portal.get_task",
+      "constant": "client_portal::TASK_BY_ID",
+      "method": "GET",
+      "path": "/api/v1/client-portal/tasks/{id}",
+      "operationId": "getClientPortalTask",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL",
+        "CLIENT"
+      ],
+      "permission": "client.portal.tasks.read",
+      "stepUp": false,
+      "summary": "Read one client-visible task"
+    },
+    {
+      "key": "settings.list",
+      "constant": "settings::ROOT",
+      "method": "GET",
+      "path": "/api/v1/settings",
+      "operationId": "listSettings",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "settings.read",
+      "stepUp": false,
+      "summary": "Read every system setting"
+    },
+    {
+      "key": "settings.update",
+      "constant": "settings::BY_KEY",
+      "method": "PUT",
+      "path": "/api/v1/settings/{key}",
+      "operationId": "updateSetting",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "settings.features.write",
+      "stepUp": false,
+      "summary": "Write one system setting"
+    },
+    {
+      "key": "settings.list_feature_flags",
+      "constant": "settings::FEATURE_FLAGS",
+      "method": "GET",
+      "path": "/api/v1/feature-flags",
+      "operationId": "listFeatureFlags",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "settings.read",
+      "stepUp": false,
+      "summary": "Read every feature flag"
+    },
+    {
+      "key": "settings.update_feature_flag",
+      "constant": "settings::FEATURE_FLAG_BY_KEY",
+      "method": "PUT",
+      "path": "/api/v1/feature-flags/{key}",
+      "operationId": "updateFeatureFlag",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "settings.features.write",
+      "stepUp": false,
+      "summary": "Turn one feature flag on or off"
+    },
+    {
+      "key": "settings.system_info",
+      "constant": "settings::SYSTEM_INFO",
+      "method": "GET",
+      "path": "/api/v1/system/info",
+      "operationId": "getSystemInfo",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL",
+        "CLIENT"
+      ],
+      "permission": null,
+      "stepUp": false,
+      "summary": "Minimal environment description for an authenticated client"
+    },
+    {
+      "key": "audit.list_events",
+      "constant": "audit::EVENTS",
+      "method": "GET",
+      "path": "/api/v1/audit/events",
+      "operationId": "listAuditEvents",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "audit.read",
+      "stepUp": false,
+      "summary": "Read the audit log"
+    },
+    {
+      "key": "audit.get_event",
+      "constant": "audit::EVENT_BY_ID",
+      "method": "GET",
+      "path": "/api/v1/audit/events/{id}",
+      "operationId": "getAuditEvent",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "audit.read",
+      "stepUp": false,
+      "summary": "Read one audit event"
+    },
+    {
+      "key": "audit.verify",
+      "constant": "audit::VERIFY",
+      "method": "GET",
+      "path": "/api/v1/audit/verify",
+      "operationId": "verifyAuditChain",
+      "access": "AUTHENTICATED",
+      "principalTypes": [
+        "INTERNAL"
+      ],
+      "permission": "audit.read",
+      "stepUp": true,
+      "summary": "Verify the audit hash chain"
+    }
+  ]
+}

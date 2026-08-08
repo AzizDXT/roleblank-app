@@ -1,0 +1,187 @@
+###############################################################################
+# 03 — Permissions, roles, role assignment and per-user overrides
+#
+# Everything that grants authority is behind step-up: complete an MFA
+# verification (01-auth-and-mfa.http) within the step-up window — 600 seconds by
+# default — before running the marked requests, or they answer 403
+# STEP_UP_REQUIRED.
+#
+# NEVER COMMIT A REAL CREDENTIAL OR TOKEN TO THIS FILE.
+###############################################################################
+
+@baseUrl = http://localhost:8090
+@accessToken = REPLACE_WITH_ACCESS_TOKEN
+
+@userId = 00000000-0000-7000-8000-000000000001
+@roleId = 00000000-0000-7000-8000-000000000003
+@overrideId = 00000000-0000-7000-8000-000000000006
+@projectId = 00000000-0000-7000-8000-000000000007
+@roleVersion = 1
+@idempotencyKey = REPLACE_WITH_A_FRESH_UUID_PER_CREATE
+
+
+### The permission catalogue
+# Correct response: 200 {items: [...]}. Not paginated — the catalogue is
+# compiled into the binary, so it is a fixed list.
+# Read `max_principal_type`: `ANY` marks the only codes an external CLIENT
+# principal may ever hold, and today those are exactly the two client.portal.*
+# codes. `is_dangerous` marks codes whose grant *and* exercise need step-up.
+GET {{baseUrl}}/api/v1/permissions
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### List roles
+# Correct response: 200, a page of role summaries.
+GET {{baseUrl}}/api/v1/roles?limit=25&sort=code&direction=asc
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### Create a role  — REQUIRES STEP-UP, idempotent
+# A role is a reusable template and cannot name a specific object, so there is
+# no way to express RESOURCE scope here: `RolePermissionInput` has no
+# `resource_type` and no `resource_id` fields to put one in.
+#
+# Correct response: 201 with the role and its grants.
+# 403 DELEGATION_DENIED if you ask for a permission at a scope you do not
+# yourself hold — you cannot grant authority you do not have.
+# 403 STEP_UP_REQUIRED if the second factor is stale.
+POST {{baseUrl}}/api/v1/roles
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+Idempotency-Key: {{idempotencyKey}}
+
+{
+  "code": "field_manager",
+  "name": "Field Manager",
+  "description": "Runs projects inside their own department.",
+  "allowed_principal_type": "INTERNAL",
+  "permissions": [
+    { "permission_code": "projects.read", "scope": "DEPARTMENT" },
+    { "permission_code": "projects.update", "scope": "DEPARTMENT" },
+    { "permission_code": "tasks.read", "scope": "ASSIGNED" }
+  ]
+}
+
+
+### Read one role
+# Correct response: 200 with the summary flattened together with `permissions`.
+GET {{baseUrl}}/api/v1/roles/{{roleId}}
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### Update a role  — REQUIRES STEP-UP
+# `code` and `allowed_principal_type` cannot be changed here: the code is
+# referenced by operators and seed data, and the principal type is the envelope
+# the permission set was authorised against. A different envelope means a
+# different role.
+#
+# Omit `permissions` to leave the set alone. Sending an explicit `[]` is a real
+# instruction to strip the role bare, and the two are distinguishable.
+# Correct response: 200 with an incremented `version`. Stale version → 409.
+PATCH {{baseUrl}}/api/v1/roles/{{roleId}}
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "version": {{roleVersion}},
+  "name": "Field Manager (revised)",
+  "permissions": [
+    { "permission_code": "projects.read", "scope": "DEPARTMENT" }
+  ]
+}
+
+
+### Delete a role  — REQUIRES STEP-UP
+# Correct response: 204.
+# 409 ROLE_IN_USE while anybody still holds it — the API refuses rather than
+# silently stripping its holders. A system role cannot be deleted at all.
+DELETE {{baseUrl}}/api/v1/roles/{{roleId}}
+Authorization: Bearer {{accessToken}}
+
+
+### A user's role assignments
+# Correct response: 200 {user_id, items: [...]}.
+GET {{baseUrl}}/api/v1/users/{{userId}}/roles
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### Assign a role  — REQUIRES STEP-UP
+# The subject comes from the path; the body carries only the role. There is no
+# `granted_by` field — that is the server's to record, not the caller's.
+# Correct response: 201, and the subject's `security_version` is bumped.
+# 403 DELEGATION_DENIED when the role carries authority you do not hold.
+# 409 PRINCIPAL_TYPE_MISMATCH when the role's envelope and the subject's differ.
+POST {{baseUrl}}/api/v1/users/{{userId}}/roles
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "role_id": "{{roleId}}"
+}
+
+
+### Revoke a role  — REQUIRES STEP-UP
+# Correct response: 204, and `security_version` is bumped again.
+DELETE {{baseUrl}}/api/v1/users/{{userId}}/roles/{{roleId}}
+Authorization: Bearer {{accessToken}}
+
+
+### A user's effective permissions
+# The union of role grants and overrides after the principal envelope has been
+# applied. Correct response: 200 {user_id, principal_type, is_root, items}.
+# Like /auth/me `capabilities`, this is a hint for user interfaces: the backend
+# re-derives every decision per request regardless of what a client believes.
+GET {{baseUrl}}/api/v1/users/{{userId}}/permissions
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### Grant one permission directly, scoped to one object — REQUIRES STEP-UP
+# `resource_type` and `resource_id` are required with, and only with, RESOURCE
+# scope. Prefer a short `expires_at`: a time-boxed override is easier to justify
+# than a permanent one, and it cleans itself up.
+# Correct response: 201 with the override.
+POST {{baseUrl}}/api/v1/users/{{userId}}/permission-overrides
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "permission_code": "projects.read",
+  "effect": "ALLOW",
+  "scope": "RESOURCE",
+  "resource_type": "PROJECT",
+  "resource_id": "{{projectId}}",
+  "expires_at": "2027-01-01T00:00:00Z",
+  "reason": "Incident 42 — temporary read access for the on-call engineer"
+}
+
+
+### Deny one permission outright — REQUIRES STEP-UP
+# A DENY override beats every ALLOW from any source. Use it to carve an
+# exception out of a role rather than forking the role.
+POST {{baseUrl}}/api/v1/users/{{userId}}/permission-overrides
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "permission_code": "projects.clients.share",
+  "effect": "DENY",
+  "scope": "GLOBAL",
+  "reason": "Contractor — must not cross the external trust boundary"
+}
+
+
+### Remove an override  — REQUIRES STEP-UP
+# Correct response: 204. Removing a DENY restores whatever the role grants said;
+# it does not grant anything on its own.
+DELETE {{baseUrl}}/api/v1/users/{{userId}}/permission-overrides/{{overrideId}}
+Authorization: Bearer {{accessToken}}
