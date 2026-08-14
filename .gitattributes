@@ -1,0 +1,48 @@
+# Line endings, decided once, in the repository rather than per machine.
+#
+# Without this file every contributor's `core.autocrlf` decides how their working
+# copy differs from the stored blob. On this machine it is `true`, which is why
+# every commit in this project printed "LF will be replaced by CRLF" and why a
+# snapshot uploaded through the GitHub web UI came back showing 116 files changed
+# with roughly 54 000 insertions and 54 000 deletions — a whole-file rewrite in
+# which not one character of code had actually changed.
+#
+# `text=auto eol=lf` stores everything as LF and checks it out as LF everywhere.
+# Two reasons LF rather than native:
+#
+#   * The shell scripts in `scripts/` run inside Linux containers. A CRLF shebang
+#     line makes the kernel look for `/usr/bin/env bash\r`, and the error it gives
+#     ("no such file or directory") names a file that plainly exists — one of the
+#     more time-wasting failures available.
+#   * PostgreSQL functions in the migrations are stored with their body text. CRLF
+#     inside a `$$ ... $$` block is preserved into the catalogue, so two developers
+#     on different platforms can produce migrations that differ byte-for-byte while
+#     appearing identical.
+#
+# `.ps1` is the deliberate exception: PowerShell on Windows is the only consumer,
+# and CRLF is its native form.
+
+* text=auto eol=lf
+
+*.ps1   text eol=crlf
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# Binary — never touched, never diffed as text.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.pdf   binary
+*.zip   binary
+*.gz    binary
+*.dump  binary
+
+# Generated artefacts. They are committed on purpose — `Cargo.lock` because this
+# repository produces a binary and a reproducible dependency set is a security
+# requirement, the OpenAPI documents because they are the frozen frontend contract
+# — but a reviewer should not have to scroll past them to reach the real change.
+Cargo.lock       linguist-generated=true
+api/openapi.json linguist-generated=true -diff
+api/openapi.yaml linguist-generated=true -diff
